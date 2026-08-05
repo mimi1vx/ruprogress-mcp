@@ -5,7 +5,12 @@ yanked  = "deny"
 [licenses]
 version = 2
 allow   = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
-           "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+           "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib",
+           # webpki-root-certs (via rustls-platform-verifier, pulled in by
+           # reqwest's rustls TLS backend) redistributes Mozilla's root
+           # certificate bundle under this license. Permissive; reviewed
+           # 2026-08-05 when phase 1 first pulled in reqwest.
+           "CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"

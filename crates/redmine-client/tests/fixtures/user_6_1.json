@@ -1,0 +1,10 @@
+{
+  "user": {
+    "id": 2,
+    "login": "alice",
+    "firstname": "Alice",
+    "lastname": "Example",
+    "created_on": "2025-06-01T08:00:00",
+    "last_login_on": "2026-01-05T09:15:00"
+  }
+}

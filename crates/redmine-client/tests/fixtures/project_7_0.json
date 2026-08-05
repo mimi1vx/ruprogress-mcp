@@ -1,0 +1,13 @@
+{
+  "project": {
+    "id": 1,
+    "name": "Example Project",
+    "identifier": "example-project",
+    "description": "An example project.",
+    "status": 1,
+    "is_public": true,
+    "parent": { "id": 5, "name": "Parent Project" },
+    "created_on": "2026-01-01T09:00:00Z",
+    "updated_on": "2026-01-01T09:00:00Z"
+  }
+}

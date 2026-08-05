@@ -1,0 +1,14 @@
+{
+  "time_entry": {
+    "id": 1,
+    "project": { "id": 1, "name": "Example Project" },
+    "issue": { "id": 5 },
+    "user": { "id": 2, "name": "Bob Example" },
+    "activity": { "id": 9, "name": "Development" },
+    "hours": 2.5,
+    "comments": "Worked on the example issue",
+    "spent_on": "2026-01-05",
+    "created_on": "2026-01-05T17:00:00",
+    "updated_on": "2026-01-05T17:00:00"
+  }
+}

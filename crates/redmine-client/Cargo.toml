@@ -10,3 +10,20 @@ repository   = { workspace = true }
 workspace = true
 
 [dependencies]
+reqwest    = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+url        = { workspace = true }
+chrono     = { workspace = true }
+http       = { workspace = true }
+bytes      = { workspace = true }
+rand       = { workspace = true }
+secrecy    = { workspace = true }
+tracing    = { workspace = true }
+tokio      = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
