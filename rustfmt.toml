@@ -1,0 +1,4 @@
+edition = "2024"
+# Nightly-only. Do NOT enable without a `cargo +nightly fmt` CI job:
+# group_imports = "StdExternalCrate"
+# imports_granularity = "Crate"
