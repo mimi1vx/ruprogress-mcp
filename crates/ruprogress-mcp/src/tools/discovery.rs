@@ -183,7 +183,7 @@ impl RedmineMcp {
     /// when a project is known.
     #[tool(
         description = "List every tracker (Bug, Feature, ...) configured on the Redmine instance. Use this to resolve a tracker name to an id before creating an issue, when no project is known yet. Prefer list_project_trackers when a project id is available, since a project can restrict which trackers it accepts. An empty list means no trackers are configured — do not retry with the same arguments.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<TrackersOutput>(),
+        output_schema = crate::tools::schema::output::<TrackersOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_trackers(
@@ -217,7 +217,8 @@ impl RedmineMcp {
     /// subset of `list_redmine_trackers`'s instance-wide list.
     #[tool(
         description = "List the trackers enabled for a specific project (numeric id or slug identifier). Use this instead of list_redmine_trackers whenever a project is known, since a project's settings can restrict which trackers it accepts. An empty list means no trackers are enabled for this project — do not retry with the same arguments.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ProjectTrackersOutput>(),
+        input_schema = crate::tools::schema::input::<ListProjectTrackersParams>(),
+        output_schema = crate::tools::schema::output::<ProjectTrackersOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_project_trackers(
@@ -264,7 +265,7 @@ impl RedmineMcp {
     /// `GET /issue_statuses.json`.
     #[tool(
         description = "List every issue status (New, In Progress, Closed, ...) configured on the Redmine instance, including which ones count as closed. Use this to resolve a status name to an id before filtering or updating issues. An empty list would mean the instance has none configured — do not retry with the same arguments.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<IssueStatusesOutput>(),
+        output_schema = crate::tools::schema::output::<IssueStatusesOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_issue_statuses(
@@ -296,7 +297,7 @@ impl RedmineMcp {
     /// `GET /enumerations/issue_priorities.json`.
     #[tool(
         description = "List every issue priority (Low, Normal, High, ...) configured on the Redmine instance. Use this to resolve a priority name to an id before creating or updating an issue. An empty list means no priorities are configured — do not retry with the same arguments.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<IssuePrioritiesOutput>(),
+        output_schema = crate::tools::schema::output::<IssuePrioritiesOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_issue_priorities(
@@ -330,7 +331,8 @@ impl RedmineMcp {
     /// credential gets a 403, surfaced as `code: "FORBIDDEN"`.
     #[tool(
         description = "List Redmine user accounts, optionally filtered by name or group. Requires an admin credential. Use this to resolve a user's name to an id before assigning an issue. If this returns a FORBIDDEN error, the credential is not an admin — do not retry; call get_current_user to check your own identity, or ask the user for an admin account.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<UsersOutput>(),
+        input_schema = crate::tools::schema::input::<ListRedmineUsersParams>(),
+        output_schema = crate::tools::schema::output::<UsersOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_users(
@@ -386,7 +388,7 @@ impl RedmineMcp {
     /// not just admins.
     #[tool(
         description = "Retrieve the currently authenticated user's profile (id, login, name, mail, admin flag). Use this to resolve \"me\" or to check whether the credential is an admin before calling admin-only tools like list_redmine_users.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<CurrentUserOutput>(),
+        output_schema = crate::tools::schema::output::<CurrentUserOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn get_current_user(
@@ -418,7 +420,7 @@ impl RedmineMcp {
     /// and there is no `manage_redmine_query` tool.
     #[tool(
         description = "List the current user's saved (custom) issue queries. Redmine has no API to create, update, or delete saved queries, so this is the only query-related tool — do not look for a manage_redmine_query tool. Use this to resolve a saved query's name to an id. An empty list means the user has no saved queries.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<SavedQueriesOutput>(),
+        output_schema = crate::tools::schema::output::<SavedQueriesOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_queries(

@@ -32,7 +32,7 @@ impl RedmineMcp {
     /// `limit`/`offset` here; the reference contract has none.
     #[tool(
         description = "List all accessible projects in the Redmine instance. Use this first to resolve a project's numeric id or identifier before calling project- or issue-scoped tools. An empty list means the credential cannot see any projects — do not retry with the same arguments.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ProjectsOutput>(),
+        output_schema = crate::tools::schema::output::<ProjectsOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn list_redmine_projects(

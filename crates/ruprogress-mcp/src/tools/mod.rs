@@ -6,3 +6,4 @@ pub(crate) mod discovery;
 pub(crate) mod meta;
 pub(crate) mod output;
 pub(crate) mod projects;
+pub(crate) mod schema;

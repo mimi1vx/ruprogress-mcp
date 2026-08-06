@@ -49,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list_issue_statuses`/`list_issue_priorities`/`list_users`/
   `list_saved_queries`.
 
+### Fixed
+
+- Tool schemas no longer advertise the non-standard `uint32`/`uint64`
+  integer `format` values `schemars` emits for `u32`/`u64` fields, which made
+  strict JSON Schema clients (e.g. opencode's Ajv-based validator) log an
+  "unknown format" warning per field on every `tools/list`.
+
 ### Changed
 
 - The default HTTP bind is `127.0.0.1:8000`, not the reference server's

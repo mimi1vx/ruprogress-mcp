@@ -469,6 +469,91 @@ async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold()
     );
 }
 
+/// The `format` vocabulary `ajv-formats` recognizes (the set MCP clients
+/// such as opencode ship). Anything outside this list is either unknown to
+/// Ajv strict mode (schemars' Rust-specific `uint*`/`int128`) or simply not
+/// produced by this server's schemas; either way a new occurrence needs a
+/// human decision, not a silent pass.
+const ALLOWED_FORMATS: &[&str] = &[
+    "date",
+    "date-time",
+    "time",
+    "duration",
+    "uri",
+    "uri-reference",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "uuid",
+    "regex",
+    "int32",
+    "int64",
+    "float",
+    "double",
+];
+
+/// Recursively collect every `"format"` string found anywhere under `value`,
+/// tagging each with a JSON-pointer-ish path for a useful failure message.
+fn collect_formats(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(format)) = map.get("format") {
+                out.push((path.to_string(), format.clone()));
+            }
+            for (key, v) in map {
+                collect_formats(v, &format!("{path}/{key}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                collect_formats(v, &format!("{path}/{i}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Regression test for `tools::schema`: every `format` string served in any
+/// tool's `inputSchema`/`outputSchema` must be one Ajv strict mode (and thus
+/// opencode) already understands. This is what actually catches a future
+/// tool author who forgets to route a new struct through
+/// `tools::schema::output`/`input` — reverting either call site in
+/// `tools/discovery.rs` (in particular `list_project_trackers`'s
+/// `input_schema` override, since the macro would otherwise auto-derive an
+/// un-normalized schema) must fail this test.
+#[tokio::test]
+async fn every_served_schema_format_is_in_the_ajv_strict_mode_allowlist() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    for tool in &tools.tools {
+        let mut formats = Vec::new();
+        collect_formats(
+            &Value::Object(tool.input_schema.as_ref().clone()),
+            "inputSchema",
+            &mut formats,
+        );
+        if let Some(output_schema) = &tool.output_schema {
+            collect_formats(
+                &Value::Object(output_schema.as_ref().clone()),
+                "outputSchema",
+                &mut formats,
+            );
+        }
+        for (path, format) in formats {
+            assert!(
+                ALLOWED_FORMATS.contains(&format.as_str()),
+                "{}: {path} declares non-standard format {format:?}, not in ALLOWED_FORMATS",
+                tool.name
+            );
+        }
+    }
+}
+
 #[test]
 #[should_panic(expected = "must be a JSON object")]
 fn conformance_helper_rejects_a_bare_array_structured_content() {
