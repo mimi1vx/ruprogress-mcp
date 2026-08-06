@@ -25,7 +25,7 @@ pub struct SavedQuery {
 #[derive(Debug, Deserialize)]
 #[allow(
     dead_code,
-    reason = "model exists for round-trip tests; no phase-1 API method uses it yet"
+    reason = "model exists for round-trip tests; no API method uses it yet"
 )]
 pub(crate) struct SavedQueriesEnvelope {
     pub queries: Vec<SavedQuery>,
@@ -37,7 +37,7 @@ mod tests {
     use super::*;
 
     // Inline fixture: see tests/fixtures/README.md for the policy that
-    // applies to models with a real API method in phase 1's surface.
+    // applies to models with a real API method.
     const JSON: &str = r#"{"queries": [
         {"id": 1, "name": "My open issues", "is_public": false, "project_id": 1}
     ]}"#;

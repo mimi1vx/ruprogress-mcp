@@ -2,7 +2,7 @@
 
 Every fixture below is a synthetic JSON document built from the official
 Redmine REST API documentation's example shapes for the stated version, not a
-capture from a live instance (none was available while building phase 1).
+capture from a live instance (none was available while building this crate).
 All identifiers, names, and dates are placeholders (`Example Project`,
 `alice`, `2026-01-01`, ...); none of it is real data. If/when a fixture is
 later replaced with a genuine capture, update this table with the real

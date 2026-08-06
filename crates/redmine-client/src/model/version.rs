@@ -37,7 +37,7 @@ pub struct Version {
 #[derive(Debug, Deserialize)]
 #[allow(
     dead_code,
-    reason = "model exists for round-trip tests; no phase-1 API method uses it yet"
+    reason = "model exists for round-trip tests; no API method uses it yet"
 )]
 pub(crate) struct VersionEnvelope {
     pub version: Version,
@@ -49,7 +49,7 @@ mod tests {
     use super::*;
 
     // Inline fixture (not a captured-instance file): Version has no
-    // dedicated API method in phase 1's surface, so this exercises the
+    // dedicated API method yet, so this exercises the
     // model shape only. See tests/fixtures/README.md for the fixture policy
     // that applies to models with real API methods.
     const JSON: &str = r#"{"version": {

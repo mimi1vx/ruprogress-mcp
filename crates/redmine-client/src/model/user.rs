@@ -41,7 +41,7 @@ pub(crate) struct UserEnvelope {
 #[derive(Debug, Deserialize)]
 #[allow(
     dead_code,
-    reason = "model exists for round-trip tests; no phase-1 API method uses it yet"
+    reason = "model exists for round-trip tests; no API method uses it yet"
 )]
 pub(crate) struct UsersEnvelope {
     users: Vec<User>,

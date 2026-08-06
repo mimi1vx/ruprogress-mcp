@@ -2,7 +2,7 @@
 
 ## Context
 
-`plans/phase-0-workspace.md` sets `rust-version = "1.88"`, the floor required
+The workspace originally set `rust-version = "1.88"`, the floor required
 by `rmcp` 3.x. The local toolchain available for development and verification
 is 1.97.1; no 1.88 toolchain is installed, and per the sota-rust skill's
 tooling policy, arbitrary historical MSRV toolchains are not installed

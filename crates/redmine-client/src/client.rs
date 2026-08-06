@@ -459,7 +459,7 @@ impl Scoped<'_> {
 
     #[allow(
         dead_code,
-        reason = "part of the 1.3 request core; no phase-1 API method needs DELETE yet"
+        reason = "part of the request core; no API method needs DELETE yet"
     )]
     pub(crate) async fn delete(&self, path: &str) -> crate::Result<()> {
         let url = self.build_url(path, None)?;
@@ -545,7 +545,7 @@ impl Scoped<'_> {
     }
 }
 
-// --- Phase-1 API surface (plan §1.10) ---
+// --- Issue, project, and time-entry API surface ---
 
 impl Scoped<'_> {
     /// `GET /my/account.json` — the currently authenticated user. Works for

@@ -2,10 +2,12 @@
 
 ## Context
 
-`plans/phase-1-redmine-client.md` §1.0 requires a timeboxed (30 min) spike
-scoring `redmine-api` 0.11.5 (crates.io, https://github.com/taladar/redmine-api,
-last published 2026-06-08) against this project's load-bearing requirements
-before committing to a hand-written client.
+Before committing to a hand-written Redmine REST client, we ran a timeboxed
+(30 min) spike scoring `redmine-api` 0.11.5 (crates.io,
+https://github.com/taladar/redmine-api, last published 2026-06-08) against
+this project's load-bearing requirements: per-request credentials, typed
+status-code errors, a retry policy restricted to idempotent verbs, caller-
+controlled pagination caps, and rustls-only TLS with custom CA/mTLS support.
 
 ## Scoring
 
@@ -24,9 +26,9 @@ before committing to a hand-written client.
 
 **Reject** `redmine-api`. It fails three "must" requirements (per-request
 credential scoping, typed status-code errors, retry policy), which are exactly
-the load-bearing guarantees this project's parent plan (Risk 4: credential
-plumbing; error-mapping tests in phase 1) depends on. Proceed with 1.1 onward:
-build `redmine-client` in-house.
+the load-bearing guarantees this project depends on for safe multi-user
+credential handling and predictable error mapping. Build `redmine-client`
+in-house instead.
 
 ## Consequence
 

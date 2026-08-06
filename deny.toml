@@ -9,12 +9,16 @@ allow   = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
            # webpki-root-certs (via rustls-platform-verifier, pulled in by
            # reqwest's rustls TLS backend) redistributes Mozilla's root
            # certificate bundle under this license. Permissive; reviewed
-           # 2026-08-05 when phase 1 first pulled in reqwest.
+           # 2026-08-05 when reqwest was first added.
            "CDLA-Permissive-2.0"]
 
 [bans]
-multiple-versions = "warn"
-wildcards         = "deny"
+multiple-versions    = "warn"
+wildcards            = "deny"
+# ruprogress-mcp depends on redmine-client via a workspace path with no
+# version pin (both crates always release together); cargo-deny otherwise
+# flags that as an unbounded "wildcard" dependency.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

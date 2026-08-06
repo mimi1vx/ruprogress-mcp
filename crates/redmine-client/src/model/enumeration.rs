@@ -25,7 +25,7 @@ mod tests {
     use super::*;
 
     // Inline fixture: see tests/fixtures/README.md for the policy that
-    // applies to models with a real API method in phase 1's surface.
+    // applies to models with a real API method.
     const JSON: &str = r#"{"id": 1, "name": "Normal", "is_default": true, "active": true}"#;
 
     #[test]

@@ -14,8 +14,7 @@ A Redmine MCP server in Rust, providing tool-parity with the reference
 - Four auth modes: `legacy`, `legacy-per-user`, `oauth`, `oauth-proxy`.
 - A reusable `redmine-client` crate, independent of MCP.
 
-See [`plans/redmine-mcp-rust.md`](./plans/redmine-mcp-rust.md) for the full
-phased plan.
+See `docs/adr/` for the design decisions made along the way.
 
 ## Non-goals (v1.0)
 

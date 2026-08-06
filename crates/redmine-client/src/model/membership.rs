@@ -28,7 +28,7 @@ pub struct Membership {
 #[derive(Debug, Deserialize)]
 #[allow(
     dead_code,
-    reason = "model exists for round-trip tests; no phase-1 API method uses it yet"
+    reason = "model exists for round-trip tests; no API method uses it yet"
 )]
 pub(crate) struct MembershipEnvelope {
     pub membership: Membership,
@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     // Inline fixture: see tests/fixtures/README.md for the policy that
-    // applies to models with a real API method in phase 1's surface.
+    // applies to models with a real API method.
     const JSON: &str = r#"{"membership": {
         "id": 1, "project": {"id": 1, "name": "Example"}, "user": {"id": 2, "name": "Alice"},
         "roles": [{"id": 3, "name": "Manager"}]
