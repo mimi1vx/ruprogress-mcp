@@ -3,7 +3,12 @@
 //! `Config::from_map` lives as unit tests in `src/config.rs` — this file
 //! covers what only the real binary can exercise: env-file loading and
 //! stdout output, without ever touching this process's own environment.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,4 +76,158 @@ fn print_config_exits_nonzero_on_invalid_config() {
         .expect("binary should run");
 
     assert!(!output.status.success());
+}
+
+/// `--transport http --print-config` with `extra` appended to a minimal valid
+/// env file.
+fn print_http_config(extra: &str) -> std::process::Output {
+    let env_file = TempEnvFile::new(&format!(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\n{extra}"
+    ));
+    Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .args(["--transport", "http", "--print-config"])
+        .env_clear()
+        .output()
+        .expect("binary should run")
+}
+
+#[test]
+fn print_config_over_http_reports_the_bind_address() {
+    let output = print_http_config("");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(summary["transport"]["kind"], "http");
+    assert_eq!(summary["transport"]["bind"], "127.0.0.1:8000");
+    assert!(!stdout.contains("\"k\""), "stdout leaked the key: {stdout}");
+}
+
+#[test]
+fn a_non_loopback_bind_without_a_host_policy_refuses_to_start() {
+    let output = print_http_config("SERVER_HOST=0.0.0.0\n");
+    assert!(
+        !output.status.success(),
+        "a bare non-loopback bind must fail at startup, not serve with Host validation off"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    // The error message is the primary documentation for this failure; a
+    // troubleshooting search lands on its exact text.
+    assert!(stderr.contains("PUBLIC_HOST"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("REDMINE_MCP_ALLOWED_HOSTS"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_non_loopback_bind_starts_with_either_escape_hatch() {
+    for extra in [
+        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n",
+        "SERVER_HOST=0.0.0.0\nREDMINE_MCP_ALLOWED_HOSTS=*\n",
+    ] {
+        let output = print_http_config(extra);
+        assert!(
+            output.status.success(),
+            "should start with {extra:?}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Resolve config over the HTTP transport without binding anything, and
+/// return the process's stderr. `--print-config` runs the whole of
+/// `Config::from_map`, which is where the startup warnings are emitted.
+fn config_stderr(extra: &str) -> String {
+    let output = print_http_config(extra);
+    String::from_utf8(output.stderr).expect("stderr should be UTF-8")
+}
+
+#[test]
+fn a_non_loopback_bind_under_legacy_auth_warns_about_the_shared_key() {
+    let stderr = config_stderr("SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n");
+    assert!(stderr.contains("WARN"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("single shared Redmine API key"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn disabling_host_validation_warns() {
+    let stderr = config_stderr("REDMINE_MCP_ALLOWED_HOSTS=*\n");
+    assert!(stderr.contains("WARN"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Host validation is disabled"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn the_effective_host_allowlist_is_logged_once_at_startup() {
+    use std::process::Stdio;
+
+    let env_file = TempEnvFile::new(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\nSERVER_PORT=18322\n",
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .args(["--transport", "http"])
+        .env_clear()
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    // `wait_with_output`, not `wait` then read: reading a pipe only after the
+    // child exits deadlocks as soon as the boot log outgrows the pipe buffer.
+    let output = child.wait_with_output().expect("child should exit");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    // A 403 must be diagnosable from the boot line alone, without
+    // reconstructing the derivation from four environment variables.
+    assert!(stderr.contains("allowed_hosts"), "stderr: {stderr}");
+    assert!(stderr.contains("localhost"), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches("serving MCP over streamable HTTP").count(),
+        1,
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn sigterm_drains_the_http_server_and_exits_zero() {
+    use std::process::Stdio;
+
+    let env_file = TempEnvFile::new(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\nSERVER_PORT=18321\n",
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .args(["--transport", "http"])
+        .env_clear()
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    // `kill(2)` via the shell, so this crate stays `unsafe`-free.
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill should run");
+    assert!(killed.success());
+
+    let output = child.wait_with_output().expect("child should exit");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("drained cleanly"), "stderr: {stderr}");
 }

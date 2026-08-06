@@ -61,6 +61,22 @@ impl RedmineMcp {
             )),
         }
     }
+
+    /// The credential the *server itself* owns, for work not driven by a
+    /// client request (the readiness probe). `None` in the auth modes where
+    /// the credential arrives per request and there is therefore nothing to
+    /// probe with — distinct from `Some(Err(..))`, which means we do own a
+    /// credential and it did not work.
+    ///
+    /// Deliberately not routed through [`Self::scoped`]: that is the
+    /// *request* choke point and takes a `RequestContext` precisely so no
+    /// caller can reach Redmine on a client's behalf without one.
+    pub(crate) fn server_scoped(&self) -> Option<Result<Scoped<'_>, McpError>> {
+        match &self.inner.config.auth {
+            AuthMode::Legacy { .. } => Some(crate::auth::legacy::scoped(&self.inner.client)),
+            AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router.clone())]

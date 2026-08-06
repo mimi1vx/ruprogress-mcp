@@ -6,6 +6,8 @@
 //! 2024, `unsafe` to mutate — see ADR 0002).
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use redmine_client::Credential;
 use secrecy::SecretString;
@@ -60,11 +62,75 @@ pub struct OAuthConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyTrust(());
 
-/// The transport the server will run over. Only `Stdio` exists so far.
+/// Which transport the CLI selected. Parsed into a [`TransportConfig`] by
+/// [`Config::from_map`], which is where the HTTP variant's settings come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Stdio,
+    Http,
+}
+
+/// The transport the server will run over, with its validated settings.
+#[derive(Debug, Clone)]
 pub enum TransportConfig {
     Stdio,
+    Http(HttpConfig),
 }
+
+impl TransportConfig {
+    /// `"stdio"` or `"http"`, for logs and `get_mcp_server_info`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http(_) => "http",
+        }
+    }
+
+    #[must_use]
+    pub fn as_http(&self) -> Option<&HttpConfig> {
+        match self {
+            Self::Http(http) => Some(http),
+            Self::Stdio => None,
+        }
+    }
+}
+
+/// Streamable-HTTP transport settings.
+///
+/// `allowed_hosts`, `allowed_origins`, and `max_request_body_bytes` are handed
+/// straight to rmcp's `StreamableHttpServerConfig`, which implements the
+/// corresponding edge checks itself; this struct only validates and derives
+/// them.
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
+    /// `SERVER_HOST` + `SERVER_PORT`.
+    pub bind: SocketAddr,
+    /// `FASTMCP_STREAMABLE_HTTP_PATH`.
+    pub mcp_path: String,
+    /// Accepted `Host` authorities. An **empty** list means rmcp allows every
+    /// host, so this is only ever empty when `REDMINE_MCP_ALLOWED_HOSTS=*` was
+    /// set explicitly.
+    pub allowed_hosts: Vec<String>,
+    /// Accepted browser origins. Empty disables Origin validation (rmcp's
+    /// default) and suppresses the CORS layer entirely.
+    pub allowed_origins: Vec<String>,
+    pub max_request_body_bytes: usize,
+    /// How long a `/readyz` probe result stays cached.
+    pub health_ttl: Duration,
+    /// Applied to the health routes only — never to the MCP route, whose
+    /// responses may be long-lived SSE streams.
+    pub request_timeout: Duration,
+}
+
+const DEFAULT_SERVER_PORT: u16 = 8000;
+const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MIN_MAX_REQUEST_BODY_BYTES: usize = 1024;
+const MAX_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HEALTH_TTL_SECONDS: u64 = 3600;
+/// rmcp's own default, restated here because we must never let the list go
+/// empty by accident (an empty list means "allow every host").
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 /// Which plugin-gated tool families are enabled. Surfaced in
 /// `get_mcp_server_info`'s `plugin_flags`; no gated tools exist yet.
@@ -185,7 +251,305 @@ fn parse_redmine(vars: &EnvMap) -> Result<RedmineConfig, ConfigError> {
     Ok(RedmineConfig { url, ssl_verify })
 }
 
-fn parse_auth(vars: &EnvMap, transport: TransportConfig) -> Result<AuthMode, ConfigError> {
+fn parse_bind(vars: &EnvMap) -> Result<SocketAddr, ConfigError> {
+    // An IP literal, not a hostname: resolving a name at bind time would make
+    // the interface the server actually listens on depend on DNS, which is not
+    // something an operator should have to guess at.
+    let ip: IpAddr = match optional(vars, "SERVER_HOST") {
+        None => IpAddr::from([127, 0, 0, 1]),
+        Some(raw) => raw.parse().map_err(|_| ConfigError::Invalid {
+            var: "SERVER_HOST",
+            expected: "an IP address literal (e.g. 127.0.0.1, ::1, 0.0.0.0)",
+            because: "hostnames are rejected so the bound interface does not depend on DNS"
+                .to_string(),
+        })?,
+    };
+    let port = parse_port(vars, "SERVER_PORT")?.unwrap_or(DEFAULT_SERVER_PORT);
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn parse_port(vars: &EnvMap, var: &'static str) -> Result<Option<u16>, ConfigError> {
+    let Some(raw) = optional(vars, var) else {
+        return Ok(None);
+    };
+    let port: u16 = raw.parse().map_err(|_| ConfigError::Invalid {
+        var,
+        expected: "a TCP port between 1 and 65535",
+        because: "the value could not be parsed as a port number".to_string(),
+    })?;
+    if port == 0 {
+        return Err(ConfigError::Invalid {
+            var,
+            expected: "a TCP port between 1 and 65535",
+            because: "0 would bind an ephemeral port that no client could be told about"
+                .to_string(),
+        });
+    }
+    Ok(Some(port))
+}
+
+/// Path-segment guard for the MCP route: it is joined into an axum router, so
+/// traversal, query, and fragment characters must not survive config parsing.
+fn parse_mcp_path(vars: &EnvMap) -> Result<String, ConfigError> {
+    const VAR: &str = "FASTMCP_STREAMABLE_HTTP_PATH";
+    let Some(path) = optional(vars, VAR) else {
+        return Ok("/mcp".to_string());
+    };
+    let invalid = |because: &str| ConfigError::Invalid {
+        var: VAR,
+        expected: "an absolute path with at least one segment, e.g. \"/mcp\"",
+        because: because.to_string(),
+    };
+    if !path.starts_with('/') {
+        return Err(invalid("the path does not start with \"/\""));
+    }
+    if path == "/" {
+        return Err(invalid("\"/\" would shadow every other route"));
+    }
+    if path.contains("..") {
+        return Err(invalid("the path contains \"..\""));
+    }
+    if path.contains(['?', '#']) {
+        return Err(invalid("the path contains a query or fragment character"));
+    }
+    // `{}` is axum's path-capture syntax and `*` its wildcard: `/{x}` would
+    // mount the MCP service at every single-segment path.
+    if path.contains(['{', '}', '*']) {
+        return Err(invalid("the path contains a route-pattern character"));
+    }
+    if path.chars().any(char::is_whitespace) {
+        return Err(invalid("the path contains whitespace"));
+    }
+    Ok(path)
+}
+
+/// Splits a comma-separated variable, rejecting a value that is present but
+/// contains no usable entries.
+///
+/// "Set, but empty after parsing" must never collapse into "unset": for both
+/// allowlists that would silently turn a control *off* while the operator
+/// believes they configured it.
+fn parse_csv(vars: &EnvMap, var: &'static str) -> Result<Option<Vec<String>>, ConfigError> {
+    let Some(raw) = optional(vars, var) else {
+        return Ok(None);
+    };
+    let entries: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if entries.is_empty() {
+        return Err(ConfigError::Invalid {
+            var,
+            expected: "a comma-separated list with at least one entry",
+            because: "the value contains only separators and whitespace; unset the variable \
+                      instead of setting it empty"
+                .to_string(),
+        });
+    }
+    Ok(Some(entries))
+}
+
+fn parse_allowed_origins(vars: &EnvMap) -> Result<Vec<String>, ConfigError> {
+    const VAR: &str = "REDMINE_MCP_ALLOWED_ORIGINS";
+    let Some(origins) = parse_csv(vars, VAR)? else {
+        return Ok(Vec::new());
+    };
+    let invalid = |because: String| ConfigError::Invalid {
+        var: VAR,
+        expected: "a comma-separated list of absolute origins",
+        because,
+    };
+    for origin in &origins {
+        if origin == "*" {
+            return Err(invalid(
+                "\"*\" would allow any site in a browser to drive this server; list the exact \
+                 origins instead"
+                    .to_string(),
+            ));
+        }
+        // `Origin: null` is what a sandboxed iframe, a `data:` document, and a
+        // redirected cross-origin request all send, so allowlisting it grants
+        // access to a set nobody can enumerate.
+        if origin.eq_ignore_ascii_case("null") {
+            return Err(invalid(
+                "\"null\" is sent by sandboxed iframes and data: documents, so it is not an \
+                 origin that can be granted access"
+                    .to_string(),
+            ));
+        }
+        if !origin.contains("://") {
+            return Err(invalid(format!(
+                "{origin:?} has no scheme; write e.g. \"https://{origin}\""
+            )));
+        }
+        // rmcp silently drops entries it cannot parse, and the CORS layer
+        // needs each one as a `HeaderValue`. Reject here so the two views of
+        // the allowlist cannot diverge at runtime.
+        if http::HeaderValue::from_str(origin).is_err() {
+            return Err(invalid(format!(
+                "{origin:?} cannot be sent as an HTTP header value"
+            )));
+        }
+    }
+    Ok(origins)
+}
+
+/// Derives the `Host` allowlist, or fails when a non-loopback bind leaves it
+/// underivable.
+///
+/// An empty allowlist means *allow every host* in rmcp, and `Host` is the only
+/// signal that distinguishes a DNS-rebinding request from a legitimate one (the
+/// browser considers it same-origin, so CORS never runs). So a bind we cannot
+/// derive an allowlist for is refused at startup rather than served with the
+/// check silently off.
+fn parse_allowed_hosts(vars: &EnvMap, bind: SocketAddr) -> Result<Vec<String>, ConfigError> {
+    const VAR: &str = "REDMINE_MCP_ALLOWED_HOSTS";
+    if let Some(explicit) = parse_csv(vars, VAR)? {
+        if explicit.iter().any(|h| h == "*") {
+            // Only as the sole entry: `a.example.com,*` silently discarding
+            // `a.example.com` and disabling the check would be the worst kind
+            // of surprise, since it reads like it narrows the list.
+            if explicit.len() > 1 {
+                return Err(ConfigError::Invalid {
+                    var: VAR,
+                    expected: "either a list of hosts or the single value \"*\"",
+                    because: "\"*\" disables Host validation entirely, so combining it with \
+                              specific hosts is contradictory"
+                        .to_string(),
+                });
+            }
+            tracing::warn!(
+                "REDMINE_MCP_ALLOWED_HOSTS=*: Host validation is disabled, so this server accepts \
+                 requests for any hostname and cannot detect DNS rebinding. Only safe behind a \
+                 proxy that validates Host itself."
+            );
+            return Ok(Vec::new());
+        }
+        for host in &explicit {
+            validate_authority(VAR, host)?;
+        }
+        return Ok(explicit);
+    }
+
+    let public_port = parse_port(vars, "PUBLIC_PORT")?;
+    let public_host = optional(vars, "PUBLIC_HOST");
+    if public_host.is_none() && public_port.is_some() {
+        return Err(ConfigError::Conflict {
+            because:
+                "PUBLIC_PORT is set without PUBLIC_HOST; it only qualifies a PUBLIC_HOST entry \
+                      in the Host allowlist"
+                    .to_string(),
+        });
+    }
+
+    let Some(host) = public_host else {
+        if bind.ip().is_loopback() {
+            return Ok(LOOPBACK_HOSTS.iter().map(ToString::to_string).collect());
+        }
+        return Err(ConfigError::Missing {
+            var: "PUBLIC_HOST",
+            because: "SERVER_HOST is not a loopback address, so the Host allowlist cannot be \
+                      derived. Set PUBLIC_HOST to the hostname clients use to reach this server, \
+                      or set REDMINE_MCP_ALLOWED_HOSTS explicitly (\"*\" disables Host validation \
+                      entirely — only do this when a reverse proxy already validates Host).",
+        });
+    };
+    validate_authority("PUBLIC_HOST", &host)?;
+
+    let mut hosts: Vec<String> = LOOPBACK_HOSTS.iter().map(ToString::to_string).collect();
+    // A port-less entry matches *any* port in rmcp, so adding both `host` and
+    // `host:port` would make `host:port` — and therefore `PUBLIC_PORT` —
+    // decorative. Pin the port only when the operator asked for one.
+    hosts.push(match public_port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    });
+    hosts.dedup();
+    Ok(hosts)
+}
+
+/// Rejects a `Host` allowlist entry that rmcp could not match against
+/// anything. rmcp falls back to treating an unparseable entry as a literal
+/// hostname, so a malformed one silently matches nothing rather than erroring.
+fn validate_authority(var: &'static str, value: &str) -> Result<(), ConfigError> {
+    if http::uri::Authority::try_from(value).is_err() {
+        return Err(ConfigError::Invalid {
+            var,
+            expected: "a hostname, optionally with a port (e.g. \"mcp.example.com:8000\")",
+            because: format!("{value:?} is not a valid host authority"),
+        });
+    }
+    Ok(())
+}
+
+fn parse_http(vars: &EnvMap) -> Result<HttpConfig, ConfigError> {
+    let bind = parse_bind(vars)?;
+    let allowed_hosts = parse_allowed_hosts(vars, bind)?;
+    // The invariant the whole derivation exists to hold, restated where it can
+    // actually fail: an empty list is *allow every host* in rmcp, so it must
+    // only ever be reachable by asking for it by name.
+    if allowed_hosts.is_empty()
+        && optional(vars, "REDMINE_MCP_ALLOWED_HOSTS").as_deref() != Some("*")
+    {
+        return Err(ConfigError::Invalid {
+            var: "REDMINE_MCP_ALLOWED_HOSTS",
+            expected: "a non-empty Host allowlist",
+            because: "the derived allowlist came out empty, which would disable Host validation; \
+                      set REDMINE_MCP_ALLOWED_HOSTS=* if that is genuinely intended"
+                .to_string(),
+        });
+    }
+
+    let max_request_body_bytes = match optional(vars, "REDMINE_MCP_MAX_REQUEST_BODY_BYTES") {
+        None => DEFAULT_MAX_REQUEST_BODY_BYTES,
+        Some(raw) => {
+            let invalid = |because: String| ConfigError::Invalid {
+                var: "REDMINE_MCP_MAX_REQUEST_BODY_BYTES",
+                expected: "a byte count between 1024 and 67108864",
+                because,
+            };
+            let bytes: usize = raw.parse().map_err(|_| {
+                invalid("the value could not be parsed as a byte count".to_string())
+            })?;
+            if !(MIN_MAX_REQUEST_BODY_BYTES..=MAX_MAX_REQUEST_BODY_BYTES).contains(&bytes) {
+                return Err(invalid(format!("{bytes} is outside the accepted range")));
+            }
+            bytes
+        }
+    };
+
+    let health_ttl_seconds = match optional(vars, "HEALTH_INTROSPECTION_TTL_SECONDS") {
+        None => 30,
+        Some(raw) => {
+            let invalid = |because: String| ConfigError::Invalid {
+                var: "HEALTH_INTROSPECTION_TTL_SECONDS",
+                expected: "a number of seconds between 0 and 3600",
+                because,
+            };
+            let seconds: u64 = raw
+                .parse()
+                .map_err(|_| invalid("the value could not be parsed as a number".to_string()))?;
+            if seconds > MAX_HEALTH_TTL_SECONDS {
+                return Err(invalid(format!("{seconds} is longer than an hour")));
+            }
+            seconds
+        }
+    };
+
+    Ok(HttpConfig {
+        bind,
+        mcp_path: parse_mcp_path(vars)?,
+        allowed_hosts,
+        allowed_origins: parse_allowed_origins(vars)?,
+        max_request_body_bytes,
+        health_ttl: Duration::from_secs(health_ttl_seconds),
+        request_timeout: Duration::from_secs(10),
+    })
+}
+
+fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, ConfigError> {
     let mode = optional(vars, "REDMINE_AUTH_MODE").unwrap_or_else(|| "legacy".to_string());
     match mode.as_str() {
         "legacy" => {
@@ -204,7 +568,7 @@ fn parse_auth(vars: &EnvMap, transport: TransportConfig) -> Result<AuthMode, Con
                     because: "legacy-per-user auth requires an explicit attestation that a TLS-terminating proxy is in front (set to \"true\")",
                 });
             }
-            if transport == TransportConfig::Stdio {
+            if transport == TransportKind::Stdio {
                 return Err(ConfigError::Conflict {
                     because: "legacy-per-user auth requires per-request headers, which the stdio transport does not have".to_string(),
                 });
@@ -248,20 +612,36 @@ fn parse_plugins(vars: &EnvMap) -> Result<PluginFlags, ConfigError> {
 }
 
 impl Config {
-    /// Validate and build a `Config` from an injected env-var map. `transport`
-    /// is passed in rather than parsed from `vars` because it comes from the
-    /// CLI (`--transport`), not the environment — but auth-mode
-    /// validation still needs to know it (`legacy-per-user` is incompatible
-    /// with `stdio`).
+    /// Validate and build a `Config` from an injected env-var map. `kind`
+    /// comes from the CLI (`--transport`) rather than `vars`; the transport's
+    /// own settings are then parsed out of `vars`, and auth-mode validation
+    /// consults the kind (`legacy-per-user` is incompatible with `stdio`).
     ///
     /// # Errors
     ///
     /// Returns a [`ConfigError`] describing exactly which variable is
     /// missing, invalid, or conflicting.
-    pub fn from_map(vars: &EnvMap, transport: TransportConfig) -> Result<Self, ConfigError> {
+    pub fn from_map(vars: &EnvMap, kind: TransportKind) -> Result<Self, ConfigError> {
+        let redmine = parse_redmine(vars)?;
+        let auth = parse_auth(vars, kind)?;
+        let transport = match kind {
+            TransportKind::Stdio => TransportConfig::Stdio,
+            TransportKind::Http => TransportConfig::Http(parse_http(vars)?),
+        };
+
+        if let (TransportConfig::Http(http), AuthMode::Legacy { .. }) = (&transport, &auth)
+            && !http.bind.ip().is_loopback()
+        {
+            tracing::warn!(
+                bind = %http.bind,
+                "serving on a non-loopback address with a single shared Redmine API key: every \
+                 client that can reach this port acts as that Redmine account"
+            );
+        }
+
         Ok(Self {
-            redmine: parse_redmine(vars)?,
-            auth: parse_auth(vars, transport)?,
+            redmine,
+            auth,
             transport,
             read_only: optional_bool(vars, "REDMINE_MCP_READ_ONLY", false)?,
             plugins: parse_plugins(vars)?,
@@ -269,14 +649,14 @@ impl Config {
         })
     }
 
-    /// `from_map(std::env::vars().collect(), TransportConfig::Stdio)`.
+    /// `from_map(std::env::vars().collect(), TransportKind::Stdio)`.
     ///
     /// # Errors
     ///
     /// See [`Config::from_map`].
     pub fn from_env() -> Result<Self, ConfigError> {
         let vars: EnvMap = std::env::vars().collect();
-        Self::from_map(&vars, TransportConfig::Stdio)
+        Self::from_map(&vars, TransportKind::Stdio)
     }
 
     pub(crate) fn auth_mode_label(&self) -> &'static str {
@@ -298,19 +678,35 @@ impl Config {
     }
 
     /// A JSON summary safe to print (`--print-config`) or log: includes the
-    /// Redmine host and auth mode for operator debugging, but never a
-    /// credential. Used by `--print-config`; the `get_mcp_server_info` MCP
-    /// tool builds its own (stricter) summary from the same
-    /// [`Self::auth_mode_label`] / [`Self::plugin_flags_json`] helpers rather
-    /// than reusing this value directly, since it must also omit the host.
+    /// Redmine host, the bind address, and the auth mode for operator
+    /// debugging, but never a credential.
+    ///
+    /// This is the widest of three redaction surfaces, and they are
+    /// deliberately different rather than accidentally divergent:
+    ///
+    /// - `redacted_summary` (here) — operator-invoked and local, so internal
+    ///   topology is fine; secrets are not.
+    /// - `get_mcp_server_info` — reaches a language model, so it omits the
+    ///   Redmine host and the bind address on top of the secrets.
+    /// - `/readyz` — unauthenticated, so it carries readiness facts only and
+    ///   no configuration at all.
     #[must_use]
     pub fn redacted_summary(&self) -> serde_json::Value {
+        let transport = match &self.transport {
+            TransportConfig::Stdio => json!({ "kind": "stdio" }),
+            TransportConfig::Http(http) => json!({
+                "kind": "http",
+                "bind": http.bind.to_string(),
+                "mcp_path": http.mcp_path,
+            }),
+        };
         json!({
             "redmine": {
                 "url_host": self.redmine.url.host_str(),
                 "ssl_verify": self.redmine.ssl_verify,
             },
             "auth_mode": self.auth_mode_label(),
+            "transport": transport,
             "read_only_mode": self.read_only,
             "plugin_flags": self.plugin_flags_json(),
         })
@@ -318,7 +714,12 @@ impl Config {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -339,7 +740,7 @@ mod tests {
     #[test]
     fn redmine_url_missing_is_missing() {
         let vars = map(&[("REDMINE_API_KEY", "k")]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Missing {
@@ -352,7 +753,7 @@ mod tests {
     #[test]
     fn redmine_url_without_scheme_is_invalid() {
         let vars = map(&[("REDMINE_URL", "not a url"), ("REDMINE_API_KEY", "k")]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Invalid {
@@ -368,7 +769,7 @@ mod tests {
             ("REDMINE_URL", "ftp://example.com"),
             ("REDMINE_API_KEY", "k"),
         ]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Invalid {
@@ -384,7 +785,7 @@ mod tests {
             ("REDMINE_URL", "https://user:pass@example.com"),
             ("REDMINE_API_KEY", "k"),
         ]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Invalid {
@@ -397,7 +798,7 @@ mod tests {
     #[test]
     fn legacy_without_api_key_is_missing() {
         let vars = map(&[("REDMINE_URL", "https://redmine.example.com")]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Missing {
@@ -414,7 +815,7 @@ mod tests {
             "REDMINE_API_KEY_FILE".to_string(),
             "/tmp/whatever".to_string(),
         );
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(err, ConfigError::Conflict { .. }));
     }
 
@@ -426,7 +827,7 @@ mod tests {
         ]);
         // Trust-proxy is checked before the transport conflict, so this
         // reports Missing even on the only transport implemented so far (stdio).
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Missing {
@@ -443,7 +844,7 @@ mod tests {
             ("REDMINE_AUTH_MODE", "legacy-per-user"),
             ("REDMINE_PER_USER_TRUST_PROXY", "true"),
         ]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(err, ConfigError::Conflict { .. }));
     }
 
@@ -453,7 +854,7 @@ mod tests {
             ("REDMINE_URL", "https://redmine.example.com"),
             ("REDMINE_AUTH_MODE", "oauth"),
         ]);
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Missing {
@@ -470,7 +871,7 @@ mod tests {
             ("REDMINE_AUTH_MODE", "oauth"),
             ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
         ]);
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(matches!(config.auth, AuthMode::OAuth(_)));
     }
 
@@ -478,7 +879,7 @@ mod tests {
     fn ssl_verify_false_is_accepted() {
         let mut vars = valid_legacy();
         vars.insert("REDMINE_SSL_VERIFY".to_string(), "false".to_string());
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(!config.redmine.ssl_verify);
     }
 
@@ -486,7 +887,7 @@ mod tests {
     fn unknown_auth_mode_is_invalid() {
         let mut vars = valid_legacy();
         vars.insert("REDMINE_AUTH_MODE".to_string(), "bogus".to_string());
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Invalid {
@@ -499,7 +900,7 @@ mod tests {
     #[test]
     fn valid_legacy_config_parses() {
         let config =
-            Config::from_map(&valid_legacy(), TransportConfig::Stdio).expect("should be valid");
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
         assert!(matches!(config.auth, AuthMode::Legacy { .. }));
         assert!(!config.read_only);
         assert_eq!(config.redmine.url.host_str(), Some("redmine.example.com"));
@@ -509,7 +910,7 @@ mod tests {
     fn read_only_flag_parses() {
         let mut vars = valid_legacy();
         vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "true".to_string());
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(config.read_only);
     }
 
@@ -517,7 +918,7 @@ mod tests {
     fn plugin_flags_default_false_and_parse_true() {
         let mut vars = valid_legacy();
         vars.insert("REDMINE_DMSF_ENABLED".to_string(), "true".to_string());
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(config.plugins.dmsf);
         assert!(!config.plugins.agile);
     }
@@ -526,7 +927,7 @@ mod tests {
     fn invalid_bool_is_invalid() {
         let mut vars = valid_legacy();
         vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "maybe".to_string());
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Invalid {
@@ -546,7 +947,7 @@ mod tests {
             "REDMINE_API_KEY_FILE".to_string(),
             path.to_string_lossy().into_owned(),
         );
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(matches!(config.auth, AuthMode::Legacy { .. }));
         std::fs::remove_file(&path).ok();
     }
@@ -559,12 +960,12 @@ mod tests {
         // error text never contains either value.
         vars.insert("REDMINE_API_KEY".to_string(), SECRET.to_string());
         vars.insert("REDMINE_API_KEY_FILE".to_string(), "/tmp/other".to_string());
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(!format!("{err}").contains(SECRET));
 
         vars.remove("REDMINE_API_KEY_FILE");
         vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "maybe".to_string());
-        let err = Config::from_map(&vars, TransportConfig::Stdio).unwrap_err();
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(!format!("{err}").contains(SECRET));
     }
 
@@ -573,9 +974,362 @@ mod tests {
         const SECRET: &str = "super-secret-value-xyz";
         let mut vars = valid_legacy();
         vars.insert("REDMINE_API_KEY".to_string(), SECRET.to_string());
-        let config = Config::from_map(&vars, TransportConfig::Stdio).expect("should be valid");
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         let summary = config.redacted_summary().to_string();
         assert!(!summary.contains(SECRET));
         assert!(summary.contains("redmine.example.com"));
+    }
+
+    // --- HTTP transport -------------------------------------------------
+
+    /// `valid_legacy()` plus the given HTTP-transport overrides, parsed as
+    /// `TransportKind::Http`.
+    fn http(pairs: &[(&str, &str)]) -> Result<HttpConfig, ConfigError> {
+        let mut vars = valid_legacy();
+        for (k, v) in pairs {
+            vars.insert((*k).to_string(), (*v).to_string());
+        }
+        Config::from_map(&vars, TransportKind::Http).map(|c| match c.transport {
+            TransportConfig::Http(h) => h,
+            TransportConfig::Stdio => panic!("asked for http, got stdio"),
+        })
+    }
+
+    #[test]
+    fn http_defaults_to_loopback_port_8000() {
+        let cfg = http(&[]).expect("defaults should be valid");
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1:8000");
+        assert_eq!(cfg.mcp_path, "/mcp");
+        assert_eq!(cfg.allowed_hosts, ["localhost", "127.0.0.1", "::1"]);
+        assert!(cfg.allowed_origins.is_empty());
+        assert_eq!(cfg.max_request_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.health_ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn server_host_hostname_is_invalid() {
+        let err = http(&[("SERVER_HOST", "example.com")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "SERVER_HOST",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn server_port_zero_is_invalid() {
+        let err = http(&[("SERVER_PORT", "0")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "SERVER_PORT",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn server_port_non_numeric_is_invalid() {
+        let err = http(&[("SERVER_PORT", "eighty")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "SERVER_PORT",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn loopback_bind_without_a_host_policy_is_ok() {
+        let cfg = http(&[("SERVER_HOST", "::1")]).expect("loopback should be derivable");
+        assert_eq!(cfg.allowed_hosts, ["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn non_loopback_bind_without_a_host_policy_is_missing_public_host() {
+        let err = http(&[("SERVER_HOST", "0.0.0.0")]).unwrap_err();
+        let ConfigError::Missing {
+            var: "PUBLIC_HOST",
+            because,
+        } = err
+        else {
+            panic!("expected Missing PUBLIC_HOST, got {err:?}");
+        };
+        // The message is the primary documentation for this failure, so it
+        // must name both escape hatches.
+        assert!(because.contains("REDMINE_MCP_ALLOWED_HOSTS"));
+        assert!(because.contains('*'));
+    }
+
+    #[test]
+    fn public_host_alone_is_added_port_agnostically() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+        ])
+        .expect("PUBLIC_HOST should make the allowlist derivable");
+        // Bare, not `mcp.example.com:8000`: a port-less entry matches any port
+        // in rmcp, so adding both would make the qualified one decorative.
+        assert!(cfg.allowed_hosts.iter().any(|h| h == "mcp.example.com"));
+        assert!(
+            !cfg.allowed_hosts
+                .iter()
+                .any(|h| h.starts_with("mcp.example.com:"))
+        );
+    }
+
+    #[test]
+    fn public_port_pins_the_public_host_entry_to_that_port() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+            ("PUBLIC_PORT", "443"),
+        ])
+        .expect("should be valid");
+        assert!(cfg.allowed_hosts.iter().any(|h| h == "mcp.example.com:443"));
+        // The unqualified entry must be absent, or the port restricts nothing.
+        assert!(!cfg.allowed_hosts.iter().any(|h| h == "mcp.example.com"));
+    }
+
+    #[test]
+    fn a_malformed_public_host_is_invalid() {
+        let err = http(&[("SERVER_HOST", "0.0.0.0"), ("PUBLIC_HOST", "not a host")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "PUBLIC_HOST",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn public_port_without_public_host_is_conflict() {
+        let err = http(&[("PUBLIC_PORT", "443")]).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn allowed_hosts_star_disables_validation_and_yields_an_empty_list() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("REDMINE_MCP_ALLOWED_HOSTS", "*"),
+        ])
+        .expect("the explicit opt-out should be accepted");
+        assert!(cfg.allowed_hosts.is_empty());
+    }
+
+    /// The invariant the whole derivation exists for: rmcp reads an empty
+    /// `allowed_hosts` as *allow every host*, so no input other than an
+    /// explicit `*` may produce one.
+    #[test]
+    fn the_host_allowlist_is_never_empty_unless_star_was_asked_for() {
+        let inputs: &[&[(&str, &str)]] = &[
+            &[],
+            &[("SERVER_HOST", "::1")],
+            &[("SERVER_HOST", "0.0.0.0"), ("PUBLIC_HOST", "a.example.com")],
+            &[("REDMINE_MCP_ALLOWED_HOSTS", "a.example.com")],
+            // Present but empty after parsing: the case that must not quietly
+            // become "unset", and must certainly not become "allow all".
+            &[("REDMINE_MCP_ALLOWED_HOSTS", " , ")],
+            &[("REDMINE_MCP_ALLOWED_HOSTS", ",")],
+            &[("REDMINE_MCP_ALLOWED_HOSTS", "   ")],
+        ];
+        for input in inputs {
+            // Refusing to start is the other acceptable answer.
+            if let Ok(cfg) = http(input) {
+                assert!(
+                    !cfg.allowed_hosts.is_empty(),
+                    "{input:?} produced an empty allowlist, which disables Host validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_allowlist_that_is_set_but_empty_is_invalid_rather_than_ignored() {
+        for value in [" , ", ",", "   "] {
+            assert!(
+                matches!(
+                    http(&[("REDMINE_MCP_ALLOWED_HOSTS", value)]),
+                    Err(ConfigError::Invalid {
+                        var: "REDMINE_MCP_ALLOWED_HOSTS",
+                        ..
+                    })
+                ),
+                "{value:?} should be rejected"
+            );
+            assert!(
+                matches!(
+                    http(&[("REDMINE_MCP_ALLOWED_ORIGINS", value)]),
+                    Err(ConfigError::Invalid {
+                        var: "REDMINE_MCP_ALLOWED_ORIGINS",
+                        ..
+                    })
+                ),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn star_mixed_with_specific_hosts_is_invalid() {
+        let err = http(&[("REDMINE_MCP_ALLOWED_HOSTS", "a.example.com,*")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_HOSTS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_malformed_allowed_hosts_entry_is_invalid() {
+        let err = http(&[("REDMINE_MCP_ALLOWED_HOSTS", "not a host")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_HOSTS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_null_origin_is_invalid() {
+        let err = http(&[("REDMINE_MCP_ALLOWED_ORIGINS", "null")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_ORIGINS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_hosts_replaces_the_derived_list_entirely() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            (
+                "REDMINE_MCP_ALLOWED_HOSTS",
+                "a.example.com, b.example.com:9000",
+            ),
+        ])
+        .expect("should be valid");
+        assert_eq!(cfg.allowed_hosts, ["a.example.com", "b.example.com:9000"]);
+    }
+
+    #[test]
+    fn allowed_origins_star_is_invalid() {
+        let err = http(&[("REDMINE_MCP_ALLOWED_ORIGINS", "*")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_ORIGINS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_origins_without_a_scheme_is_invalid() {
+        let err = http(&[("REDMINE_MCP_ALLOWED_ORIGINS", "app.example.com")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_ORIGINS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_origins_parse_as_a_trimmed_list() {
+        let cfg = http(&[(
+            "REDMINE_MCP_ALLOWED_ORIGINS",
+            "https://app.example.com, http://localhost:5173",
+        )])
+        .expect("should be valid");
+        assert_eq!(
+            cfg.allowed_origins,
+            ["https://app.example.com", "http://localhost:5173"]
+        );
+    }
+
+    #[test]
+    fn mcp_path_must_be_an_absolute_multi_segment_path() {
+        for bad in ["mcp", "/", "/a/../b", "/mcp?x=1", "/mcp#f", "/m cp"] {
+            let Err(err) = http(&[("FASTMCP_STREAMABLE_HTTP_PATH", bad)]) else {
+                panic!("{bad:?} should be rejected");
+            };
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "FASTMCP_STREAMABLE_HTTP_PATH",
+                        ..
+                    }
+                ),
+                "{bad:?} produced {err:?}"
+            );
+        }
+        let cfg = http(&[("FASTMCP_STREAMABLE_HTTP_PATH", "/api/mcp")]).expect("should be valid");
+        assert_eq!(cfg.mcp_path, "/api/mcp");
+    }
+
+    #[test]
+    fn max_request_body_bytes_is_range_checked() {
+        assert!(http(&[("REDMINE_MCP_MAX_REQUEST_BODY_BYTES", "512")]).is_err());
+        assert!(http(&[("REDMINE_MCP_MAX_REQUEST_BODY_BYTES", "134217728")]).is_err());
+        assert!(http(&[("REDMINE_MCP_MAX_REQUEST_BODY_BYTES", "lots")]).is_err());
+        let cfg = http(&[("REDMINE_MCP_MAX_REQUEST_BODY_BYTES", "65536")]).expect("in range");
+        assert_eq!(cfg.max_request_body_bytes, 65536);
+    }
+
+    #[test]
+    fn health_ttl_is_range_checked_and_zero_is_allowed() {
+        assert!(http(&[("HEALTH_INTROSPECTION_TTL_SECONDS", "3601")]).is_err());
+        assert!(http(&[("HEALTH_INTROSPECTION_TTL_SECONDS", "soon")]).is_err());
+        let cfg = http(&[("HEALTH_INTROSPECTION_TTL_SECONDS", "0")]).expect("0 disables caching");
+        assert_eq!(cfg.health_ttl, Duration::ZERO);
+    }
+
+    #[test]
+    fn legacy_per_user_is_accepted_on_http_and_rejected_on_stdio() {
+        let vars = map(&[
+            ("REDMINE_URL", "https://redmine.example.com"),
+            ("REDMINE_AUTH_MODE", "legacy-per-user"),
+            ("REDMINE_PER_USER_TRUST_PROXY", "true"),
+        ]);
+        let config = Config::from_map(&vars, TransportKind::Http).expect("http should accept it");
+        assert!(matches!(config.auth, AuthMode::LegacyPerUser { .. }));
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn redacted_summary_reports_the_transport_but_still_no_secret() {
+        const SECRET: &str = "super-secret-value-xyz";
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_API_KEY".to_string(), SECRET.to_string());
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        let summary = config.redacted_summary();
+        assert!(!summary.to_string().contains(SECRET));
+        assert_eq!(summary["transport"]["kind"], "http");
+        assert_eq!(summary["transport"]["bind"], "127.0.0.1:8000");
+        assert_eq!(summary["transport"]["mcp_path"], "/mcp");
+
+        let stdio = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(
+            stdio.redacted_summary()["transport"],
+            json!({"kind": "stdio"})
+        );
     }
 }

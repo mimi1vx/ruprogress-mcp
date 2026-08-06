@@ -1,25 +1,30 @@
-//! CLI entry point: parse args, resolve config, run the stdio MCP server.
-//! stdout is reserved for the JSON-RPC transport once the server starts —
-//! everything else (tracing, `--print-config`) goes to stderr/a raw stdout
-//! write that bypasses the `print_stdout` lint deliberately (see
-//! `print_config` below).
+//! CLI entry point: parse args, resolve config, run the MCP server over the
+//! selected transport. stdout is reserved for the JSON-RPC stream once the
+//! stdio server starts — everything else (tracing, `--print-config`) goes to
+//! stderr/a raw stdout write that bypasses the `print_stdout` lint
+//! deliberately (see `print_config` below).
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
 use redmine_client::{RedmineClient, RedmineClientBuilder};
-use rmcp::ServiceExt as _;
-use ruprogress_mcp::config::{AuthMode, Config, TransportConfig};
+use ruprogress_mcp::config::{AuthMode, Config, TransportKind};
 use ruprogress_mcp::server::RedmineMcp;
+use ruprogress_mcp::transport;
+use tokio_util::sync::CancellationToken;
+
+/// How long in-flight HTTP requests get to finish after a shutdown signal.
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "ruprogress-mcp")]
 struct Cli {
-    #[arg(long, value_enum, default_value_t = TransportKind::Stdio)]
-    transport: TransportKind,
+    #[arg(long, value_enum, default_value_t = CliTransport::Stdio)]
+    transport: CliTransport,
     #[arg(long)]
     env_file: Option<PathBuf>,
     #[arg(long)]
@@ -30,14 +35,16 @@ struct Cli {
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum TransportKind {
+enum CliTransport {
     Stdio,
+    Http,
 }
 
-impl From<TransportKind> for TransportConfig {
-    fn from(kind: TransportKind) -> Self {
+impl From<CliTransport> for TransportKind {
+    fn from(kind: CliTransport) -> Self {
         match kind {
-            TransportKind::Stdio => Self::Stdio,
+            CliTransport::Stdio => Self::Stdio,
+            CliTransport::Http => Self::Http,
         }
     }
 }
@@ -129,38 +136,16 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-async fn run_server(server: RedmineMcp) -> anyhow::Result<()> {
-    let service = server
-        .serve(rmcp::transport::stdio())
-        .await
-        .context("failed to start the stdio MCP transport")?;
-    service.waiting().await.context("MCP server task failed")?;
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    init_tracing(cli.log_level.as_deref());
-
-    let vars = load_env_map(cli.env_file.as_deref())?;
-    let transport = TransportConfig::from(cli.transport);
-    let config = Config::from_map(&vars, transport)?;
-
-    if cli.print_config {
-        return print_config(&config);
-    }
-
-    let client = build_redmine_client(&config)?;
-    let server = RedmineMcp::new(client, config);
-
+/// stdio shutdown: abort the serving task. See `transport::stdio` for why a
+/// graceful drain is not attainable — and not needed — there.
+async fn run_stdio(server: RedmineMcp) -> anyhow::Result<()> {
     // Race a *spawned* task against the signal, not the future directly:
     // `serve()` reads from stdin on a blocking OS thread, which the same
     // SIGTERM can also interrupt (EINTR), nondeterministically finishing
     // that branch with a spurious transport error instead of letting the
     // signal branch win outright. Aborting the task on shutdown sidesteps
     // that race entirely — the process is about to exit either way.
-    let mut handle = tokio::spawn(run_server(server));
+    let mut handle = tokio::spawn(transport::stdio::serve(server));
     tokio::select! {
         result = &mut handle => match result {
             Ok(inner) => inner?,
@@ -173,4 +158,60 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// HTTP shutdown: cancel, then drain. The token is shared with both
+/// `axum::serve`'s graceful shutdown and rmcp's own service config, so a
+/// signal stops accepting connections and terminates in-flight MCP work from
+/// the same edge.
+async fn run_http(
+    server: RedmineMcp,
+    cfg: &ruprogress_mcp::config::HttpConfig,
+) -> anyhow::Result<()> {
+    let ct = CancellationToken::new();
+    let mut handle = tokio::spawn({
+        let (server, cfg, ct) = (server, cfg.clone(), ct.clone());
+        async move { transport::http::serve(server, &cfg, ct).await }
+    });
+
+    tokio::select! {
+        result = &mut handle => return result?,
+        () = wait_for_shutdown_signal() => {
+            tracing::info!("shutdown signal received, draining in-flight requests");
+            ct.cancel();
+        }
+    }
+
+    if let Ok(joined) = tokio::time::timeout(HTTP_DRAIN_TIMEOUT, handle).await {
+        joined??;
+        tracing::info!("drained cleanly");
+    } else {
+        tracing::warn!(
+            timeout_secs = HTTP_DRAIN_TIMEOUT.as_secs(),
+            "in-flight requests did not finish before the drain timeout; exiting anyway"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    init_tracing(cli.log_level.as_deref());
+
+    let vars = load_env_map(cli.env_file.as_deref())?;
+    let config = Config::from_map(&vars, TransportKind::from(cli.transport))?;
+
+    if cli.print_config {
+        return print_config(&config);
+    }
+
+    let http = config.transport.as_http().cloned();
+    let client = build_redmine_client(&config)?;
+    let server = RedmineMcp::new(client, config);
+
+    match &http {
+        Some(cfg) => run_http(server, cfg).await,
+        None => run_stdio(server).await,
+    }
 }

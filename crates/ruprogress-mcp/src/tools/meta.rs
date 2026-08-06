@@ -42,6 +42,10 @@ impl RedmineMcp {
             "server_version": env!("CARGO_PKG_VERSION"),
             "read_only_mode": self.inner.config.read_only,
             "auth_mode": self.inner.config.auth_mode_label(),
+            // Just the kind. Not the bind address and not the MCP path: the
+            // model has no use for either, and both are useful to an attacker
+            // who has achieved prompt injection.
+            "transport": self.inner.config.transport.label(),
             "current_user": current_user_json,
             "plugin_flags": self.inner.config.plugin_flags_json(),
         });
