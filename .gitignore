@@ -4,3 +4,11 @@
 *.pem
 *.key
 
+# The blanket *.pem rule above also caught redmine-client's TLS test
+# fixtures, which `tests/tls.rs` pulls in with `include_str!` — so the crate
+# did not compile from a fresh clone. These two files are throwaway
+# self-signed certs holding no real identity; see the README beside them.
+# Keep this exception to exactly that directory: nothing outside it is
+# reviewed for being safe to publish.
+!/crates/redmine-client/tests/certs/*.pem
+
