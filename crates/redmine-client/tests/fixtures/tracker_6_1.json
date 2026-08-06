@@ -1,0 +1,6 @@
+{
+  "trackers": [
+    { "id": 1, "name": "Bug", "description": "Software defect", "default_status": { "id": 1, "name": "New" } },
+    { "id": 2, "name": "Feature" }
+  ]
+}

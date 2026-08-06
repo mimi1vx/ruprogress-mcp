@@ -9,10 +9,12 @@ pub mod attachment;
 pub mod custom_field;
 pub mod enumeration;
 pub mod issue;
+pub mod issue_status;
 pub mod membership;
 pub mod project;
 pub mod query;
 pub mod time_entry;
+pub mod tracker;
 pub mod user;
 pub mod version;
 pub mod wiki;
@@ -51,10 +53,6 @@ pub(crate) trait Collection: serde::de::DeserializeOwned {
 /// fields `Option`: the difference between a paginated and an un-paginated
 /// endpoint is load-bearing and belongs in the type system, not a runtime
 /// check that can be gotten wrong per call site.
-#[allow(
-    dead_code,
-    reason = "no un-paginated API method exists yet; the discovery-tool sub-phase (4a) is the first to implement one"
-)]
 pub(crate) trait BareCollection: serde::de::DeserializeOwned {
     /// The element type of the collection.
     type Item;

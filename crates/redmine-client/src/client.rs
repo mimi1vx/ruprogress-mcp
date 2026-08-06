@@ -11,7 +11,10 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{IssueId, ProjectIdent};
-use crate::model::{BareCollection, Collection, issue, project, time_entry, user};
+use crate::model::{
+    BareCollection, Collection, enumeration, issue, issue_status, project, query, time_entry,
+    tracker, user,
+};
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
 
@@ -550,10 +553,6 @@ impl Scoped<'_> {
     /// `total_count` field: that means the endpoint is actually paginated,
     /// and silently returning only its first page would be worse than
     /// failing outright.
-    #[allow(
-        dead_code,
-        reason = "part of the request core; the discovery-tool sub-phase (4a) is the first API method to call it"
-    )]
     pub(crate) async fn get_collection<W: BareCollection>(
         &self,
         path: &str,
@@ -581,10 +580,6 @@ impl Scoped<'_> {
     /// `limit`/`offset` given and never follows on to a second page — unlike
     /// [`Scoped::fetch_all`], which auto-pages endpoints with no exposed
     /// `limit`/`offset` parameter.
-    #[allow(
-        dead_code,
-        reason = "part of the request core; the discovery-tool sub-phase (4a) is the first API method to call it"
-    )]
     pub(crate) async fn fetch_page<W: Collection>(
         &self,
         path: &str,
@@ -750,6 +745,77 @@ impl Scoped<'_> {
             )
             .await?;
         Ok(env.time_entry)
+    }
+
+    /// `GET /trackers.json` — no pagination envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_trackers(&self) -> crate::Result<Vec<tracker::Tracker>> {
+        self.get_collection::<tracker::TrackersEnvelope>("trackers.json", &Query::default())
+            .await
+    }
+
+    /// `GET /issue_statuses.json` — no pagination envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_issue_statuses(&self) -> crate::Result<Vec<issue_status::IssueStatus>> {
+        self.get_collection::<issue_status::IssueStatusesEnvelope>(
+            "issue_statuses.json",
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `GET /enumerations/issue_priorities.json` — no pagination envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_issue_priorities(&self) -> crate::Result<Vec<enumeration::Enumeration>> {
+        self.get_collection::<enumeration::IssuePrioritiesEnvelope>(
+            "enumerations/issue_priorities.json",
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `GET /users.json`, a single explicit page (admin-only on Redmine's
+    /// side).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 for a non-admin credential).
+    pub async fn list_users(
+        &self,
+        q: &user::UserQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<user::User>> {
+        self.fetch_page::<user::UsersEnvelope>("users.json", &q.to_query(), limit, offset)
+            .await
+    }
+
+    /// `GET /queries.json`, auto-paged. Redmine's REST API has no
+    /// create/update/delete for saved queries — this is read-only by nature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_saved_queries(&self) -> crate::Result<Page<query::SavedQuery>> {
+        self.fetch_all::<query::SavedQueriesEnvelope>("queries.json", &Query::default())
+            .await
     }
 }
 
@@ -960,6 +1026,158 @@ mod tests {
         assert_eq!(page.total_count, 100);
         assert_eq!(page.offset, 20);
         assert_eq!(page.limit, 10);
+        assert!(!page.truncated);
+    }
+
+    // --- Discovery-tool API methods (4a) ---
+
+    fn discovery_client(server: &wiremock::MockServer) -> RedmineClient {
+        RedmineClientBuilder::new(server.uri().parse().unwrap())
+            .credential(Credential::ApiKey(SecretString::from("k")))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_trackers_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/trackers.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "trackers": [{"id": 1, "name": "Bug"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let trackers = client
+            .as_user(&cred)
+            .list_trackers()
+            .await
+            .expect("list_trackers should succeed");
+        assert_eq!(trackers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_issue_statuses_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/issue_statuses.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issue_statuses": [{"id": 1, "name": "New", "is_closed": false}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let statuses = client
+            .as_user(&cred)
+            .list_issue_statuses()
+            .await
+            .expect("list_issue_statuses should succeed");
+        assert_eq!(statuses.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_issue_priorities_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/enumerations/issue_priorities.json",
+            ))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issue_priorities": [{"id": 1, "name": "Normal"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let priorities = client
+            .as_user(&cred)
+            .list_issue_priorities()
+            .await
+            .expect("list_issue_priorities should succeed");
+        assert_eq!(priorities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_users_sends_exactly_the_requested_limit_offset_and_filters() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/users.json"))
+            .and(wiremock::matchers::query_param("limit", "10"))
+            .and(wiremock::matchers::query_param("offset", "0"))
+            .and(wiremock::matchers::query_param("name", "Ale& Ünïcode"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "users": [{
+                        "id": 1, "login": "alice", "firstname": "Alice", "lastname": "Example",
+                        "created_on": "2026-01-01T00:00:00Z"
+                    }],
+                    "total_count": 1,
+                    "offset": 0,
+                    "limit": 10
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let q = user::UserQuery {
+            name: Some("Ale& Ünïcode".to_string()),
+            group_id: None,
+            status: None,
+        };
+        let page = client
+            .as_user(&cred)
+            .list_users(&q, 10, 0)
+            .await
+            .expect("list_users should succeed");
+        assert_eq!(page.items.len(), 1);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_saved_queries_auto_pages() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/queries.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "queries": [{"id": 1, "name": "My open issues"}],
+                    "total_count": 1,
+                    "offset": 0,
+                    "limit": 100
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let page = client
+            .as_user(&cred)
+            .list_saved_queries()
+            .await
+            .expect("list_saved_queries should succeed");
+        assert_eq!(page.items.len(), 1);
         assert!(!page.truncated);
     }
 }

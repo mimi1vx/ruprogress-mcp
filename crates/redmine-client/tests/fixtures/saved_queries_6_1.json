@@ -1,0 +1,8 @@
+{
+  "queries": [
+    { "id": 1, "name": "My open issues", "is_public": false, "project_id": 1 }
+  ],
+  "total_count": 1,
+  "offset": 0,
+  "limit": 100
+}

@@ -9,5 +9,9 @@ pub mod write_tools {
     /// populated as write tools land, and the tests in `tests/readonly.rs`
     /// turn a stale or missing name here into a build/test failure rather
     /// than a silent read-only-mode bypass.
+    ///
+    /// The 4a discovery-tool sub-phase deliberately adds nothing here: all
+    /// seven of its tools (including `list_redmine_users`, which merely
+    /// *requires* an admin credential) are reads.
     pub const ALL: &[&str] = &[];
 }

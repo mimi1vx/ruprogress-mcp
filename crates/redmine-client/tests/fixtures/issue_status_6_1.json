@@ -1,0 +1,6 @@
+{
+  "issue_statuses": [
+    { "id": 1, "name": "New", "is_closed": false, "is_default": true },
+    { "id": 5, "name": "Closed", "is_closed": true, "is_default": false }
+  ]
+}

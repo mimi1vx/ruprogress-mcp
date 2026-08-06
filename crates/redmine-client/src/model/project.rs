@@ -38,6 +38,12 @@ pub struct Project {
     /// Custom field values attached to this project.
     #[serde(default)]
     pub custom_fields: Option<Vec<CustomField>>,
+    /// Trackers enabled for this project. `None` means trackers were not
+    /// requested (no `include=trackers` on the request that produced this
+    /// value) — **not** that none are enabled; `Some(vec![])` means none
+    /// are enabled.
+    #[serde(default)]
+    pub trackers: Option<Vec<IdName>>,
 }
 
 /// `include=` values accepted by the project endpoints.
@@ -149,6 +155,25 @@ mod tests {
         let env: ProjectEnvelope =
             serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
         assert_eq!(env.project.identifier, "example-project");
+    }
+
+    const FIXTURE_WITH_TRACKERS_7_0: &str =
+        include_str!("../../tests/fixtures/project_with_trackers_7_0.json");
+
+    #[test]
+    fn trackers_is_none_when_not_requested() {
+        let env: ProjectEnvelope =
+            serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
+        assert!(env.project.trackers.is_none());
+    }
+
+    #[test]
+    fn trackers_is_populated_when_include_trackers_was_requested() {
+        let env: ProjectEnvelope = serde_json::from_str(FIXTURE_WITH_TRACKERS_7_0)
+            .expect("project_with_trackers fixture should parse");
+        let trackers = env.project.trackers.expect("trackers should be Some");
+        assert_eq!(trackers.len(), 2);
+        assert_eq!(trackers.first().unwrap().name, "Bug");
     }
 
     #[test]

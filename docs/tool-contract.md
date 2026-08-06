@@ -9,8 +9,10 @@ and a one-line return shape. This is a snapshot for drift detection, not a spec 
 the upstream doc is authoritative; re-vendor when implementing more tools.
 
 Tools currently implemented: `get_mcp_server_info`, `get_current_user`,
-`list_redmine_projects`. All others are recorded here for reference as the
-rest of the tool surface is built out.
+`list_redmine_projects`, `list_redmine_trackers`, `list_project_trackers`,
+`list_redmine_issue_statuses`, `list_redmine_issue_priorities`,
+`list_redmine_users`, `list_redmine_queries`. All others are recorded here
+for reference as the rest of the tool surface is built out.
 
 ## Project Management
 

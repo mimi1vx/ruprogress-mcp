@@ -19,6 +19,12 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "get_current_user",
     "get_mcp_server_info",
     "list_redmine_projects",
+    "list_redmine_trackers",
+    "list_project_trackers",
+    "list_redmine_issue_statuses",
+    "list_redmine_issue_priorities",
+    "list_redmine_users",
+    "list_redmine_queries",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -81,6 +87,10 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_mcp_server_info",
 ];
 
+/// Tools implemented so far that take parameters (everything else must have
+/// an empty `properties` object).
+const TOOLS_WITH_PARAMETERS: &[&str] = &["list_project_trackers", "list_redmine_users"];
+
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -105,8 +115,12 @@ async fn tools_list_returns_exactly_the_implemented_tools() {
     expected.sort_unstable();
     assert_eq!(names, expected);
 
-    // Every tool implemented so far takes no parameters.
+    // Every tool implemented so far takes no parameters, except the two
+    // discovery tools with a documented input contract.
     for tool in &tools.tools {
+        if TOOLS_WITH_PARAMETERS.contains(&tool.name.as_ref()) {
+            continue;
+        }
         let props = tool
             .input_schema
             .get("properties")
@@ -333,6 +347,46 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         })))
         .mount(&h.redmine)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/trackers.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"trackers": []})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "project": {
+                "id": 1, "name": "P", "identifier": "p",
+                "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z",
+                "trackers": []
+            }
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issue_statuses.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue_statuses": []})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/enumerations/issue_priorities.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue_priorities": []})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "users": [], "total_count": 0, "offset": 0, "limit": 25
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/queries.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "queries": [], "total_count": 0, "offset": 0, "limit": 100
+        })))
+        .mount(&h.redmine)
+        .await;
 
     let tools = h
         .client
@@ -340,9 +394,13 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .await
         .expect("list_tools should succeed");
     for tool in &tools.tools {
+        let mut request = CallToolRequestParams::new(tool.name.clone());
+        if tool.name.as_ref() == "list_project_trackers" {
+            request.arguments = json!({"project_id": 1}).as_object().cloned();
+        }
         let result = h
             .client
-            .call_tool(CallToolRequestParams::new(tool.name.clone()))
+            .call_tool(request)
             .await
             .unwrap_or_else(|e| panic!("{} should be callable: {e}", tool.name));
         let schema = tool
@@ -386,6 +444,29 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
             tool.name
         );
     }
+}
+
+/// Phase 4 Risk 3: 36 tools × (description + input schema + output schema) is
+/// materially more `tools/list` JSON than the reference server's 36 × two
+/// schemas. This is the baseline measurement the remaining sub-phases are
+/// checked against — a generous threshold, not a tight one, so it fails loud
+/// and early if a future sub-phase balloons descriptions or schemas rather
+/// than silently degrading context budgets.
+#[tokio::test]
+async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
+    assert!(
+        bytes.len() < 50_000,
+        "tools/list is {} bytes for {} tools; over the Phase 4 baseline threshold of 50000",
+        bytes.len(),
+        tools.tools.len()
+    );
 }
 
 #[test]

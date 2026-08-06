@@ -6,6 +6,8 @@
 
 use serde::Deserialize;
 
+use super::Collection;
+
 /// A saved Redmine query.
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
@@ -23,12 +25,31 @@ pub struct SavedQuery {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "model exists for round-trip tests; no API method uses it yet"
-)]
 pub(crate) struct SavedQueriesEnvelope {
-    pub queries: Vec<SavedQuery>,
+    queries: Vec<SavedQuery>,
+    total_count: u64,
+    offset: u64,
+    limit: u32,
+}
+
+impl Collection for SavedQueriesEnvelope {
+    type Item = SavedQuery;
+
+    fn total_count(&self) -> u64 {
+        self.total_count
+    }
+
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    fn into_items(self) -> Vec<SavedQuery> {
+        self.queries
+    }
 }
 
 #[cfg(test)]
@@ -36,15 +57,21 @@ pub(crate) struct SavedQueriesEnvelope {
 mod tests {
     use super::*;
 
-    // Inline fixture: see tests/fixtures/README.md for the policy that
-    // applies to models with a real API method.
-    const JSON: &str = r#"{"queries": [
-        {"id": 1, "name": "My open issues", "is_public": false, "project_id": 1}
-    ]}"#;
+    const FIXTURE_6_1: &str = include_str!("../../tests/fixtures/saved_queries_6_1.json");
+    const FIXTURE_7_0: &str = include_str!("../../tests/fixtures/saved_queries_7_0.json");
 
     #[test]
-    fn round_trips() {
-        let env: SavedQueriesEnvelope = serde_json::from_str(JSON).expect("should parse");
+    fn round_trips_against_6_1_fixture() {
+        let env: SavedQueriesEnvelope =
+            serde_json::from_str(FIXTURE_6_1).expect("6.1 fixture should parse");
+        assert_eq!(env.queries.first().unwrap().name, "My open issues");
+        assert_eq!(env.total_count, 1);
+    }
+
+    #[test]
+    fn round_trips_against_7_0_fixture() {
+        let env: SavedQueriesEnvelope =
+            serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
         assert_eq!(env.queries.first().unwrap().name, "My open issues");
     }
 }

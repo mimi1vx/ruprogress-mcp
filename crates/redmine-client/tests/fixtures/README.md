@@ -18,6 +18,17 @@ capture date and re-run the scrub test below.
 | `time_entry_7_0.json` | 7.0 | `GET /time_entries/1.json` | `Z`-suffixed timestamps |
 | `user_6_1.json` | 6.1 | `GET /my/account.json` | naive timestamps; `mail` omitted (permission-gated field, and email-shaped strings are exactly what the scrub test below rejects) |
 | `user_7_0.json` | 7.0 | `GET /my/account.json` | `Z`-suffixed timestamps |
+| `tracker_6_1.json` | 6.1 | `GET /trackers.json` | second tracker omits `default_status` |
+| `tracker_7_0.json` | 7.0 | `GET /trackers.json` | every tracker carries `default_status` |
+| `issue_status_6_1.json` | 6.1 | `GET /issue_statuses.json` | carries `is_default` |
+| `issue_status_7_0.json` | 7.0 | `GET /issue_statuses.json` | omits `is_default` (dropped from this endpoint) |
+| `issue_priority_6_1.json` | 6.1 | `GET /enumerations/issue_priorities.json` | — |
+| `issue_priority_7_0.json` | 7.0 | `GET /enumerations/issue_priorities.json` | — |
+| `users_list_6_1.json` | 6.1 | `GET /users.json` | naive timestamp; no `admin` field |
+| `users_list_7_0.json` | 7.0 | `GET /users.json` | `Z`-suffixed timestamp; `admin: true` |
+| `saved_queries_6_1.json` | 6.1 | `GET /queries.json` | — |
+| `saved_queries_7_0.json` | 7.0 | `GET /queries.json` | — |
+| `project_with_trackers_7_0.json` | 7.0 | `GET /projects/1.json?include=trackers` | `project.trackers` populated |
 
 ## Scrubbing
 

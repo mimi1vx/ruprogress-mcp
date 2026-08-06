@@ -1,0 +1,6 @@
+{
+  "issue_priorities": [
+    { "id": 1, "name": "Low", "is_default": false, "active": true },
+    { "id": 2, "name": "Normal", "is_default": true, "active": true }
+  ]
+}

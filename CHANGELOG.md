@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cut.
 - `redmine-client`: `Scoped::get_collection`/`Scoped::fetch_page` request
   primitives for Redmine's un-paginated and single-page-only endpoints.
+- Six discovery/enumeration tools: `list_redmine_trackers`,
+  `list_project_trackers`, `list_redmine_issue_statuses`,
+  `list_redmine_issue_priorities`, `list_redmine_users`,
+  `list_redmine_queries`, alongside the existing `get_current_user`. Each
+  resolves a name to an id before a create/update tool needs it.
+  `list_redmine_users` requires an admin credential and clamps `limit` to
+  1-100; a non-admin call returns a `FORBIDDEN` error naming
+  `get_current_user` as the next step instead of retrying.
+- `redmine-client`: `Tracker` and `IssueStatus` models, an `admin` field on
+  `User`, a `trackers` field on `Project` (populated only when
+  `include=trackers` was requested), and `Scoped::list_trackers`/
+  `list_issue_statuses`/`list_issue_priorities`/`list_users`/
+  `list_saved_queries`.
 
 ### Changed
 
