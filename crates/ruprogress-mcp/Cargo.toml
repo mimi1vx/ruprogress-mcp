@@ -22,6 +22,7 @@ tower-http  = { workspace = true, features = ["cors", "trace", "timeout", "set-h
 http        = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+schemars    = { workspace = true, features = ["chrono04"] }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 chrono      = { workspace = true }

@@ -3,5 +3,6 @@
 //! `server.rs` merges them into the router served to clients.
 
 pub(crate) mod meta;
+pub(crate) mod output;
 pub(crate) mod projects;
 pub(crate) mod users;

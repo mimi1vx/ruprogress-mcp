@@ -11,7 +11,7 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{IssueId, ProjectIdent};
-use crate::model::{Collection, issue, project, time_entry, user};
+use crate::model::{BareCollection, Collection, issue, project, time_entry, user};
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
 
@@ -543,6 +543,74 @@ impl Scoped<'_> {
             truncated,
         })
     }
+
+    /// Fetch a Redmine collection endpoint that carries **no** pagination
+    /// envelope (e.g. `{"trackers": [...]}`), sending no `limit`/`offset`
+    /// query parameters. Errors loudly if the response turns out to carry a
+    /// `total_count` field: that means the endpoint is actually paginated,
+    /// and silently returning only its first page would be worse than
+    /// failing outright.
+    #[allow(
+        dead_code,
+        reason = "part of the request core; the discovery-tool sub-phase (4a) is the first API method to call it"
+    )]
+    pub(crate) async fn get_collection<W: BareCollection>(
+        &self,
+        path: &str,
+        query: &Query,
+    ) -> crate::Result<Vec<W::Item>> {
+        let value: serde_json::Value = self.get_json(path, query).await?;
+        if value.get("total_count").is_some() {
+            use serde::de::Error as _;
+            return Err(Error::Decode {
+                context: "un-paginated collection response",
+                source: serde_json::Error::custom(
+                    "response carries a total_count field; this endpoint is paginated, use fetch_page/fetch_all instead",
+                ),
+            });
+        }
+        let envelope: W = serde_json::from_value(value).map_err(|source| Error::Decode {
+            context: "un-paginated collection response",
+            source,
+        })?;
+        Ok(envelope.into_items())
+    }
+
+    /// Fetch exactly one page of a Redmine collection endpoint that exposes
+    /// `limit`/`offset` as tool-level parameters. Sends exactly the
+    /// `limit`/`offset` given and never follows on to a second page — unlike
+    /// [`Scoped::fetch_all`], which auto-pages endpoints with no exposed
+    /// `limit`/`offset` parameter.
+    #[allow(
+        dead_code,
+        reason = "part of the request core; the discovery-tool sub-phase (4a) is the first API method to call it"
+    )]
+    pub(crate) async fn fetch_page<W: Collection>(
+        &self,
+        path: &str,
+        query: &Query,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<W::Item>> {
+        let mut q = query.clone();
+        q.insert("limit", limit.to_string());
+        q.insert("offset", offset.to_string());
+        let envelope: W = self.get_json(path, &q).await?;
+        let total_count = envelope.total_count();
+        let offset = envelope.offset();
+        let limit = envelope.limit();
+        Ok(Page {
+            items: envelope.into_items(),
+            total_count,
+            offset,
+            limit,
+            // A single explicit page is never truncated by our own limits:
+            // nothing here decided to stop early. Whether more data exists
+            // beyond this page is pagination metadata for the caller to
+            // derive from total_count/limit/offset, not this flag.
+            truncated: false,
+        })
+    }
 }
 
 // --- Issue, project, and time-entry API surface ---
@@ -745,5 +813,153 @@ mod tests {
             .endpoint("issues.json")
             .expect("relative path should be accepted");
         assert_eq!(url.as_str(), "https://example.com/issues.json");
+    }
+
+    // --- get_collection / fetch_page (D6) ---
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestWidget {
+        #[allow(dead_code, reason = "only the item count matters to these tests")]
+        id: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestBareEnvelope {
+        widgets: Vec<TestWidget>,
+    }
+
+    impl BareCollection for TestBareEnvelope {
+        type Item = TestWidget;
+
+        fn into_items(self) -> Vec<TestWidget> {
+            self.widgets
+        }
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestPagedEnvelope {
+        widgets: Vec<TestWidget>,
+        total_count: u64,
+        offset: u64,
+        limit: u32,
+    }
+
+    impl Collection for TestPagedEnvelope {
+        type Item = TestWidget;
+
+        fn total_count(&self) -> u64 {
+            self.total_count
+        }
+
+        fn offset(&self) -> u64 {
+            self.offset
+        }
+
+        fn limit(&self) -> u32 {
+            self.limit
+        }
+
+        fn into_items(self) -> Vec<TestWidget> {
+            self.widgets
+        }
+    }
+
+    #[tokio::test]
+    async fn get_collection_sends_no_pagination_params_and_returns_items() {
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri().parse().unwrap();
+        let client = RedmineClientBuilder::new(base)
+            .credential(Credential::ApiKey(SecretString::from("k")))
+            .build()
+            .unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/widgets.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "widgets": [{"id": 1}, {"id": 2}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let items = client
+            .as_user(&cred)
+            .get_collection::<TestBareEnvelope>("widgets.json", &Query::default())
+            .await
+            .expect("un-paginated collection should be fetched");
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_collection_errors_loudly_on_a_paginated_envelope() {
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri().parse().unwrap();
+        let client = RedmineClientBuilder::new(base)
+            .credential(Credential::ApiKey(SecretString::from("k")))
+            .build()
+            .unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/widgets.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "widgets": [{"id": 1}],
+                    "total_count": 50,
+                    "offset": 0,
+                    "limit": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let err = client
+            .as_user(&cred)
+            .get_collection::<TestBareEnvelope>("widgets.json", &Query::default())
+            .await
+            .expect_err("a paginated envelope must not be silently treated as complete");
+        assert!(matches!(err, Error::Decode { .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_page_sends_exactly_the_requested_limit_and_offset_and_does_not_follow_on() {
+        let server = wiremock::MockServer::start().await;
+        let base = server.uri().parse().unwrap();
+        let client = RedmineClientBuilder::new(base)
+            .credential(Credential::ApiKey(SecretString::from("k")))
+            .build()
+            .unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/widgets.json"))
+            .and(wiremock::matchers::query_param("limit", "10"))
+            .and(wiremock::matchers::query_param("offset", "20"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "widgets": [{"id": 21}],
+                    "total_count": 100,
+                    "offset": 20,
+                    "limit": 10
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let page = client
+            .as_user(&cred)
+            .fetch_page::<TestPagedEnvelope>("widgets.json", &Query::default(), 10, 20)
+            .await
+            .expect("single page fetch should succeed");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total_count, 100);
+        assert_eq!(page.offset, 20);
+        assert_eq!(page.limit, 10);
+        assert!(!page.truncated);
     }
 }

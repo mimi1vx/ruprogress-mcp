@@ -1,12 +1,35 @@
 //! `get_mcp_server_info`.
 
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::CallToolResult;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Serialize;
 
+use crate::config::PluginFlags;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
+use crate::tools::output;
+
+/// A boundary-wrapped summary of the authenticated user, or absent when
+/// Redmine is unreachable or the credential could not be resolved.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct CurrentUserSummary {
+    pub(crate) id: u64,
+    pub(crate) login: Option<String>,
+    /// `"firstname lastname"`, boundary-wrapped.
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ServerInfoOutput {
+    pub(crate) server_version: String,
+    pub(crate) read_only_mode: bool,
+    pub(crate) auth_mode: String,
+    pub(crate) transport: String,
+    pub(crate) current_user: Option<CurrentUserSummary>,
+    pub(crate) plugin_flags: PluginFlags,
+}
 
 #[tool_router(router = meta_tool_router, vis = "pub(crate)")]
 impl RedmineMcp {
@@ -14,7 +37,9 @@ impl RedmineMcp {
     /// identity of the authenticated Redmine user. The response excludes
     /// credentials, internal hostnames, and filesystem paths.
     #[tool(
-        description = "Return the MCP server's version, read-only/auth mode, plugin flags, and the identity of the authenticated Redmine user (or null if Redmine is unreachable)."
+        description = "Return the MCP server's version, read-only/auth mode, plugin flags, and the identity of the authenticated Redmine user (or null if Redmine is unreachable). Use this once at the start of a session to learn what the server can do before calling other tools.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ServerInfoOutput>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]
     pub(crate) async fn get_mcp_server_info(
         &self,
@@ -26,35 +51,23 @@ impl RedmineMcp {
         };
 
         let boundary = Boundary::new();
-        let (current_user_json, wrapped_any) = match current_user {
-            Some(u) => (
-                Some(json!({
-                    "id": u.id,
-                    "login": u.login,
-                    "name": boundary.wrap("user.name", &format!("{} {}", u.firstname, u.lastname)),
-                })),
-                true,
-            ),
-            None => (None, false),
-        };
+        let current_user = current_user.map(|u| CurrentUserSummary {
+            id: u.id,
+            login: u.login,
+            name: boundary.wrap("user.name", &format!("{} {}", u.firstname, u.lastname)),
+        });
 
-        let body = json!({
-            "server_version": env!("CARGO_PKG_VERSION"),
-            "read_only_mode": self.inner.config.read_only,
-            "auth_mode": self.inner.config.auth_mode_label(),
+        let output = ServerInfoOutput {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            read_only_mode: self.inner.config.read_only,
+            auth_mode: self.inner.config.auth_mode_label().to_string(),
             // Just the kind. Not the bind address and not the MCP path: the
             // model has no use for either, and both are useful to an attacker
             // who has achieved prompt injection.
-            "transport": self.inner.config.transport.label(),
-            "current_user": current_user_json,
-            "plugin_flags": self.inner.config.plugin_flags_json(),
-        });
-
-        let mut blocks = Vec::new();
-        if wrapped_any {
-            blocks.push(ContentBlock::text(boundary.preamble()));
-        }
-        blocks.push(ContentBlock::text(body.to_string()));
-        Ok(CallToolResult::success(blocks))
+            transport: self.inner.config.transport.label().to_string(),
+            current_user,
+            plugin_flags: self.inner.config.plugins,
+        };
+        Ok(output::ok(&output, self.output_caps()))
     }
 }

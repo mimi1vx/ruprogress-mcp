@@ -216,7 +216,9 @@ async fn list_redmine_projects_returns_fixture_derived_content() {
         .and_then(|l| serde_json::from_str(l).ok())
         .expect("last content block should be the JSON body");
 
-    let projects = body.as_array().expect("body should be a JSON array");
+    let projects = body["projects"]
+        .as_array()
+        .expect("body.projects should be a JSON array");
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0]["id"], 1);
     assert_eq!(projects[0]["identifier"], "my-project");
@@ -227,6 +229,8 @@ async fn list_redmine_projects_returns_fixture_derived_content() {
             .unwrap()
             .starts_with("<<<untrusted:")
     );
+    assert_eq!(body["pagination"]["total"], 1);
+    assert_eq!(body["pagination"]["truncated"], false);
 }
 
 #[tokio::test]
@@ -279,4 +283,118 @@ async fn get_mcp_server_info_never_leaks_the_redmine_host() {
         !text.contains(&host),
         "get_mcp_server_info leaked the Redmine host: {text}"
     );
+}
+
+// --- Sub-phase 4.0: structured output, schemas, and annotations (D1/D2/D7) ---
+
+#[tokio::test]
+async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_annotations() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    for tool in &tools.tools {
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} is missing an outputSchema", tool.name));
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("object"),
+            "{}'s outputSchema root must be \"type\": \"object\" (D2)",
+            tool.name
+        );
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} is missing annotations", tool.name));
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(true),
+            "{} should be annotated read_only_hint = true",
+            tool.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_implemented_tool_call_returns_structured_content_matching_its_schema() {
+    let h = support::harness(&[]).await;
+    support::mock_current_user(&h.redmine, None).await;
+    Mock::given(method("GET"))
+        .and(path("/projects.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "projects": [],
+            "total_count": 0,
+            "offset": 0,
+            "limit": 100
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    for tool in &tools.tools {
+        let result = h
+            .client
+            .call_tool(CallToolRequestParams::new(tool.name.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{} should be callable: {e}", tool.name));
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} is missing an outputSchema", tool.name));
+        support::assert_structured_content_matches_schema(&result, schema);
+    }
+}
+
+#[tokio::test]
+async fn every_tool_description_is_short_and_names_when_to_call_it() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    for tool in &tools.tools {
+        let description = tool
+            .description
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} has no description", tool.name));
+        assert!(
+            !description.is_empty(),
+            "{} has an empty description",
+            tool.name
+        );
+        assert!(
+            description.len() <= 400,
+            "{}'s description is {} chars, over the 400-char budget",
+            tool.name,
+            description.len()
+        );
+        let names_when_to_call = ["Use this", "Use when", "Call this", "Call when"]
+            .iter()
+            .any(|phrase| description.contains(phrase));
+        assert!(
+            names_when_to_call,
+            "{}'s description does not say when to call it: {description:?}",
+            tool.name
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "must be a JSON object")]
+fn conformance_helper_rejects_a_bare_array_structured_content() {
+    let schema = serde_json::json!({"type": "object"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = rmcp::model::CallToolResult::structured(serde_json::json!([1, 2, 3]));
+    support::assert_structured_content_matches_schema(&result, &schema);
 }

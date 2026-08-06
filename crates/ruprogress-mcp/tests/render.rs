@@ -63,7 +63,7 @@ async fn forged_delimiter_in_a_project_description_is_neutralised() {
         .await;
 
     let body = call_list_projects(&h).await;
-    let description = body[0]["description"]
+    let description = body["projects"][0]["description"]
         .as_str()
         .expect("description should be a string");
 
@@ -94,7 +94,7 @@ async fn nonce_differs_between_two_separate_tool_responses() {
     let first = call_list_projects(&h).await;
     let second = call_list_projects(&h).await;
     assert_ne!(
-        first[0]["name"], second[0]["name"],
+        first["projects"][0]["name"], second["projects"][0]["name"],
         "nonce should differ per response"
     );
 }

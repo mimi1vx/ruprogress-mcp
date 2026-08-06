@@ -45,6 +45,23 @@ pub(crate) trait Collection: serde::de::DeserializeOwned {
     fn into_items(self) -> Vec<Self::Item>;
 }
 
+/// A collection response with **no** pagination envelope at all — just
+/// `{"<key>": [...]}`, no `total_count`/`offset`/`limit`. Kept as a distinct
+/// trait from [`Collection`] rather than making the latter's pagination
+/// fields `Option`: the difference between a paginated and an un-paginated
+/// endpoint is load-bearing and belongs in the type system, not a runtime
+/// check that can be gotten wrong per call site.
+#[allow(
+    dead_code,
+    reason = "no un-paginated API method exists yet; the discovery-tool sub-phase (4a) is the first to implement one"
+)]
+pub(crate) trait BareCollection: serde::de::DeserializeOwned {
+    /// The element type of the collection.
+    type Item;
+    /// Consume the envelope, yielding just the items.
+    fn into_items(self) -> Vec<Self::Item>;
+}
+
 /// Parse a Redmine timestamp that may or may not carry a UTC suffix.
 /// Some configurations emit `"2025-01-15T10:00:00"` (naive, assumed UTC)
 /// instead of RFC 3339's `"...Z"`.

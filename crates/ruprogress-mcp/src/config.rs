@@ -27,6 +27,13 @@ pub struct Config {
     pub plugins: PluginFlags,
     /// Reserved for attachment storage; no fields yet.
     pub attachments: AttachmentConfig,
+    /// Hard cap on items in a single list tool's response
+    /// (`REDMINE_MCP_MAX_RESPONSE_ITEMS`, default 200), enforced above
+    /// `redmine-client`'s own byte caps (D9).
+    pub max_response_items: usize,
+    /// Hard cap on a single tool response's serialized size in bytes
+    /// (`REDMINE_MCP_MAX_RESPONSE_BYTES`, default 256 KiB).
+    pub max_response_bytes: usize,
 }
 
 /// Redmine connection settings.
@@ -123,6 +130,8 @@ pub struct HttpConfig {
     pub request_timeout: Duration,
 }
 
+const DEFAULT_MAX_RESPONSE_ITEMS: usize = 200;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const DEFAULT_SERVER_PORT: u16 = 8000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MIN_MAX_REQUEST_BODY_BYTES: usize = 1024;
@@ -134,7 +143,7 @@ const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 /// Which plugin-gated tool families are enabled. Surfaced in
 /// `get_mcp_server_info`'s `plugin_flags`; no gated tools exist yet.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, schemars::JsonSchema)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "mirrors the upstream reference server's six independent plugin toggles exactly"
@@ -611,6 +620,29 @@ fn parse_plugins(vars: &EnvMap) -> Result<PluginFlags, ConfigError> {
     })
 }
 
+/// Parses a positive `usize` env var, rejecting `0` (which would make every
+/// list tool return an empty collection — almost certainly a misconfiguration
+/// rather than what the operator meant).
+fn positive_usize(vars: &EnvMap, var: &'static str, default: usize) -> Result<usize, ConfigError> {
+    let Some(raw) = optional(vars, var) else {
+        return Ok(default);
+    };
+    let invalid = |because: String| ConfigError::Invalid {
+        var,
+        expected: "a positive integer",
+        because,
+    };
+    let value: usize = raw
+        .parse()
+        .map_err(|_| invalid("the value could not be parsed as a number".to_string()))?;
+    if value == 0 {
+        return Err(invalid(
+            "0 would make every list tool return an empty collection".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
 impl Config {
     /// Validate and build a `Config` from an injected env-var map. `kind`
     /// comes from the CLI (`--transport`) rather than `vars`; the transport's
@@ -646,6 +678,16 @@ impl Config {
             read_only: optional_bool(vars, "REDMINE_MCP_READ_ONLY", false)?,
             plugins: parse_plugins(vars)?,
             attachments: AttachmentConfig,
+            max_response_items: positive_usize(
+                vars,
+                "REDMINE_MCP_MAX_RESPONSE_ITEMS",
+                DEFAULT_MAX_RESPONSE_ITEMS,
+            )?,
+            max_response_bytes: positive_usize(
+                vars,
+                "REDMINE_MCP_MAX_RESPONSE_BYTES",
+                DEFAULT_MAX_RESPONSE_BYTES,
+            )?,
         })
     }
 
@@ -912,6 +954,43 @@ mod tests {
         vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "true".to_string());
         let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(config.read_only);
+    }
+
+    #[test]
+    fn output_caps_default_to_200_items_and_256_kib() {
+        let config =
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.max_response_items, 200);
+        assert_eq!(config.max_response_bytes, 256 * 1024);
+    }
+
+    #[test]
+    fn output_caps_parse_from_env() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_MAX_RESPONSE_ITEMS".to_string(),
+            "50".to_string(),
+        );
+        vars.insert(
+            "REDMINE_MCP_MAX_RESPONSE_BYTES".to_string(),
+            "1024".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.max_response_items, 50);
+        assert_eq!(config.max_response_bytes, 1024);
+    }
+
+    #[test]
+    fn output_caps_reject_zero() {
+        for var in [
+            "REDMINE_MCP_MAX_RESPONSE_ITEMS",
+            "REDMINE_MCP_MAX_RESPONSE_BYTES",
+        ] {
+            let mut vars = valid_legacy();
+            vars.insert(var.to_string(), "0".to_string());
+            let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { var: v, .. } if v == var));
+        }
     }
 
     #[test]

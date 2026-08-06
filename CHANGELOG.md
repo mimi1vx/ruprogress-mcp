@@ -23,11 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_mcp_server_info` reports the active `transport`.
 - Cargo workspace scaffold with `redmine-client` and `ruprogress-mcp` crates.
 - Workspace-wide lints, `rustfmt.toml`, `deny.toml`, and CI gates.
+- Every tool returns structured content (`structuredContent`) validating
+  against a declared JSON output schema, plus `readOnlyHint`/
+  `idempotentHint`/`openWorldHint` annotations.
+- Redmine API failures are reported in-band as `{error, code, retryable,
+  hint}` results (`isError: true`) instead of protocol-level errors, so a
+  model can see and react to them.
+- `REDMINE_MCP_MAX_RESPONSE_ITEMS` (default 200) and
+  `REDMINE_MCP_MAX_RESPONSE_BYTES` (default 256 KiB) cap list-tool response
+  size, surfaced as `pagination.truncated` plus a hint rather than a silent
+  cut.
+- `redmine-client`: `Scoped::get_collection`/`Scoped::fetch_page` request
+  primitives for Redmine's un-paginated and single-page-only endpoints.
 
 ### Changed
 
 - The default HTTP bind is `127.0.0.1:8000`, not the reference server's
   `0.0.0.0:8000`.
+- `list_redmine_projects` now returns `{"projects": [...], "pagination":
+  {...}}` instead of a bare JSON array, so `structuredContent` is a JSON
+  object per the MCP spec.
+- The prompt-injection delimiter scheme is now explained once per session in
+  the MCP `initialize` instructions, instead of a repeated text block on
+  every tool response.
 - `/health` reports readiness only; it no longer carries version, auth mode,
   read-only state, or plugin flags. Those remain on `get_mcp_server_info` and
   `--print-config`.

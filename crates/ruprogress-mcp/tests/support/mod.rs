@@ -133,6 +133,94 @@ pub(crate) async fn http_harness(env: &[(&str, &str)]) -> HttpHarness {
     }
 }
 
+/// Assert `result.structured_content` is present, is a JSON **object** (D2),
+/// and validates against `schema` (a tool's declared `outputSchema`).
+///
+/// This is a minimal structural check — object/array/scalar `type`,
+/// `properties`, `required`, array `items` — not a general JSON Schema
+/// validator. Sufficient for our own hand-written, deliberately flat output
+/// schemas (see phase-4-core-tools.md Risk 3); adopt a real validator crate
+/// if a future schema needs `anyOf`/`oneOf`/`$ref`.
+pub(crate) fn assert_structured_content_matches_schema(
+    result: &rmcp::model::CallToolResult,
+    schema: &serde_json::Map<String, serde_json::Value>,
+) {
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("tool result must carry structured_content");
+    assert!(
+        structured.is_object(),
+        "structuredContent must be a JSON object per D2, got {structured}"
+    );
+    assert_schema(structured, &serde_json::Value::Object(schema.clone()), "$");
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn assert_schema(value: &serde_json::Value, schema: &serde_json::Value, path: &str) {
+    let Some(schema_obj) = schema.as_object() else {
+        return;
+    };
+
+    if let Some(ty) = schema_obj.get("type") {
+        let allowed: Vec<&str> = match ty {
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+            _ => vec![],
+        };
+        let actual = json_type_name(value);
+        // A JSON integer also satisfies a schema `"type": "number"`.
+        let matches =
+            allowed.contains(&actual) || (actual == "integer" && allowed.contains(&"number"));
+        assert!(
+            matches,
+            "{path}: expected type in {allowed:?}, got {actual} ({value})"
+        );
+    }
+
+    if let Some(props) = schema_obj.get("properties").and_then(|p| p.as_object())
+        && let Some(obj) = value.as_object()
+    {
+        for (key, sub_schema) in props {
+            if let Some(sub_value) = obj.get(key) {
+                assert_schema(sub_value, sub_schema, &format!("{path}.{key}"));
+            }
+        }
+    }
+
+    if let Some(required) = schema_obj.get("required").and_then(|r| r.as_array())
+        && let Some(obj) = value.as_object()
+    {
+        for req in required {
+            if let Some(key) = req.as_str() {
+                assert!(
+                    obj.contains_key(key),
+                    "{path}: missing required field {key:?}"
+                );
+            }
+        }
+    }
+
+    if let Some(items_schema) = schema_obj.get("items")
+        && let Some(arr) = value.as_array()
+    {
+        for (i, item) in arr.iter().enumerate() {
+            assert_schema(item, items_schema, &format!("{path}[{i}]"));
+        }
+    }
+}
+
 /// Mock `GET /my/account.json` with a fixture user, `times` responses expected.
 pub(crate) async fn mock_current_user(redmine: &wiremock::MockServer, times: Option<u64>) {
     use wiremock::matchers::{method, path};

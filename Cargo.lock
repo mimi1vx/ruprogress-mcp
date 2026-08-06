@@ -1455,6 +1455,7 @@ dependencies = [
  "redmine-client",
  "reqwest",
  "rmcp",
+ "schemars",
  "secrecy",
  "serde",
  "serde_json",
