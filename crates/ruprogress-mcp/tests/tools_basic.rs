@@ -52,6 +52,7 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "manage_issue_category",
     "search_entire_redmine",
     "manage_redmine_wiki_page",
+    "get_gantt_chart",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -145,6 +146,7 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "manage_issue_category",
     "search_entire_redmine",
     "manage_redmine_wiki_page",
+    "get_gantt_chart",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -561,6 +563,7 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
             "list_redmine_versions",
             "list_project_members",
             "get_project_modules",
+            "get_gantt_chart",
         ];
         let issue_id_only_tools = ["get_redmine_issue", "list_subtasks", "get_private_notes"];
         if project_id_only_tools.contains(&tool.name.as_ref()) {
@@ -639,6 +642,11 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// 4f's single `get_gantt_chart` tool and 4g's `get_mcp_server_info`
 /// extension (no new tool, more output fields) at the same per-tool rate,
 /// while still catching a runaway sub-phase.
+///
+/// 4f lands `get_gantt_chart` (37 tools, 111 038 bytes observed): 120 000
+/// still has headroom, and 4g needs no new tool (the `get_mcp_server_info`
+/// extension already landed as part of 4.0's retrofit) — this is the final
+/// tool the Phase 4 core-tools threshold needs to cover.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold() {
     let h = support::harness(&[]).await;

@@ -58,13 +58,14 @@ async fn no_write_tool_name_exists_in_a_read_only_router() {
 #[tokio::test]
 async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
     let h = support::harness(&[]).await;
-    // `get_gantt_chart` is a real future tool name (see
-    // docs/tool-contract.md, sub-phase 4f) that does not exist in the
-    // router yet — the router's response to it is identical to what it
-    // will return for a route removed by read-only mode.
+    // `get_checklist` is a real future tool name (see
+    // docs/tool-contract.md, the Checklist plugin family, not in Phase 4's
+    // 36 core tools) that does not exist in the router yet — the router's
+    // response to it is identical to what it will return for a route
+    // removed by read-only mode.
     let result = h
         .client
-        .call_tool(CallToolRequestParams::new("get_gantt_chart"))
+        .call_tool(CallToolRequestParams::new("get_checklist"))
         .await;
     assert!(
         result.is_err(),
