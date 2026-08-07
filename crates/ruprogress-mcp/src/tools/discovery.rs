@@ -56,6 +56,20 @@ pub(crate) struct ListProjectTrackersParams {
     pub(crate) project_id: ProjectRef,
 }
 
+/// Convert a [`ProjectRef`] (D5's untagged `integer | string` union) to a
+/// validated [`ProjectIdent`], on the first line of every tool that takes a
+/// `project_id` parameter — shared by `discovery.rs` and `projects.rs`. An
+/// invalid slug identifier is an **argument** error (`McpError`), not a tool
+/// result: the model gave us something that cannot be a project.
+pub(crate) fn resolve_project_ref(r: ProjectRef) -> Result<ProjectIdent, McpError> {
+    match r {
+        ProjectRef::Id(id) => Ok(ProjectIdent::Id(ProjectId(id))),
+        ProjectRef::Identifier(s) => ProjectIdentifier::from_str(&s)
+            .map(ProjectIdent::Identifier)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None)),
+    }
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct ProjectTrackerOut {
     pub(crate) id: u64,
@@ -226,12 +240,7 @@ impl RedmineMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListProjectTrackersParams>,
     ) -> Result<CallToolResult, McpError> {
-        let project_ident = match params.project_id {
-            ProjectRef::Id(id) => ProjectIdent::Id(ProjectId(id)),
-            ProjectRef::Identifier(s) => ProjectIdentifier::from_str(&s)
-                .map(ProjectIdent::Identifier)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
-        };
+        let project_ident = resolve_project_ref(params.project_id)?;
 
         let scoped = self.scoped(&ctx)?;
         let project = match scoped

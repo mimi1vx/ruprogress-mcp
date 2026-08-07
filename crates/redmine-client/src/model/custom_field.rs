@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Deserializer};
 
+use super::{BareCollection, IdName};
+
 /// The value of a single Redmine custom field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustomFieldValue {
@@ -60,6 +62,85 @@ pub struct CustomField {
     /// The value, if Redmine included one.
     #[serde(default)]
     pub value: Option<CustomFieldValue>,
+}
+
+/// A single allowed value for a `field_format: "list"` custom field, as
+/// Redmine's `GET /custom_fields.json` sends it (`{"value": ..., "label":
+/// ...}`). `CustomFieldDefinition::possible_values` collapses these to their
+/// `value`s, matching the flattened shape the reference server documents.
+#[derive(Debug, Clone, Deserialize)]
+struct PossibleValue {
+    value: String,
+}
+
+/// A custom field *definition*, as returned by the global, admin-only
+/// `GET /custom_fields.json` — distinct from [`CustomField`], which is the
+/// value attached to one resource. Redmine's `is_required` here is the
+/// definition's own flag; workflow rules and per-tracker settings can still
+/// make a field effectively required without it being reflected here (see
+/// `plans/phase-4c-projects.md` and the reference tool-reference.md caveat
+/// on `list_project_issue_custom_fields`).
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct CustomFieldDefinition {
+    /// The custom field's id.
+    pub id: u64,
+    /// The custom field's display name.
+    pub name: String,
+    /// `"string"`, `"list"`, `"date"`, ...
+    pub field_format: String,
+    /// The definition's own required flag (see the struct-level caveat).
+    #[serde(default)]
+    pub is_required: Option<bool>,
+    /// Whether multiple values may be selected.
+    #[serde(default)]
+    pub multiple: Option<bool>,
+    /// The default value, if any.
+    #[serde(default)]
+    pub default_value: Option<String>,
+    /// The allowed values, for `field_format: "list"` fields.
+    #[serde(default, deserialize_with = "deserialize_possible_values")]
+    pub possible_values: Option<Vec<String>>,
+    /// `"issue"`, `"project"`, `"time_entry"`, `"user"`, `"version"`,
+    /// `"group"`, ... `None` for older Redmine versions that omit it.
+    #[serde(default)]
+    pub customized_type: Option<String>,
+    /// Whether this field applies to every project rather than a specific
+    /// list.
+    #[serde(default)]
+    pub is_for_all: Option<bool>,
+    /// The projects this field is scoped to, when `is_for_all` is `false`.
+    /// Only present for `customized_type == "issue"`.
+    #[serde(default)]
+    pub projects: Option<Vec<IdName>>,
+    /// The trackers this field applies to. Only present for
+    /// `customized_type == "issue"`.
+    #[serde(default)]
+    pub trackers: Option<Vec<IdName>>,
+}
+
+fn deserialize_possible_values<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Vec<PossibleValue>>::deserialize(deserializer)?;
+    Ok(raw.map(|values| values.into_iter().map(|v| v.value).collect()))
+}
+
+/// `GET /custom_fields.json` carries no pagination envelope at all
+/// (confirmed against `custom_fields/index.api.rsb`, which has no
+/// `api_meta` call) — it is also admin-only on Redmine's side.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CustomFieldDefinitionsEnvelope {
+    custom_fields: Vec<CustomFieldDefinition>,
+}
+
+impl BareCollection for CustomFieldDefinitionsEnvelope {
+    type Item = CustomFieldDefinition;
+
+    fn into_items(self) -> Vec<CustomFieldDefinition> {
+        self.custom_fields
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +198,32 @@ mod tests {
         let without_value: CustomField =
             serde_json::from_str(r#"{"id":2,"name":"Empty"}"#).unwrap();
         assert_eq!(without_value.value, None);
+    }
+
+    #[test]
+    fn custom_field_definitions_envelope_round_trips_and_flattens_possible_values() {
+        let json = r#"{"custom_fields": [{
+            "id": 6, "name": "Size", "field_format": "list", "is_required": false,
+            "multiple": false, "default_value": "M",
+            "possible_values": [{"value": "S", "label": "S"}, {"value": "M", "label": "M"}],
+            "customized_type": "issue", "is_for_all": true,
+            "trackers": [{"id": 5, "name": "Bug"}]
+        }]}"#;
+        let env: CustomFieldDefinitionsEnvelope = serde_json::from_str(json).expect("should parse");
+        let field = env.custom_fields.first().unwrap();
+        assert_eq!(
+            field.possible_values,
+            Some(vec!["S".to_string(), "M".to_string()])
+        );
+        assert_eq!(field.customized_type.as_deref(), Some("issue"));
+    }
+
+    #[test]
+    fn custom_field_definition_without_possible_values_parses() {
+        let json = r#"{"custom_fields": [{
+            "id": 1, "name": "Notes", "field_format": "text"
+        }]}"#;
+        let env: CustomFieldDefinitionsEnvelope = serde_json::from_str(json).expect("should parse");
+        assert_eq!(env.custom_fields.first().unwrap().possible_values, None);
     }
 }

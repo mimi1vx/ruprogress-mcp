@@ -1,8 +1,8 @@
-//! `GET /projects/{id}/memberships`.
+//! `GET/POST /projects/{id}/memberships`, `GET/PUT/DELETE /memberships/{id}`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::IdName;
+use super::{Collection, IdName};
 
 /// A project membership: a user or group, and the roles they hold on a
 /// project.
@@ -26,12 +26,68 @@ pub struct Membership {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "model exists for round-trip tests; no API method uses it yet"
-)]
 pub(crate) struct MembershipEnvelope {
     pub membership: Membership,
+}
+
+/// `GET /projects/{id}/memberships.json` — genuinely paginated
+/// (`MembersController#index` calls `api_offset_and_limit`), unlike
+/// `list_redmine_versions`'s endpoint.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MembershipsEnvelope {
+    memberships: Vec<Membership>,
+    total_count: u64,
+    offset: u64,
+    limit: u32,
+}
+
+impl Collection for MembershipsEnvelope {
+    type Item = Membership;
+
+    fn total_count(&self) -> u64 {
+        self.total_count
+    }
+
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    fn into_items(self) -> Vec<Membership> {
+        self.memberships
+    }
+}
+
+/// The `membership` hash sent to `POST /projects/{id}/memberships.json`.
+/// Redmine's API accepts a group id through the same `user_id` field a user
+/// id goes through — there is no separate `group_id` wire field.
+#[derive(Debug, Clone, Serialize)]
+pub struct MembershipCreate {
+    /// The user or group id.
+    pub user_id: u64,
+    /// Non-empty list of role ids.
+    pub role_ids: Vec<u64>,
+}
+
+/// The `membership` hash sent to `PUT /memberships/{id}.json`. Only roles
+/// can be changed; the project and principal are read-only after creation.
+#[derive(Debug, Clone, Serialize)]
+pub struct MembershipUpdate {
+    /// Non-empty list of role ids.
+    pub role_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MembershipCreateEnvelope<'a> {
+    pub membership: &'a MembershipCreate,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MembershipUpdateEnvelope<'a> {
+    pub membership: &'a MembershipUpdate,
 }
 
 #[cfg(test)]

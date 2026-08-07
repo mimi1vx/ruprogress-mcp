@@ -40,6 +40,10 @@ id_newtype!(
     /// A Redmine version (roadmap target) id.
     VersionId
 );
+id_newtype!(
+    /// A Redmine project membership id.
+    MembershipId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

@@ -44,6 +44,11 @@ pub struct Project {
     /// are enabled.
     #[serde(default)]
     pub trackers: Option<Vec<IdName>>,
+    /// Modules enabled for this project. Same `None` = not requested,
+    /// `Some(vec![])` = none enabled convention as `trackers` above —
+    /// populated only when `include=enabled_modules` was requested.
+    #[serde(default)]
+    pub enabled_modules: Option<Vec<IdName>>,
 }
 
 /// `include=` values accepted by the project endpoints.

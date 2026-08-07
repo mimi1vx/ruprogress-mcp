@@ -5,13 +5,21 @@
 
 pub mod write_tools {
     /// Every tool that mutates Redmine. Removed from the router in read-only
-    /// mode. Empty for now: only read-only tools exist so far — this gets
-    /// populated as write tools land, and the tests in `tests/readonly.rs`
-    /// turn a stale or missing name here into a build/test failure rather
-    /// than a silent read-only-mode bypass.
+    /// mode. The tests in `tests/readonly.rs` turn a stale or missing name
+    /// here into a build/test failure rather than a silent read-only-mode
+    /// bypass.
     ///
-    /// The 4a discovery-tool sub-phase deliberately adds nothing here: all
+    /// The 4a discovery-tool sub-phase deliberately added nothing here: all
     /// seven of its tools (including `list_redmine_users`, which merely
     /// *requires* an admin credential) are reads.
-    pub const ALL: &[&str] = &[];
+    ///
+    /// 4c adds `manage_redmine_version` and `manage_project_member` in full
+    /// — not per-action, unlike the parent plan's general `manage_*` gating
+    /// (D8). Both tools' `action` enums are exclusively mutating
+    /// (`create`/`update`/`delete` and `add`/`update`/`remove`); listing
+    /// versions/members is a separate tool for each
+    /// (`list_redmine_versions`/`list_project_members`), so there is no read
+    /// action inside either `manage_*` tool to preserve. See
+    /// `plans/phase-4c-projects.md` decision F1.
+    pub const ALL: &[&str] = &["manage_redmine_version", "manage_project_member"];
 }

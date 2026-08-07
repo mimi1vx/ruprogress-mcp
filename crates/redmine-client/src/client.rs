@@ -10,10 +10,10 @@ use url::Url;
 
 use crate::auth::Credential;
 use crate::error::Error;
-use crate::ids::{IssueId, ProjectIdent};
+use crate::ids::{IssueId, MembershipId, ProjectIdent, VersionId};
 use crate::model::{
-    BareCollection, Collection, enumeration, issue, issue_status, project, query, time_entry,
-    tracker, user,
+    BareCollection, Collection, custom_field, enumeration, issue, issue_status, membership,
+    project, query, role, time_entry, tracker, user, version,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -460,10 +460,6 @@ impl Scoped<'_> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "part of the request core; no API method needs DELETE yet"
-    )]
     pub(crate) async fn delete(&self, path: &str) -> crate::Result<()> {
         let url = self.build_url(path, None)?;
         let template = self.credential.apply(self.inner.http.delete(url));
@@ -668,6 +664,25 @@ impl Scoped<'_> {
             .await
     }
 
+    /// `GET /issues.json`, a single explicit page — unlike [`Self::list_issues`],
+    /// never auto-pages. Used by tools that expose `limit`/`offset` directly
+    /// (and by `summarize_project_status`'s count-only and sample-breakdown
+    /// calls, which only ever want one bounded page).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_issues_page(
+        &self,
+        q: &issue::IssueQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<issue::Issue>> {
+        self.fetch_page::<issue::IssuesEnvelope>("issues.json", &q.to_query(), limit, offset)
+            .await
+    }
+
     /// `GET /issues/{id}.json`.
     ///
     /// # Errors
@@ -817,11 +832,213 @@ impl Scoped<'_> {
         self.fetch_all::<query::SavedQueriesEnvelope>("queries.json", &Query::default())
             .await
     }
+
+    /// `GET /projects/{id}/versions.json`. Always returns every version —
+    /// Redmine's endpoint has no `limit`/`offset` and no server-side status
+    /// filter (see `plans/phase-4c-projects.md` decision F1); a caller
+    /// wanting a status filter applies it client-side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_versions(
+        &self,
+        project: &ProjectIdent,
+    ) -> crate::Result<Vec<version::Version>> {
+        let env: version::VersionsEnvelope = self
+            .get_json(
+                &format!("projects/{project}/versions.json"),
+                &Query::default(),
+            )
+            .await?;
+        Ok(env.versions)
+    }
+
+    /// `GET /versions/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_version(&self, id: VersionId) -> crate::Result<version::Version> {
+        let env: version::VersionEnvelope = self
+            .get_json(&format!("versions/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.version)
+    }
+
+    /// `POST /projects/{id}/versions.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine rejects the payload
+    /// (e.g. 422 with validation errors).
+    pub async fn create_version(
+        &self,
+        project: &ProjectIdent,
+        new: &version::VersionWrite,
+    ) -> crate::Result<version::Version> {
+        let env: version::VersionEnvelope = self
+            .post_json(
+                &format!("projects/{project}/versions.json"),
+                &version::VersionWriteEnvelope { version: new },
+            )
+            .await?;
+        Ok(env.version)
+    }
+
+    /// `PUT /versions/{id}.json`, then a follow-up `GET` to return the full
+    /// updated resource — Redmine's `PUT` itself answers `204 No Content`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// update (e.g. 422 with validation errors).
+    pub async fn update_version(
+        &self,
+        id: VersionId,
+        patch: &version::VersionWrite,
+    ) -> crate::Result<version::Version> {
+        self.put_json(
+            &format!("versions/{id}.json"),
+            &version::VersionWriteEnvelope { version: patch },
+        )
+        .await?;
+        self.get_version(id).await
+    }
+
+    /// `DELETE /versions/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_version(&self, id: VersionId) -> crate::Result<()> {
+        self.delete(&format!("versions/{id}.json")).await
+    }
+
+    /// `GET /projects/{id}/memberships.json`, auto-paged. No tool exposes
+    /// `limit`/`offset` for this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_memberships(
+        &self,
+        project: &ProjectIdent,
+    ) -> crate::Result<Page<membership::Membership>> {
+        self.fetch_all::<membership::MembershipsEnvelope>(
+            &format!("projects/{project}/memberships.json"),
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `GET /memberships/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_membership(&self, id: MembershipId) -> crate::Result<membership::Membership> {
+        let env: membership::MembershipEnvelope = self
+            .get_json(&format!("memberships/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.membership)
+    }
+
+    /// `POST /projects/{id}/memberships.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine rejects the payload
+    /// (e.g. 422 with validation errors).
+    pub async fn create_membership(
+        &self,
+        project: &ProjectIdent,
+        new: &membership::MembershipCreate,
+    ) -> crate::Result<membership::Membership> {
+        let env: membership::MembershipEnvelope = self
+            .post_json(
+                &format!("projects/{project}/memberships.json"),
+                &membership::MembershipCreateEnvelope { membership: new },
+            )
+            .await?;
+        Ok(env.membership)
+    }
+
+    /// `PUT /memberships/{id}.json`, then a follow-up `GET` — same 204
+    /// pattern as [`Self::update_version`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// update (e.g. 422 with validation errors).
+    pub async fn update_membership(
+        &self,
+        id: MembershipId,
+        patch: &membership::MembershipUpdate,
+    ) -> crate::Result<membership::Membership> {
+        self.put_json(
+            &format!("memberships/{id}.json"),
+            &membership::MembershipUpdateEnvelope { membership: patch },
+        )
+        .await?;
+        self.get_membership(id).await
+    }
+
+    /// `DELETE /memberships/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_membership(&self, id: MembershipId) -> crate::Result<()> {
+        self.delete(&format!("memberships/{id}.json")).await
+    }
+
+    /// `GET /roles.json` — no pagination envelope. Unlike `list_redmine_users`,
+    /// this is **not** admin-gated: `RolesController` lets any authenticated
+    /// API request through (`require_admin_or_api_request`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_roles(&self) -> crate::Result<Vec<role::Role>> {
+        self.get_collection::<role::RolesEnvelope>("roles.json", &Query::default())
+            .await
+    }
+
+    /// `GET /custom_fields.json` — no pagination envelope, but admin-only on
+    /// Redmine's side (403 for a non-admin credential). Returns *every*
+    /// custom field definition on the instance, regardless of
+    /// `customized_type` or project scope; callers filter client-side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status (403 for a non-admin credential), or the response
+    /// unexpectedly carries a pagination envelope.
+    pub async fn list_custom_field_definitions(
+        &self,
+    ) -> crate::Result<Vec<custom_field::CustomFieldDefinition>> {
+        self.get_collection::<custom_field::CustomFieldDefinitionsEnvelope>(
+            "custom_fields.json",
+            &Query::default(),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::str::FromStr as _;
+
     use secrecy::SecretString;
 
     use super::*;
@@ -1179,5 +1396,355 @@ mod tests {
             .expect("list_saved_queries should succeed");
         assert_eq!(page.items.len(), 1);
         assert!(!page.truncated);
+    }
+
+    // --- Project-management tool API methods (4c) ---
+
+    #[tokio::test]
+    async fn list_versions_tolerates_a_total_count_field_with_no_offset_or_limit() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/projects/5/versions.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": [{
+                        "id": 1, "project": {"id": 5, "name": "P"}, "name": "1.0",
+                        "status": "open",
+                        "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z"
+                    }],
+                    "total_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Id(crate::ids::ProjectId(5));
+        let versions = client
+            .as_user(&cred)
+            .list_versions(&project)
+            .await
+            .expect("a total_count field must not be rejected (it is not a Collection)");
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_version_sends_expected_body() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/versions.json",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "version": {"name": "v2.0", "status": "open"}
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "version": {
+                        "id": 42, "project": {"id": 5, "name": "P"}, "name": "v2.0",
+                        "status": "open",
+                        "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let write = version::VersionWrite {
+            name: Some("v2.0".to_string()),
+            status: Some(version::VersionStatus::Open),
+            ..Default::default()
+        };
+        let created = client
+            .as_user(&cred)
+            .create_version(&project, &write)
+            .await
+            .expect("create_version should succeed");
+        assert_eq!(created.id, 42);
+    }
+
+    #[tokio::test]
+    async fn update_version_issues_a_put_then_exactly_one_get() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/versions/42.json"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/versions/42.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {
+                        "id": 42, "project": {"id": 5, "name": "P"}, "name": "v2.0",
+                        "status": "locked",
+                        "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let patch = version::VersionWrite {
+            status: Some(version::VersionStatus::Locked),
+            ..Default::default()
+        };
+        let updated = client
+            .as_user(&cred)
+            .update_version(VersionId(42), &patch)
+            .await
+            .expect("update_version should succeed");
+        assert_eq!(updated.status, "locked");
+    }
+
+    #[tokio::test]
+    async fn delete_version_succeeds_on_204() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/versions/42.json"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        client
+            .as_user(&cred)
+            .delete_version(VersionId(42))
+            .await
+            .expect("delete_version should succeed");
+    }
+
+    #[tokio::test]
+    async fn list_memberships_sends_no_pagination_params_but_auto_pages() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/projects/5/memberships.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "memberships": [{
+                        "id": 1, "project": {"id": 5, "name": "P"},
+                        "user": {"id": 2, "name": "Alice"},
+                        "roles": [{"id": 3, "name": "Manager"}]
+                    }],
+                    "total_count": 1, "offset": 0, "limit": 100
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Id(crate::ids::ProjectId(5));
+        let page = client
+            .as_user(&cred)
+            .list_memberships(&project)
+            .await
+            .expect("list_memberships should succeed");
+        assert_eq!(page.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_membership_routes_group_id_through_the_user_id_field() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/projects/5/memberships.json"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "membership": {"user_id": 20, "role_ids": [3, 4]}
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "membership": {
+                        "id": 7, "project": {"id": 5, "name": "P"},
+                        "group": {"id": 20, "name": "Dev Team"},
+                        "roles": [{"id": 3, "name": "Manager"}, {"id": 4, "name": "Developer"}]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Id(crate::ids::ProjectId(5));
+        let new = membership::MembershipCreate {
+            user_id: 20,
+            role_ids: vec![3, 4],
+        };
+        let created = client
+            .as_user(&cred)
+            .create_membership(&project, &new)
+            .await
+            .expect("create_membership should succeed");
+        assert_eq!(created.id, 7);
+    }
+
+    #[tokio::test]
+    async fn update_membership_issues_a_put_then_exactly_one_get() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/memberships/7.json"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "membership": {"role_ids": [4]}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/memberships/7.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "membership": {
+                        "id": 7, "project": {"id": 5, "name": "P"},
+                        "user": {"id": 2, "name": "Alice"},
+                        "roles": [{"id": 4, "name": "Developer"}]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let patch = membership::MembershipUpdate { role_ids: vec![4] };
+        let updated = client
+            .as_user(&cred)
+            .update_membership(MembershipId(7), &patch)
+            .await
+            .expect("update_membership should succeed");
+        assert_eq!(updated.id, 7);
+    }
+
+    #[tokio::test]
+    async fn delete_membership_succeeds_on_200() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/memberships/7.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        client
+            .as_user(&cred)
+            .delete_membership(MembershipId(7))
+            .await
+            .expect("delete_membership should succeed (Redmine answers 200, not 204)");
+    }
+
+    #[tokio::test]
+    async fn list_roles_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/roles.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .and(wiremock::matchers::query_param_is_missing("offset"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "roles": [{"id": 3, "name": "Manager"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let roles = client
+            .as_user(&cred)
+            .list_roles()
+            .await
+            .expect("list_roles should succeed");
+        assert_eq!(roles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_custom_field_definitions_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/custom_fields.json"))
+            .and(wiremock::matchers::query_param_is_missing("limit"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "custom_fields": [{
+                        "id": 6, "name": "Size", "field_format": "list",
+                        "customized_type": "issue", "is_for_all": true
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let fields = client
+            .as_user(&cred)
+            .list_custom_field_definitions()
+            .await
+            .expect("list_custom_field_definitions should succeed");
+        assert_eq!(fields.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_custom_field_definitions_forbidden_for_a_non_admin() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/custom_fields.json"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let err = client
+            .as_user(&cred)
+            .list_custom_field_definitions()
+            .await
+            .expect_err("a non-admin credential should be forbidden");
+        assert!(matches!(err, Error::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn list_issues_page_sends_exactly_the_requested_limit_and_offset() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/issues.json"))
+            .and(wiremock::matchers::query_param("limit", "1"))
+            .and(wiremock::matchers::query_param("offset", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [],
+                    "total_count": 42, "offset": 0, "limit": 1
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let page = client
+            .as_user(&cred)
+            .list_issues_page(&issue::IssueQuery::default(), 1, 0)
+            .await
+            .expect("list_issues_page should succeed");
+        assert_eq!(page.total_count, 42);
+        assert!(page.items.is_empty());
     }
 }

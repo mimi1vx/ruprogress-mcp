@@ -13,6 +13,7 @@ pub mod issue_status;
 pub mod membership;
 pub mod project;
 pub mod query;
+pub mod role;
 pub mod time_entry;
 pub mod tracker;
 pub mod user;

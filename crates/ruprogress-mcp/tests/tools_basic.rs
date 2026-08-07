@@ -25,6 +25,14 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "list_redmine_issue_priorities",
     "list_redmine_users",
     "list_redmine_queries",
+    "list_project_issue_custom_fields",
+    "summarize_project_status",
+    "list_redmine_versions",
+    "manage_redmine_version",
+    "list_project_members",
+    "list_redmine_roles",
+    "get_project_modules",
+    "manage_project_member",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -89,7 +97,17 @@ const EXPECTED_TOOLS: &[&str] = &[
 
 /// Tools implemented so far that take parameters (everything else must have
 /// an empty `properties` object).
-const TOOLS_WITH_PARAMETERS: &[&str] = &["list_project_trackers", "list_redmine_users"];
+const TOOLS_WITH_PARAMETERS: &[&str] = &[
+    "list_project_trackers",
+    "list_redmine_users",
+    "list_project_issue_custom_fields",
+    "summarize_project_status",
+    "list_redmine_versions",
+    "manage_redmine_version",
+    "list_project_members",
+    "get_project_modules",
+    "manage_project_member",
+];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -324,16 +342,31 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
             .annotations
             .as_ref()
             .unwrap_or_else(|| panic!("{} is missing annotations", tool.name));
+        let is_write_tool =
+            ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref());
         assert_eq!(
             annotations.read_only_hint,
-            Some(true),
-            "{} should be annotated read_only_hint = true",
-            tool.name
+            Some(!is_write_tool),
+            "{} should be annotated read_only_hint = {} (D7)",
+            tool.name,
+            !is_write_tool
         );
+        if is_write_tool {
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(true),
+                "{} mutates Redmine and should declare destructive_hint (D7)",
+                tool.name
+            );
+        }
     }
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "mostly repetitive wiremock mock registration, one per implemented tool"
+)]
 async fn every_implemented_tool_call_returns_structured_content_matching_its_schema() {
     let h = support::harness(&[]).await;
     support::mock_current_user(&h.redmine, None).await;
@@ -387,6 +420,40 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         })))
         .mount(&h.redmine)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/custom_fields.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"custom_fields": []})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1/versions.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": [], "total_count": 0
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1/memberships.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "memberships": [], "total_count": 0, "offset": 0, "limit": 100
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/roles.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"roles": []})))
+        .mount(&h.redmine)
+        .await;
+    // Covers every `summarize_project_status` sub-query (sample, open,
+    // closed, created-in-period, updated-in-period): this test does not
+    // constrain query parameters, so one mock serves all five.
+    Mock::given(method("GET"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issues": [], "total_count": 0, "offset": 0, "limit": 100
+        })))
+        .mount(&h.redmine)
+        .await;
 
     let tools = h
         .client
@@ -394,8 +461,22 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .await
         .expect("list_tools should succeed");
     for tool in &tools.tools {
+        // Write tools (`manage_*` with no read-only action, see D8/F1) are
+        // exercised in `tests/tools_projects.rs` instead, with real
+        // request/response bodies per action.
+        if ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref()) {
+            continue;
+        }
         let mut request = CallToolRequestParams::new(tool.name.clone());
-        if tool.name.as_ref() == "list_project_trackers" {
+        let project_id_only_tools = [
+            "list_project_trackers",
+            "list_project_issue_custom_fields",
+            "summarize_project_status",
+            "list_redmine_versions",
+            "list_project_members",
+            "get_project_modules",
+        ];
+        if project_id_only_tools.contains(&tool.name.as_ref()) {
             request.arguments = json!({"project_id": 1}).as_object().cloned();
         }
         let result = h
