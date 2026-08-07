@@ -26,14 +26,16 @@ pub(crate) struct ServerInner {
 
 impl RedmineMcp {
     /// Assemble the server: merge every tool module's router (see
-    /// `tools/{meta,discovery,projects}.rs`, each its own `#[tool_router]`
-    /// block), then remove write-tool routes if configured read-only.
+    /// `tools/{meta,discovery,projects,issues}.rs`, each its own
+    /// `#[tool_router]` block), then remove write-tool routes if configured
+    /// read-only.
     #[must_use]
     pub fn new(client: RedmineClient, config: Config) -> Self {
         let mut router = ToolRouter::new();
         router.merge(Self::meta_tool_router());
         router.merge(Self::discovery_tool_router());
         router.merge(Self::projects_tool_router());
+        router.merge(Self::issues_tool_router());
         if config.read_only {
             for name in write_tools::ALL {
                 router.remove_route(name);

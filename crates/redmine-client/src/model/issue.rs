@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{Collection, CustomField, IdName, permissive_datetime, permissive_datetime_opt};
+use super::attachment::Attachment;
+use super::journal::Journal;
+use super::relation::IssueRelation;
+use super::{
+    Collection, CustomField, IdName, IdOnly, permissive_datetime, permissive_datetime_opt,
+};
 use crate::ids::{IssueId, ProjectIdent, UserId};
 
 /// A Redmine issue.
@@ -27,9 +32,17 @@ pub struct Issue {
     /// Who the issue is assigned to, if anyone.
     #[serde(default)]
     pub assigned_to: Option<IdName>,
-    /// The parent issue, if this is a sub-issue.
+    /// The parent issue, if this is a sub-issue. Redmine sends only the id
+    /// here (`{"id": N}`, no `name`), unlike every other association on an
+    /// issue — see [`IdOnly`].
     #[serde(default)]
-    pub parent: Option<IdName>,
+    pub parent: Option<IdOnly>,
+    /// The issue category, if one is set.
+    #[serde(default)]
+    pub category: Option<IdName>,
+    /// The target version (roadmap milestone), if one is set.
+    #[serde(default)]
+    pub fixed_version: Option<IdName>,
     /// The issue subject line.
     pub subject: String,
     /// The issue description.
@@ -44,6 +57,14 @@ pub struct Issue {
     /// Estimated hours.
     #[serde(default)]
     pub estimated_hours: Option<f64>,
+    /// Hours logged against this issue. Redmine omits this field entirely
+    /// (not merely `null`) when the credential lacks the `view_time_entries`
+    /// permission — `None` here is therefore ambiguous between "zero hours
+    /// logged" and "not visible to this credential", matching Redmine's own
+    /// ambiguity rather than inventing a distinction Redmine itself doesn't
+    /// make.
+    #[serde(default)]
+    pub spent_hours: Option<f64>,
     /// Planned start date.
     #[serde(default)]
     pub start_date: Option<NaiveDate>,
@@ -62,6 +83,66 @@ pub struct Issue {
     /// Custom field values attached to this issue.
     #[serde(default)]
     pub custom_fields: Option<Vec<CustomField>>,
+    /// Journal entries (notes and field-change history). `None` when
+    /// `include=journals` was not requested; `Some(vec![])` when requested
+    /// and the issue has none. Same convention as `Project.trackers` (4a).
+    #[serde(default)]
+    pub journals: Option<Vec<Journal>>,
+    /// File attachments. `None` = not requested, `Some(vec![])` = none.
+    #[serde(default)]
+    pub attachments: Option<Vec<Attachment>>,
+    /// Relations to other issues. `None` = not requested, `Some(vec![])` =
+    /// none.
+    #[serde(default)]
+    pub relations: Option<Vec<IssueRelation>>,
+    /// Users watching this issue. `None` = not requested, `Some(vec![])` =
+    /// none. Redmine additionally hides this array entirely (rather than
+    /// sending an empty one) when the credential lacks
+    /// `view_issue_watchers` — indistinguishable here from "not requested".
+    #[serde(default)]
+    pub watchers: Option<Vec<IdName>>,
+    /// Direct sub-issues, recursively nested one level deep. `None` = not
+    /// requested, `Some(vec![])` = none (a leaf issue).
+    #[serde(default)]
+    pub children: Option<Vec<IssueChild>>,
+}
+
+/// One level of `Issue.children`. Redmine's own `render_api_issue_children`
+/// nests arbitrarily deep; this client stops at two levels total (this type
+/// plus [`IssueChildLeaf`]) — see `plans/phase-4b-issues.md` decision G4. A
+/// grandchild beyond that is simply absent from the JSON, not truncated with
+/// a signal: a caller who needs the full tree uses `list_subtasks`
+/// recursively, one level at a time.
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueChild {
+    /// The child issue's id.
+    pub id: u64,
+    /// The child's tracker, if visible.
+    #[serde(default)]
+    pub tracker: Option<IdName>,
+    /// The child's subject.
+    #[serde(default)]
+    pub subject: String,
+    /// The child's own children (grandchildren of the original issue).
+    #[serde(default)]
+    pub children: Option<Vec<IssueChildLeaf>>,
+}
+
+/// The deepest level of nesting under `Issue.children` this client models
+/// (see [`IssueChild`] and decision G4). Carries no further `children`
+/// field at all, by design.
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueChildLeaf {
+    /// The grandchild issue's id.
+    pub id: u64,
+    /// The grandchild's tracker, if visible.
+    #[serde(default)]
+    pub tracker: Option<IdName>,
+    /// The grandchild's subject.
+    #[serde(default)]
+    pub subject: String,
 }
 
 /// Payload for `POST /issues.json`. Separate from [`Issue`] because
@@ -365,5 +446,72 @@ mod tests {
             .unwrap();
         assert_eq!(obj["subject"], "New issue");
         assert!(!obj.contains_key("tracker_id"));
+    }
+
+    #[test]
+    fn parent_deserializes_from_an_id_only_object_with_no_name() {
+        // `issues/show.api.rsb`: `api.parent(:id => @issue.parent_id)` sends
+        // no `name` — deserializing this into an `IdName` (which requires
+        // one) would be a decode error.
+        let json = r#"{"issue": {
+            "id": 2, "project": {"id":1,"name":"P"}, "tracker": {"id":1,"name":"Bug"},
+            "status": {"id":1,"name":"New"}, "priority": {"id":1,"name":"Normal"},
+            "author": {"id":1,"name":"A"}, "subject": "sub-issue",
+            "parent": {"id": 100},
+            "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z"
+        }}"#;
+        let env: IssueEnvelope = serde_json::from_str(json).expect("should parse");
+        assert_eq!(env.issue.parent.expect("parent").id, 100);
+    }
+
+    #[test]
+    fn every_include_gated_field_defaults_to_none_when_absent() {
+        let env: IssueEnvelope =
+            serde_json::from_str(FIXTURE_6_1).expect("6.1 fixture should parse");
+        let issue = env.issue;
+        assert!(issue.category.is_none());
+        assert!(issue.fixed_version.is_none());
+        assert!(issue.spent_hours.is_none());
+        assert!(issue.journals.is_none());
+        assert!(issue.attachments.is_none());
+        assert!(issue.relations.is_none());
+        assert!(issue.watchers.is_none());
+        assert!(issue.children.is_none());
+    }
+
+    #[test]
+    fn parses_every_include_gated_field_and_two_levels_of_children() {
+        let json = r#"{"issue": {
+            "id": 1, "project": {"id":1,"name":"P"}, "tracker": {"id":1,"name":"Bug"},
+            "status": {"id":1,"name":"New"}, "priority": {"id":1,"name":"Normal"},
+            "author": {"id":1,"name":"A"}, "subject": "s",
+            "category": {"id": 9, "name": "Backend"},
+            "fixed_version": {"id": 6, "name": "v2.0"},
+            "spent_hours": 3.5,
+            "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z",
+            "journals": [{"id": 1, "notes": "hi", "created_on": "2026-01-01T00:00:00Z"}],
+            "attachments": [{"id": 1, "filename": "a.png", "filesize": 10,
+                "content_url": "https://x/a.png", "created_on": "2026-01-01T00:00:00Z"}],
+            "relations": [{"id": 1, "issue_id": 1, "issue_to_id": 2, "relation_type": "relates"}],
+            "watchers": [{"id": 5, "name": "Alice"}],
+            "children": [{"id": 2, "subject": "child", "tracker": {"id": 1, "name": "Bug"},
+                "children": [{"id": 3, "subject": "grandchild"}]}]
+        }}"#;
+        let env: IssueEnvelope = serde_json::from_str(json).expect("should parse");
+        let issue = env.issue;
+        assert_eq!(issue.category.unwrap().name, "Backend");
+        assert_eq!(issue.fixed_version.unwrap().name, "v2.0");
+        assert_eq!(issue.spent_hours, Some(3.5));
+        assert_eq!(issue.journals.unwrap().len(), 1);
+        assert_eq!(issue.attachments.unwrap().len(), 1);
+        assert_eq!(issue.relations.unwrap().len(), 1);
+        assert_eq!(issue.watchers.unwrap().len(), 1);
+        let children = issue.children.unwrap();
+        assert_eq!(children.len(), 1);
+        let child = children.first().expect("one child");
+        assert_eq!(child.id, 2);
+        let grandchildren = child.children.as_ref().unwrap();
+        assert_eq!(grandchildren.len(), 1);
+        assert_eq!(grandchildren.first().expect("one grandchild").id, 3);
     }
 }

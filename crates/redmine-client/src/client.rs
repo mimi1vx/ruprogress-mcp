@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::ids::{IssueId, MembershipId, ProjectIdent, VersionId};
 use crate::model::{
     BareCollection, Collection, custom_field, enumeration, issue, issue_status, membership,
-    project, query, role, time_entry, tracker, user, version,
+    project, query, role, search, time_entry, tracker, user, version,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -681,6 +681,77 @@ impl Scoped<'_> {
     ) -> crate::Result<Page<issue::Issue>> {
         self.fetch_page::<issue::IssuesEnvelope>("issues.json", &q.to_query(), limit, offset)
             .await
+    }
+
+    /// `GET /issues.json?issue_id=<comma-list>&status_id=*`, auto-paged (no
+    /// `limit`/`offset` exposed to any caller of this method). Hydrates a
+    /// list of issue ids — e.g. the thin results `search.json` returns — to
+    /// full issue dicts. `status_id=*` overrides Redmine's default
+    /// open-only filter, since the ids may reference closed issues. Returns
+    /// an empty `Vec` without making an HTTP call when `ids` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_issues_by_id(&self, ids: &[IssueId]) -> crate::Result<Vec<issue::Issue>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut q = Query::default();
+        q.insert(
+            "issue_id",
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        q.insert("status_id", "*");
+        let page = self
+            .fetch_all::<issue::IssuesEnvelope>("issues.json", &q)
+            .await?;
+        Ok(page.items)
+    }
+
+    /// `GET /issues.json?parent_id={id}&status_id=*`, auto-paged. Includes
+    /// closed subtasks — Redmine's default issue filter is open-only, and
+    /// the reference tool contract says subtasks include closed ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_subtasks(&self, parent: IssueId) -> crate::Result<Vec<issue::Issue>> {
+        let mut q = Query::default();
+        q.insert("parent_id", parent.to_string());
+        q.insert("status_id", "*");
+        let page = self
+            .fetch_all::<issue::IssuesEnvelope>("issues.json", &q)
+            .await?;
+        Ok(page.items)
+    }
+
+    /// `GET /search.json`, a single explicit page — genuinely paginated on
+    /// Redmine's side (unlike the four bare-collection endpoints from 4a),
+    /// so this goes through `fetch_page`, not `get_collection`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn search_issues_page(
+        &self,
+        q: &search::SearchQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<search::SearchResult>> {
+        self.fetch_page::<search::SearchResultsEnvelope>(
+            "search.json",
+            &q.to_query(),
+            limit,
+            offset,
+        )
+        .await
     }
 
     /// `GET /issues/{id}.json`.
@@ -1745,6 +1816,108 @@ mod tests {
             .await
             .expect("list_issues_page should succeed");
         assert_eq!(page.total_count, 42);
+        assert!(page.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_issues_by_id_sends_one_comma_joined_issue_id_param_and_status_id_star() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/issues.json"))
+            .and(wiremock::matchers::query_param("issue_id", "1,2,3"))
+            .and(wiremock::matchers::query_param("status_id", "*"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [], "total_count": 0, "offset": 0, "limit": 100
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let ids = [
+            crate::ids::IssueId(1),
+            crate::ids::IssueId(2),
+            crate::ids::IssueId(3),
+        ];
+        client
+            .as_user(&cred)
+            .list_issues_by_id(&ids)
+            .await
+            .expect("list_issues_by_id should succeed");
+    }
+
+    #[tokio::test]
+    async fn list_issues_by_id_makes_no_http_call_for_an_empty_id_list() {
+        let server = wiremock::MockServer::start().await;
+        // No mock mounted: any request would fail this test.
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let issues = client
+            .as_user(&cred)
+            .list_issues_by_id(&[])
+            .await
+            .expect("empty id list should short-circuit");
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_subtasks_sends_parent_id_and_status_id_star() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/issues.json"))
+            .and(wiremock::matchers::query_param("parent_id", "42"))
+            .and(wiremock::matchers::query_param("status_id", "*"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [], "total_count": 0, "offset": 0, "limit": 100
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        client
+            .as_user(&cred)
+            .list_subtasks(crate::ids::IssueId(42))
+            .await
+            .expect("list_subtasks should succeed");
+    }
+
+    #[tokio::test]
+    async fn search_issues_page_sends_exactly_the_requested_limit_and_offset() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/search.json"))
+            .and(wiremock::matchers::query_param("q", "bug"))
+            .and(wiremock::matchers::query_param("issues", "1"))
+            .and(wiremock::matchers::query_param("limit", "10"))
+            .and(wiremock::matchers::query_param("offset", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [], "total_count": 0, "offset": 0, "limit": 10
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let q = search::SearchQuery {
+            q: "bug".to_string(),
+            scope: None,
+            open_issues: false,
+        };
+        let page = client
+            .as_user(&cred)
+            .search_issues_page(&q, 10, 0)
+            .await
+            .expect("search_issues_page should succeed");
         assert!(page.items.is_empty());
     }
 }

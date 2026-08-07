@@ -10,10 +10,13 @@ pub mod custom_field;
 pub mod enumeration;
 pub mod issue;
 pub mod issue_status;
+pub mod journal;
 pub mod membership;
 pub mod project;
 pub mod query;
+pub mod relation;
 pub mod role;
+pub mod search;
 pub mod time_entry;
 pub mod tracker;
 pub mod user;
@@ -31,6 +34,19 @@ pub struct IdName {
     pub id: u64,
     /// The referenced resource's display name.
     pub name: String,
+}
+
+/// The `{ "id": 100 }` shape Redmine uses for `Issue.parent` —
+/// `issues/show.api.rsb` renders `api.parent(:id => @issue.parent_id)` with
+/// no accompanying name, unlike every other `IdName`-shaped association on
+/// an issue. Do not conflate with [`IdName`]: deserializing a bare `{"id":
+/// N}` into a struct requiring a non-optional `name` field is a decode
+/// error, not a graceful fallback.
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdOnly {
+    /// The referenced resource's id.
+    pub id: u64,
 }
 
 /// A collection response's pagination envelope, implemented per resource
