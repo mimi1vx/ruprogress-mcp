@@ -58,5 +58,14 @@ pub mod write_tools {
     /// `destructive_hint = true` in their tool annotations, same as an
     /// `ALL` tool — the annotation describes what the tool *can* do, not
     /// what read-only mode currently allows.
-    pub const PARTIAL_WRITE: &[&str] = &["manage_issue_relation", "manage_issue_category"];
+    ///
+    /// 4e adds `manage_redmine_wiki_page`: `list`/`get` are reads,
+    /// `create`/`update`/`delete`/`rename` are writes — matching the
+    /// reference contract's own documented read-only behavior for this
+    /// tool exactly. See `plans/phase-4e-search-wiki.md` decision I12.
+    pub const PARTIAL_WRITE: &[&str] = &[
+        "manage_issue_relation",
+        "manage_issue_category",
+        "manage_redmine_wiki_page",
+    ];
 }

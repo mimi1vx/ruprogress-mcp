@@ -58,13 +58,13 @@ async fn no_write_tool_name_exists_in_a_read_only_router() {
 #[tokio::test]
 async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
     let h = support::harness(&[]).await;
-    // `search_entire_redmine` is a real future tool name (see
-    // docs/tool-contract.md, sub-phase 4e) that does not exist in the
+    // `get_gantt_chart` is a real future tool name (see
+    // docs/tool-contract.md, sub-phase 4f) that does not exist in the
     // router yet — the router's response to it is identical to what it
     // will return for a route removed by read-only mode.
     let result = h
         .client
-        .call_tool(CallToolRequestParams::new("search_entire_redmine"))
+        .call_tool(CallToolRequestParams::new("get_gantt_chart"))
         .await;
     assert!(
         result.is_err(),
@@ -113,6 +113,47 @@ async fn manage_issue_relation_list_works_but_create_is_blocked_in_read_only_mod
     create_request.arguments = json!({"action": "create", "issue_id": 1, "issue_to_id": 2})
         .as_object()
         .cloned();
+    let create_result = h
+        .client
+        .call_tool(create_request)
+        .await
+        .expect("call_tool should succeed at the protocol level");
+    assert_eq!(create_result.is_error, Some(true));
+    assert_eq!(
+        create_result.structured_content.expect("structured")["code"],
+        "READ_ONLY"
+    );
+}
+
+#[tokio::test]
+async fn manage_redmine_wiki_page_list_works_but_create_is_blocked_in_read_only_mode() {
+    let h = support::harness(&[("REDMINE_MCP_READ_ONLY", "true")]).await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/projects/my-project/wiki/index.json",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"wiki_pages": []})))
+        .mount(&h.redmine)
+        .await;
+
+    let mut list_request = CallToolRequestParams::new("manage_redmine_wiki_page");
+    list_request.arguments = json!({"action": "list", "project_id": "my-project"})
+        .as_object()
+        .cloned();
+    let list_result = h
+        .client
+        .call_tool(list_request)
+        .await
+        .expect("action=\"list\" should be callable in read-only mode");
+    assert_ne!(list_result.is_error, Some(true));
+
+    let mut create_request = CallToolRequestParams::new("manage_redmine_wiki_page");
+    create_request.arguments = json!({
+        "action": "create", "project_id": "my-project",
+        "wiki_page_title": "Home", "text": "hello"
+    })
+    .as_object()
+    .cloned();
     let create_result = h
         .client
         .call_tool(create_request)

@@ -50,6 +50,8 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "manage_issue_watcher",
     "manage_issue_note",
     "manage_issue_category",
+    "search_entire_redmine",
+    "manage_redmine_wiki_page",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -141,6 +143,8 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "manage_issue_watcher",
     "manage_issue_note",
     "manage_issue_category",
+    "search_entire_redmine",
+    "manage_redmine_wiki_page",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -563,7 +567,7 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
             request.arguments = json!({"project_id": 1}).as_object().cloned();
         } else if issue_id_only_tools.contains(&tool.name.as_ref()) {
             request.arguments = json!({"issue_id": 1}).as_object().cloned();
-        } else if tool.name.as_ref() == "search_redmine_issues" {
+        } else if ["search_redmine_issues", "search_entire_redmine"].contains(&tool.name.as_ref()) {
             request.arguments = json!({"query": "test"}).as_object().cloned();
         }
         let result = h
@@ -627,6 +631,14 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// landed. 100 000 leaves headroom for the ~14 tools still to come (4d,
 /// 4b-write, 4e, 4f, 4g) at the same per-tool rate, while still catching a
 /// sub-phase that blows the budget outright.
+///
+/// Revised again at 4e (36 tools, 106 813 bytes observed, ~2.97 KiB/tool —
+/// `manage_redmine_wiki_page`'s six-action, mostly-optional parameter set is
+/// this sub-phase's widest input schema, per its own Risk 3): 100 000 no
+/// longer has headroom even for 4e's own two tools. 120 000 leaves room for
+/// 4f's single `get_gantt_chart` tool and 4g's `get_mcp_server_info`
+/// extension (no new tool, more output fields) at the same per-tool rate,
+/// while still catching a runaway sub-phase.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold() {
     let h = support::harness(&[]).await;
@@ -637,8 +649,8 @@ async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold()
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
-        bytes.len() < 100_000,
-        "tools/list is {} bytes for {} tools; over the Phase 4 baseline threshold of 100000",
+        bytes.len() < 120_000,
+        "tools/list is {} bytes for {} tools; over the Phase 4 baseline threshold of 120000",
         bytes.len(),
         tools.tools.len()
     );

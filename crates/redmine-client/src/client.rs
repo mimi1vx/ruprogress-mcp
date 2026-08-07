@@ -12,12 +12,12 @@ use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{
     IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent, RelationId, TimeEntryId,
-    UserId, VersionId,
+    UserId, VersionId, WikiTitle,
 };
 use crate::model::{
     BareCollection, Collection, custom_field, enumeration, issue, issue_category, issue_status,
     journal, membership, project, query, relation, role, search, time_entry, tracker, user,
-    version,
+    version, wiki,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -1441,6 +1441,138 @@ impl Scoped<'_> {
         )
         .await
     }
+
+    /// `GET /search.json`, a single explicit page, restricted to the
+    /// resource(s) named in `q.resources` (`search_entire_redmine`). See
+    /// [`Self::search_issues_page`] for the issues-only counterpart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn search_entire_page(
+        &self,
+        q: &search::EntireSearchQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<search::SearchResult>> {
+        self.fetch_page::<search::SearchResultsEnvelope>(
+            "search.json",
+            &q.to_query(),
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    /// `GET /projects/{id}/wiki/index.json` — no pagination envelope
+    /// (`wiki/index.api.rsb` is a bare `api.array`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_wiki_pages(
+        &self,
+        project: &ProjectIdent,
+    ) -> crate::Result<Vec<wiki::WikiPageListItem>> {
+        self.get_collection::<wiki::WikiPagesEnvelope>(
+            &format!("projects/{project}/wiki/index.json"),
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `GET /projects/{id}/wiki/{title}.json`, or
+    /// `GET /projects/{id}/wiki/{title}/{version}.json` when `version` is
+    /// given — a path segment, not a query parameter (decision I14).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_wiki_page(
+        &self,
+        project: &ProjectIdent,
+        title: &WikiTitle,
+        version: Option<u32>,
+        include_attachments: bool,
+    ) -> crate::Result<wiki::WikiPage> {
+        let mut q = Query::default();
+        if include_attachments {
+            q.insert("include", "attachments");
+        }
+        let segment = title.encoded_segment();
+        let path = version.map_or_else(
+            || format!("projects/{project}/wiki/{segment}.json"),
+            |v| format!("projects/{project}/wiki/{segment}/{v}.json"),
+        );
+        let env: wiki::WikiPageEnvelope = self.get_json(&path, &q).await?;
+        Ok(env.wiki_page)
+    }
+
+    /// `PUT /projects/{id}/wiki/{title}.json`, with no follow-up `GET`. The
+    /// `rename` mechanism (I3) uses this directly rather than
+    /// [`Self::upsert_wiki_page`]: `rename` re-fetches at the *new* title
+    /// afterward regardless, so a follow-up `GET` at `title` (still the
+    /// *old* title at this point) would be pure waste.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, or if Redmine rejects the
+    /// write (e.g. 422 with validation errors).
+    pub async fn write_wiki_page(
+        &self,
+        project: &ProjectIdent,
+        title: &WikiTitle,
+        write: &wiki::WikiPageWrite,
+    ) -> crate::Result<()> {
+        self.put_json(
+            &format!("projects/{project}/wiki/{}.json", title.encoded_segment()),
+            &wiki::WikiPageWriteEnvelope { wiki_page: write },
+        )
+        .await
+    }
+
+    /// [`Self::write_wiki_page`], then a follow-up `GET` for the full page.
+    /// Redmine's `PUT` answers `204`-equivalent `render_api_ok` (no body)
+    /// when updating an existing page, and a full body only when creating
+    /// one for the first time; fetching afterward unconditionally keeps one
+    /// code path for both `create` and `update` (decision I11).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// write (e.g. 422 with validation errors).
+    pub async fn upsert_wiki_page(
+        &self,
+        project: &ProjectIdent,
+        title: &WikiTitle,
+        write: &wiki::WikiPageWrite,
+    ) -> crate::Result<wiki::WikiPage> {
+        self.write_wiki_page(project, title, write).await?;
+        self.get_wiki_page(project, title, None, false).await
+    }
+
+    /// `DELETE /projects/{id}/wiki/{title}.json`. Children are un-parented
+    /// (`parent_id` set to `NULL`), never cascade-deleted — see decision I6.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_wiki_page(
+        &self,
+        project: &ProjectIdent,
+        title: &WikiTitle,
+    ) -> crate::Result<()> {
+        self.delete(&format!(
+            "projects/{project}/wiki/{}.json",
+            title.encoded_segment()
+        ))
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -2398,5 +2530,261 @@ mod tests {
         let cred = Credential::ApiKey(SecretString::from("k"));
         let result = client.as_user(&cred).list_time_entry_activities().await;
         assert!(result.is_err());
+    }
+
+    // --- Search & wiki API methods (4e) ---
+
+    #[tokio::test]
+    async fn search_entire_page_sends_a_flag_for_each_requested_resource() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/search.json"))
+            .and(wiremock::matchers::query_param("q", "install"))
+            .and(wiremock::matchers::query_param("issues", "1"))
+            .and(wiremock::matchers::query_param("wiki_pages", "1"))
+            .and(wiremock::matchers::query_param("limit", "10"))
+            .and(wiremock::matchers::query_param("offset", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [], "total_count": 0, "offset": 0, "limit": 10
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let q = search::EntireSearchQuery {
+            q: "install".to_string(),
+            resources: vec![
+                search::SearchResource::Issues,
+                search::SearchResource::WikiPages,
+            ],
+        };
+        let page = client
+            .as_user(&cred)
+            .search_entire_page(&q, 10, 0)
+            .await
+            .expect("search_entire_page should succeed");
+        assert!(page.items.is_empty());
+    }
+
+    fn sample_wiki_page_json() -> serde_json::Value {
+        serde_json::json!({
+            "wiki_page": {
+                "title": "Home", "text": "Welcome", "version": 1,
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn list_wiki_pages_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/index.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "wiki_pages": [
+                        {"title": "Home", "version": 1, "created_on": "2026-01-01T00:00:00Z"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let pages = client
+            .as_user(&cred)
+            .list_wiki_pages(&project)
+            .await
+            .expect("list_wiki_pages should succeed");
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_wiki_page_without_version_omits_the_version_segment() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Home.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_wiki_page_json()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("Home").unwrap();
+        let page = client
+            .as_user(&cred)
+            .get_wiki_page(&project, &title, None, false)
+            .await
+            .expect("get_wiki_page should succeed");
+        assert_eq!(page.title, "Home");
+    }
+
+    #[tokio::test]
+    async fn get_wiki_page_with_version_requests_the_version_path_segment() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Home/3.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_wiki_page_json()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("Home").unwrap();
+        client
+            .as_user(&cred)
+            .get_wiki_page(&project, &title, Some(3), false)
+            .await
+            .expect("get_wiki_page should succeed");
+    }
+
+    #[tokio::test]
+    async fn get_wiki_page_encodes_a_title_with_spaces() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/My%20Page.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_wiki_page_json()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("My Page").unwrap();
+        client
+            .as_user(&cred)
+            .get_wiki_page(&project, &title, None, false)
+            .await
+            .expect("get_wiki_page should succeed");
+    }
+
+    #[tokio::test]
+    async fn write_wiki_page_issues_only_a_put_no_follow_up_get() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Old_Title.json",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "wiki_page": {"text": "body", "title": "New_Title"}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("Old_Title").unwrap();
+        let write = wiki::WikiPageWrite {
+            text: "body".to_string(),
+            title: Some("New_Title".to_string()),
+            ..Default::default()
+        };
+        client
+            .as_user(&cred)
+            .write_wiki_page(&project, &title, &write)
+            .await
+            .expect("write_wiki_page should succeed");
+    }
+
+    #[tokio::test]
+    async fn upsert_wiki_page_issues_a_put_then_exactly_one_get() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Home.json",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Home.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_wiki_page_json()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("Home").unwrap();
+        let write = wiki::WikiPageWrite {
+            text: "Welcome".to_string(),
+            ..Default::default()
+        };
+        let page = client
+            .as_user(&cred)
+            .upsert_wiki_page(&project, &title, &write)
+            .await
+            .expect("upsert_wiki_page should succeed");
+        assert_eq!(page.title, "Home");
+    }
+
+    #[tokio::test]
+    async fn delete_wiki_page_succeeds_on_200() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/projects/my-project/wiki/Home.json",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let project = ProjectIdent::Identifier(
+            crate::ids::ProjectIdentifier::from_str("my-project").unwrap(),
+        );
+        let title = WikiTitle::new("Home").unwrap();
+        client
+            .as_user(&cred)
+            .delete_wiki_page(&project, &title)
+            .await
+            .expect("delete_wiki_page should succeed");
     }
 }

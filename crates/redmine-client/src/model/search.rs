@@ -65,6 +65,76 @@ impl SearchScope {
     }
 }
 
+/// Which Redmine search-index scope(s) `search_entire_redmine` restricts to.
+/// Wire query flags are additive (`issues=1`, `wiki_pages=1`) — Redmine's
+/// `SearchController` ORs together whichever recognized-type flags are
+/// present and only falls back to "every type" when none are given at all
+/// (`plans/phase-4e-search-wiki.md` decision I1). This client always sends
+/// an explicit flag per requested resource rather than relying on that
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchResource {
+    /// Issues.
+    Issues,
+    /// Wiki pages.
+    WikiPages,
+}
+
+impl SearchResource {
+    /// The `search.json` query flag for this resource — also used as the
+    /// bucket name in `search_entire_redmine`'s output `type`/
+    /// `results_by_type` fields (decision I2).
+    #[must_use]
+    pub const fn wire_param(self) -> &'static str {
+        match self {
+            Self::Issues => "issues",
+            Self::WikiPages => "wiki_pages",
+        }
+    }
+
+    /// Map Redmine's raw per-result `type` (`"issue"`, `"wiki-page"` —
+    /// `Redmine::Acts::Event`'s default `self.class.name.underscore.dasherize`)
+    /// back to the resource it belongs to. `None` for any other value: this
+    /// client only ever sends `issues=1`/`wiki_pages=1`, so any other type
+    /// would be unexpected, not silently bucketed.
+    #[must_use]
+    pub fn from_raw_type(raw: &str) -> Option<Self> {
+        match raw {
+            "issue" => Some(Self::Issues),
+            "wiki-page" => Some(Self::WikiPages),
+            _ => None,
+        }
+    }
+}
+
+/// Filter parameters for `GET /search.json`, restricted to one or more
+/// resource types (`search_entire_redmine`). Unlike [`SearchQuery`] (issues
+/// only, with `open_issues`/`scope`), this carries no issue-specific
+/// filters — the reference contract's `search_entire_redmine` has neither.
+#[derive(Debug, Clone)]
+pub struct EntireSearchQuery {
+    /// The search text.
+    pub q: String,
+    /// Which resource types to search. Each is sent as its own `=1` flag;
+    /// an empty list would (per I1) fall back to Redmine's "every
+    /// registered type" default — callers should pass the full set
+    /// explicitly instead of relying on that.
+    pub resources: Vec<SearchResource>,
+}
+
+impl EntireSearchQuery {
+    /// Convert to the query-parameter map sent on the wire.
+    #[must_use]
+    pub fn to_query(&self) -> crate::client::Query {
+        let mut query = crate::client::Query::default();
+        query.insert("q", self.q.clone());
+        for resource in &self.resources {
+            query.insert(resource.wire_param(), "1");
+        }
+        query
+    }
+}
+
 /// Filter parameters for `GET /search.json`, restricted to issues.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
@@ -156,6 +226,41 @@ mod tests {
         assert!(debug.contains(r#""scope": "my_projects""#), "{debug}");
         assert!(!debug.contains("\"my_project\""), "{debug}");
         assert!(debug.contains(r#""open_issues": "1""#), "{debug}");
+    }
+
+    #[test]
+    fn entire_search_query_sends_one_flag_per_requested_resource() {
+        let q = EntireSearchQuery {
+            q: "bug".to_string(),
+            resources: vec![SearchResource::Issues, SearchResource::WikiPages],
+        };
+        let debug = format!("{:?}", q.to_query());
+        assert!(debug.contains(r#""issues": "1""#), "{debug}");
+        assert!(debug.contains(r#""wiki_pages": "1""#), "{debug}");
+    }
+
+    #[test]
+    fn entire_search_query_sends_only_the_one_requested_resource() {
+        let q = EntireSearchQuery {
+            q: "bug".to_string(),
+            resources: vec![SearchResource::WikiPages],
+        };
+        let debug = format!("{:?}", q.to_query());
+        assert!(debug.contains(r#""wiki_pages": "1""#), "{debug}");
+        assert!(!debug.contains("\"issues\""), "{debug}");
+    }
+
+    #[test]
+    fn search_resource_from_raw_type_maps_redmines_dasherized_wiki_page_type() {
+        assert_eq!(
+            SearchResource::from_raw_type("issue"),
+            Some(SearchResource::Issues)
+        );
+        assert_eq!(
+            SearchResource::from_raw_type("wiki-page"),
+            Some(SearchResource::WikiPages)
+        );
+        assert_eq!(SearchResource::from_raw_type("news"), None);
     }
 
     #[test]

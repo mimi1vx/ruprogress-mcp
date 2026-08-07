@@ -49,7 +49,7 @@ pub(crate) struct IdNameOut {
     pub(crate) name: String,
 }
 
-fn id_name_out(boundary: &Boundary, kind: &str, v: &IdName) -> IdNameOut {
+pub(crate) fn id_name_out(boundary: &Boundary, kind: &str, v: &IdName) -> IdNameOut {
     IdNameOut {
         id: v.id,
         name: boundary.wrap(kind, &v.name),
@@ -333,7 +333,7 @@ pub(crate) struct AttachmentOut {
     pub(crate) created_on: DateTime<Utc>,
 }
 
-fn attachment_out(boundary: &Boundary, a: &Attachment) -> AttachmentOut {
+pub(crate) fn attachment_out(boundary: &Boundary, a: &Attachment) -> AttachmentOut {
     AttachmentOut {
         id: a.id,
         filename: boundary.wrap("attachment.filename", &a.filename),

@@ -37,6 +37,7 @@ impl RedmineMcp {
         router.merge(Self::projects_tool_router());
         router.merge(Self::issues_tool_router());
         router.merge(Self::time_tool_router());
+        router.merge(Self::search_wiki_tool_router());
         if config.read_only {
             for name in write_tools::ALL {
                 router.remove_route(name);

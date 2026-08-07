@@ -8,4 +8,5 @@ pub(crate) mod meta;
 pub(crate) mod output;
 pub(crate) mod projects;
 pub(crate) mod schema;
+pub(crate) mod search_wiki;
 pub(crate) mod time;
