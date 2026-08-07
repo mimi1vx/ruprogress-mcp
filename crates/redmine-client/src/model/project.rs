@@ -49,6 +49,14 @@ pub struct Project {
     /// populated only when `include=enabled_modules` was requested.
     #[serde(default)]
     pub enabled_modules: Option<Vec<IdName>>,
+    /// Time-tracking activities enabled for this project (Redmine ≥ 3.4.0).
+    /// Same `None` = not requested convention as `trackers`/
+    /// `enabled_modules`. Unlike the global `GET
+    /// /enumerations/time_entry_activities.json` enumeration, this
+    /// `include=`-gated association carries only `{id, name}` — no
+    /// `active`/`is_default`.
+    #[serde(default)]
+    pub time_entry_activities: Option<Vec<IdName>>,
 }
 
 /// `include=` values accepted by the project endpoints.
@@ -179,6 +187,29 @@ mod tests {
         let trackers = env.project.trackers.expect("trackers should be Some");
         assert_eq!(trackers.len(), 2);
         assert_eq!(trackers.first().unwrap().name, "Bug");
+    }
+
+    #[test]
+    fn time_entry_activities_is_none_when_not_requested() {
+        let env: ProjectEnvelope =
+            serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
+        assert!(env.project.time_entry_activities.is_none());
+    }
+
+    #[test]
+    fn time_entry_activities_is_populated_when_requested() {
+        let json = r#"{"project": {
+            "id": 1, "name": "P", "identifier": "p",
+            "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z",
+            "time_entry_activities": [{"id": 8, "name": "Design"}, {"id": 9, "name": "Development"}]
+        }}"#;
+        let env: ProjectEnvelope = serde_json::from_str(json).expect("should parse");
+        let activities = env
+            .project
+            .time_entry_activities
+            .expect("time_entry_activities should be Some");
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities.get(1).unwrap().name, "Development");
     }
 
     #[test]

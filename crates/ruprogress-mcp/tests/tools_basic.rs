@@ -38,6 +38,10 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "search_redmine_issues",
     "list_subtasks",
     "get_private_notes",
+    "list_time_entries",
+    "manage_time_entry",
+    "list_time_entry_activities",
+    "import_time_entries",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -117,6 +121,10 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "search_redmine_issues",
     "list_subtasks",
     "get_private_notes",
+    "list_time_entries",
+    "manage_time_entry",
+    "list_time_entry_activities",
+    "import_time_entries",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -483,6 +491,20 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .and(path("/search.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "results": [], "total_count": 0, "offset": 0, "limit": 25
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/time_entries.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "time_entries": [], "total_count": 0, "offset": 0, "limit": 25
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/enumerations/time_entry_activities.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "time_entry_activities": []
         })))
         .mount(&h.redmine)
         .await;

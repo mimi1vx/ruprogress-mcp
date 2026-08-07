@@ -21,5 +21,17 @@ pub mod write_tools {
     /// (`list_redmine_versions`/`list_project_members`), so there is no read
     /// action inside either `manage_*` tool to preserve. See
     /// `plans/phase-4c-projects.md` decision F1.
-    pub const ALL: &[&str] = &["manage_redmine_version", "manage_project_member"];
+    ///
+    /// 4b-read added nothing here (all five of its tools are reads).
+    ///
+    /// 4d adds `manage_time_entry` (action enum is `create`/`update` only —
+    /// same "no read action to preserve" reasoning as F1) and
+    /// `import_time_entries` (always writes when called, by construction).
+    /// See `plans/phase-4d-time.md` decisions H5/H6.
+    pub const ALL: &[&str] = &[
+        "manage_redmine_version",
+        "manage_project_member",
+        "manage_time_entry",
+        "import_time_entries",
+    ];
 }

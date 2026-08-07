@@ -288,7 +288,7 @@ pub enum UserFilter {
 }
 
 impl UserFilter {
-    fn as_query_value(self) -> String {
+    pub(crate) fn as_query_value(self) -> String {
         match self {
             Self::Me => "me".to_string(),
             Self::Id(id) => id.0.to_string(),

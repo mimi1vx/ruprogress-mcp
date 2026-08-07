@@ -35,6 +35,20 @@ impl BareCollection for IssuePrioritiesEnvelope {
     }
 }
 
+/// `GET /enumerations/time_entry_activities.json` — no pagination envelope.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TimeEntryActivitiesEnvelope {
+    time_entry_activities: Vec<Enumeration>,
+}
+
+impl BareCollection for TimeEntryActivitiesEnvelope {
+    type Item = Enumeration;
+
+    fn into_items(self) -> Vec<Enumeration> {
+        self.time_entry_activities
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -70,5 +84,25 @@ mod tests {
             serde_json::from_str(ISSUE_PRIORITIES_FIXTURE_7_0).expect("7.0 fixture should parse");
         assert_eq!(env.issue_priorities.len(), 2);
         assert_eq!(env.issue_priorities.get(1).unwrap().is_default, Some(true));
+    }
+
+    const TIME_ENTRY_ACTIVITIES_JSON: &str = r#"{"time_entry_activities": [
+        {"id": 8, "name": "Design", "is_default": false, "active": true},
+        {"id": 9, "name": "Development", "is_default": true, "active": true}
+    ]}"#;
+
+    #[test]
+    fn time_entry_activities_envelope_round_trips() {
+        let env: TimeEntryActivitiesEnvelope =
+            serde_json::from_str(TIME_ENTRY_ACTIVITIES_JSON).expect("should parse");
+        assert_eq!(env.time_entry_activities.len(), 2);
+        assert_eq!(
+            env.time_entry_activities.get(1).unwrap().name,
+            "Development"
+        );
+        assert_eq!(
+            env.time_entry_activities.get(1).unwrap().is_default,
+            Some(true)
+        );
     }
 }

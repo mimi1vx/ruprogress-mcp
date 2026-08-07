@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::auth::Credential;
 use crate::error::Error;
-use crate::ids::{IssueId, MembershipId, ProjectIdent, VersionId};
+use crate::ids::{IssueId, MembershipId, ProjectIdent, TimeEntryId, VersionId};
 use crate::model::{
     BareCollection, Collection, custom_field, enumeration, issue, issue_status, membership,
     project, query, role, search, time_entry, tracker, user, version,
@@ -814,6 +814,29 @@ impl Scoped<'_> {
             .await
     }
 
+    /// `GET /time_entries.json`, a single explicit page — unlike
+    /// [`Self::list_time_entries`], never auto-pages. Used by
+    /// `list_time_entries`, which exposes `limit`/`offset` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_time_entries_page(
+        &self,
+        q: &time_entry::TimeEntryQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<time_entry::TimeEntry>> {
+        self.fetch_page::<time_entry::TimeEntriesEnvelope>(
+            "time_entries.json",
+            &q.to_query(),
+            limit,
+            offset,
+        )
+        .await
+    }
+
     /// `POST /time_entries.json`.
     ///
     /// # Errors
@@ -831,6 +854,60 @@ impl Scoped<'_> {
             )
             .await?;
         Ok(env.time_entry)
+    }
+
+    /// `GET /time_entries/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_time_entry(&self, id: TimeEntryId) -> crate::Result<time_entry::TimeEntry> {
+        let env: time_entry::TimeEntryEnvelope = self
+            .get_json(&format!("time_entries/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.time_entry)
+    }
+
+    /// `PUT /time_entries/{id}.json`, then a follow-up `GET` to return the
+    /// full updated resource — Redmine's `PUT` itself answers `204 No
+    /// Content` (matching `update_version`/`update_membership`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// update (e.g. 422 with validation errors).
+    pub async fn update_time_entry(
+        &self,
+        id: TimeEntryId,
+        patch: &time_entry::TimeEntryUpdate,
+    ) -> crate::Result<time_entry::TimeEntry> {
+        self.put_json(
+            &format!("time_entries/{id}.json"),
+            &time_entry::TimeEntryUpdateEnvelope { time_entry: patch },
+        )
+        .await?;
+        self.get_time_entry(id).await
+    }
+
+    /// `GET /enumerations/time_entry_activities.json` — no pagination
+    /// envelope. The project-scoped variant (`GET
+    /// /projects/{id}.json?include=time_entry_activities`) reuses
+    /// [`Self::get_project`] with [`project::ProjectInclude::TimeEntryActivities`]
+    /// instead of a dedicated method — it is a plain `include=`, not a
+    /// distinct endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_time_entry_activities(&self) -> crate::Result<Vec<enumeration::Enumeration>> {
+        self.get_collection::<enumeration::TimeEntryActivitiesEnvelope>(
+            "enumerations/time_entry_activities.json",
+            &Query::default(),
+        )
+        .await
     }
 
     /// `GET /trackers.json` — no pagination envelope.
@@ -1919,5 +1996,146 @@ mod tests {
             .await
             .expect("search_issues_page should succeed");
         assert!(page.items.is_empty());
+    }
+
+    // --- Time-tracking API methods (4d) ---
+
+    fn sample_time_entry_json(id: u64, hours: f64) -> serde_json::Value {
+        serde_json::json!({
+            "time_entry": {
+                "id": id, "project": {"id": 5, "name": "P"},
+                "user": {"id": 2, "name": "Alice"}, "activity": {"id": 9, "name": "Development"},
+                "hours": hours, "spent_on": "2026-01-15",
+                "created_on": "2026-01-15T00:00:00Z", "updated_on": "2026-01-15T00:00:00Z"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn list_time_entries_page_sends_exactly_the_requested_limit_and_offset_and_does_not_follow_on()
+     {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/time_entries.json"))
+            .and(wiremock::matchers::query_param("limit", "10"))
+            .and(wiremock::matchers::query_param("offset", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "time_entries": [], "total_count": 50, "offset": 0, "limit": 10
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let page = client
+            .as_user(&cred)
+            .list_time_entries_page(&time_entry::TimeEntryQuery::default(), 10, 0)
+            .await
+            .expect("list_time_entries_page should succeed");
+        assert_eq!(page.total_count, 50);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn get_time_entry_happy_path() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/time_entries/7.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_time_entry_json(7, 2.5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let entry = client
+            .as_user(&cred)
+            .get_time_entry(crate::ids::TimeEntryId(7))
+            .await
+            .expect("get_time_entry should succeed");
+        assert_eq!(entry.id, 7);
+    }
+
+    #[tokio::test]
+    async fn update_time_entry_issues_a_put_then_exactly_one_get() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/time_entries/7.json"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/time_entries/7.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(sample_time_entry_json(7, 3.0)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let patch = time_entry::TimeEntryUpdate {
+            hours: Some(3.0),
+            ..Default::default()
+        };
+        let updated = client
+            .as_user(&cred)
+            .update_time_entry(crate::ids::TimeEntryId(7), &patch)
+            .await
+            .expect("update_time_entry should succeed");
+        assert!((updated.hours - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn list_time_entry_activities_sends_no_pagination_params() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/enumerations/time_entry_activities.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "time_entry_activities": [{"id": 9, "name": "Development", "is_default": true, "active": true}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let activities = client
+            .as_user(&cred)
+            .list_time_entry_activities()
+            .await
+            .expect("list_time_entry_activities should succeed");
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities.first().unwrap().name, "Development");
+    }
+
+    #[tokio::test]
+    async fn list_time_entry_activities_errors_loudly_on_a_paginated_envelope() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/enumerations/time_entry_activities.json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "time_entry_activities": [], "total_count": 0
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let result = client.as_user(&cred).list_time_entry_activities().await;
+        assert!(result.is_err());
     }
 }
