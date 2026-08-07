@@ -335,6 +335,33 @@ async fn get_mcp_server_info_reports_current_user_null_when_redmine_unreachable(
 }
 
 #[tokio::test]
+async fn get_mcp_server_info_reports_the_resolved_current_user_when_reachable() {
+    let h = support::harness(&[]).await;
+    support::mock_current_user(&h.redmine, None).await;
+    let result = h
+        .client
+        .call_tool(CallToolRequestParams::new("get_mcp_server_info"))
+        .await
+        .expect("call_tool should succeed");
+    let text = content_text(&result);
+    let body: Value = text
+        .lines()
+        .last()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .expect("last content block should be the JSON body");
+
+    assert_eq!(body["current_user"]["id"], 5);
+    assert_eq!(body["current_user"]["login"], "alice");
+    // `name` is `firstname lastname`, boundary-wrapped like every other
+    // free-text field derived from Redmine content.
+    let name = body["current_user"]["name"]
+        .as_str()
+        .expect("current_user.name should be a string");
+    assert!(name.starts_with("<<<untrusted:"), "name: {name}");
+    assert!(name.contains("Alice Example"), "name: {name}");
+}
+
+#[tokio::test]
 async fn get_mcp_server_info_never_leaks_the_redmine_host() {
     let h = support::harness(&[]).await;
     let result = h

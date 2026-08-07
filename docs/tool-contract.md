@@ -8,11 +8,26 @@ For each tool: name, parameter names + types + required-ness (as given upstream)
 and a one-line return shape. This is a snapshot for drift detection, not a spec —
 the upstream doc is authoritative; re-vendor when implementing more tools.
 
-Tools currently implemented: `get_mcp_server_info`, `get_current_user`,
-`list_redmine_projects`, `list_redmine_trackers`, `list_project_trackers`,
+Tools currently implemented (all 36 non-app core tools from
+`plans/phase-4-core-tools.md`; kept in sync with `IMPLEMENTED_TOOLS` in
+`crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
+`get_mcp_server_info`, `get_current_user`, `list_redmine_projects`,
+`list_redmine_trackers`, `list_project_trackers`,
 `list_redmine_issue_statuses`, `list_redmine_issue_priorities`,
-`list_redmine_users`, `list_redmine_queries`. All others are recorded here
-for reference as the rest of the tool surface is built out.
+`list_redmine_users`, `list_redmine_queries`,
+`list_project_issue_custom_fields`, `summarize_project_status`,
+`list_redmine_versions`, `manage_redmine_version`, `list_project_members`,
+`list_redmine_roles`, `get_project_modules`, `manage_project_member`,
+`get_redmine_issue`, `list_redmine_issues`, `search_redmine_issues`,
+`list_subtasks`, `get_private_notes`, `list_time_entries`,
+`manage_time_entry`, `list_time_entry_activities`, `import_time_entries`,
+`create_redmine_issue`, `update_redmine_issue`, `delete_redmine_issue`,
+`copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
+`manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
+`manage_redmine_wiki_page`, `get_gantt_chart`. All remaining sections below
+(MCP Apps, File Operations, Checklist Tools, Products/Contacts/Documents
+plugin families) are recorded for reference as app-plugin tools out of
+Phase 4's scope (see the parent plan's "non-app core tools" framing).
 
 ## Project Management
 
