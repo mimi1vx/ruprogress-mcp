@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use futures_core::Stream;
+use futures_util::TryStreamExt as _;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -11,13 +14,13 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{
-    IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent, RelationId, TimeEntryId,
-    UserId, VersionId, WikiTitle,
+    AttachmentId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent, RelationId,
+    TimeEntryId, UserId, VersionId, WikiTitle,
 };
 use crate::model::{
-    BareCollection, Collection, custom_field, enumeration, issue, issue_category, issue_status,
-    journal, membership, project, query, relation, role, search, time_entry, tracker, user,
-    version, wiki,
+    BareCollection, Collection, attachment, custom_field, enumeration, issue, issue_category,
+    issue_status, journal, membership, project, query, relation, role, search, time_entry, tracker,
+    upload, user, version, wiki,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -493,6 +496,67 @@ impl Scoped<'_> {
         let template = self.credential.apply(self.inner.http.post(url)).json(body);
         self.send_with_retry(&http::Method::POST, &template).await?;
         Ok(())
+    }
+
+    /// Like [`Self::post_json`], but for an endpoint that wants a raw byte
+    /// body with an explicit `Content-Type` rather than a JSON payload
+    /// (`POST /uploads.json`, per `AttachmentsController#upload`, which
+    /// 406s any request whose `Content-Type` isn't exactly
+    /// `application/octet-stream`).
+    pub(crate) async fn post_bytes<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &Query,
+        content_type: &str,
+        body: Bytes,
+    ) -> crate::Result<T> {
+        let url = self.build_url(path, Some(query))?;
+        let template = self
+            .credential
+            .apply(self.inner.http.post(url))
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(body);
+        let resp = self.send_with_retry(&http::Method::POST, &template).await?;
+        self.read_json(resp, "response").await
+    }
+
+    /// Fetch an attachment's content from `content_url` (as returned by
+    /// [`Self::get_attachment`]/[`Self::list_project_files`] —  an
+    /// **absolute** URL, unlike every other method on this type, which
+    /// resolves a path relative to the API base via [`Self::endpoint`]).
+    /// Returns the response headers plus a byte stream of the body,
+    /// deliberately bypassing [`Self::read_json`]/[`Limits::max_response_bytes`]:
+    /// an attachment can be up to `ATTACHMENT_MAX_DOWNLOAD_BYTES` (200 MB by
+    /// default in `ruprogress-mcp`), far past what should ever be buffered
+    /// into one `Vec`. The caller (`ruprogress-mcp`'s attachment store) owns
+    /// enforcing a byte cap mid-stream and writing to disk; this crate stays
+    /// filesystem-free (parent plan decision J5).
+    ///
+    /// `content_url` is used as given — it is expected to be a value
+    /// Redmine itself returned from an earlier call in the same scope, not
+    /// arbitrary caller-supplied input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if `content_url` does not parse. Returns a
+    /// transport or status error if the request itself fails; errors
+    /// surfaced by the stream (a connection drop mid-body) are yielded as
+    /// stream items, not from this method.
+    pub async fn download_attachment(
+        &self,
+        content_url: &str,
+    ) -> crate::Result<(
+        http::HeaderMap,
+        impl Stream<Item = crate::Result<Bytes>> + Send + use<>,
+    )> {
+        let url: Url = content_url.parse().map_err(|e| Error::Config {
+            reason: format!("invalid attachment content_url: {e}"),
+        })?;
+        let template = self.credential.apply(self.inner.http.get(url));
+        let resp = self.send_with_retry(&http::Method::GET, &template).await?;
+        let headers = resp.headers().clone();
+        let stream = resp.bytes_stream().map_err(Error::transport);
+        Ok((headers, stream))
     }
 
     /// Walk every page of a Redmine collection endpoint, subject to
@@ -1571,6 +1635,112 @@ impl Scoped<'_> {
             "projects/{project}/wiki/{}.json",
             title.encoded_segment()
         ))
+        .await
+    }
+
+    /// `GET /attachments/{id}.json`. See [`attachment::Attachment`]'s doc
+    /// comment for which fields this endpoint never populates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (404 for an unknown or already-deleted id).
+    pub async fn get_attachment(&self, id: AttachmentId) -> crate::Result<attachment::Attachment> {
+        let env: attachment::AttachmentEnvelope = self
+            .get_json(&format!("attachments/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.attachment)
+    }
+
+    /// `DELETE /attachments/{id}.json`. Redmine's endpoint deletes *any*
+    /// attachment regardless of its container — callers that need to
+    /// restrict this to project Files should check
+    /// [`attachment::Attachment`] before calling (see that type's doc
+    /// comment on why a container-type check can't be done from Redmine's
+    /// response alone).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 if the attachment is not deletable by this
+    /// credential).
+    pub async fn delete_attachment(&self, id: AttachmentId) -> crate::Result<()> {
+        self.delete(&format!("attachments/{id}.json")).await
+    }
+
+    /// `GET /projects/{id}/files.json` — no pagination envelope
+    /// (`files/index.api.rsb` is a bare `api.array :files`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_project_files(
+        &self,
+        project: &ProjectIdent,
+    ) -> crate::Result<Vec<attachment::Attachment>> {
+        self.get_collection::<attachment::ProjectFilesEnvelope>(
+            &format!("projects/{project}/files.json"),
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `POST /uploads.json`, step one of attaching a file (see
+    /// `docs/tool-contract.md` and parent plan decision J8 for the request-
+    /// body-size ceiling this sits behind on the HTTP transport). Redmine
+    /// 406s any request whose `Content-Type` is not exactly
+    /// `application/octet-stream` — this method sets it unconditionally, so
+    /// `content_type` only ever affects the *stored* attachment's recorded
+    /// MIME type, never the request Redmine receives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, or if Redmine rejects the
+    /// upload (422 when `body` exceeds `Setting.attachment_max_size`).
+    pub async fn create_upload(
+        &self,
+        body: Bytes,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+    ) -> crate::Result<upload::Upload> {
+        let mut q = Query::default();
+        if let Some(filename) = filename {
+            q.insert("filename", filename);
+        }
+        if let Some(content_type) = content_type {
+            q.insert("content_type", content_type);
+        }
+        let env: upload::UploadEnvelope = self
+            .post_bytes("uploads.json", &q, "application/octet-stream", body)
+            .await?;
+        Ok(env.upload)
+    }
+
+    /// `POST /projects/{id}/files.json`, step two of attaching a file:
+    /// consumes the token from [`Self::create_upload`] to attach that
+    /// already-uploaded file to the project (or one of its versions, via
+    /// `new.version_id`). Answers `204 No Content`
+    /// (`FilesController#create` → `render_api_ok`) — there is no follow-up
+    /// `GET` here because the attachment id was already known from the
+    /// upload step; callers that want the full resource call
+    /// [`Self::get_attachment`] with that id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, or if Redmine rejects the
+    /// attach (400 for an unknown/expired token, 422 with validation
+    /// errors).
+    pub async fn create_project_file(
+        &self,
+        project: &ProjectIdent,
+        new: &upload::ProjectFileCreate,
+    ) -> crate::Result<()> {
+        self.post_json_no_content(
+            &format!("projects/{project}/files.json"),
+            &upload::ProjectFileCreateEnvelope { file: new },
+        )
         .await
     }
 }

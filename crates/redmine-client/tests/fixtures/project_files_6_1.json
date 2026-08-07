@@ -1,0 +1,17 @@
+{
+  "files": [
+    {
+      "id": 12,
+      "filename": "foo-1.0-setup.exe",
+      "filesize": 74753799,
+      "content_type": "application/octet-stream",
+      "description": "Foo App for Windows",
+      "content_url": "https://redmine.example.com/attachments/download/12/foo-1.0-setup.exe",
+      "author": { "id": 1, "name": "Redmine Admin" },
+      "created_on": "2026-01-04T09:12:32",
+      "version": { "id": 2, "name": "1.0" },
+      "digest": "1276481102f218c981e0324180bafd9f",
+      "downloads": 12
+    }
+  ]
+}

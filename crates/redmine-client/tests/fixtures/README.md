@@ -29,6 +29,12 @@ capture date and re-run the scrub test below.
 | `saved_queries_6_1.json` | 6.1 | `GET /queries.json` | — |
 | `saved_queries_7_0.json` | 7.0 | `GET /queries.json` | — |
 | `project_with_trackers_7_0.json` | 7.0 | `GET /projects/1.json?include=trackers` | `project.trackers` populated |
+| `attachment_6_1.json` | 6.1 | `GET /attachments/6243.json` | naive timestamp; no `thumbnail_url` (non-image) |
+| `attachment_7_0.json` | 7.0 | `GET /attachments/6244.json` | `Z`-suffixed timestamp; includes `thumbnail_url` (image), which the client ignores (not modeled) |
+| `project_files_6_1.json` | 6.1 | `GET /projects/1/files.json` | naive timestamp; file attached to a `Version` (`version` present) |
+| `project_files_7_0.json` | 7.0 | `GET /projects/1/files.json` | `Z`-suffixed timestamp; file attached directly to the `Project` (`version` absent) |
+| `upload_token_6_1.json` | 6.1 | `POST /uploads.json` | `upload.api.rsb` is identical across both versions (verified against `redmine/redmine` `6.1-stable` and `master`); paired per convention, values differ only for test readability |
+| `upload_token_7_0.json` | 7.0 | `POST /uploads.json` | see above |
 
 ## Scrubbing
 

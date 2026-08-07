@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "id": 13,
+      "filename": "README.md",
+      "filesize": 512,
+      "content_type": "text/markdown",
+      "description": "Project readme, attached directly to the project (no version)",
+      "content_url": "https://redmine.example.com/attachments/download/13/README.md",
+      "author": { "id": 1, "name": "Redmine Admin" },
+      "created_on": "2026-01-04T09:12:32Z",
+      "digest": "d41d8cd98f00b204e9800998ecf8427e",
+      "downloads": 0
+    }
+  ]
+}

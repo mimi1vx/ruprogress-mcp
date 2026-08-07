@@ -60,6 +60,11 @@ id_newtype!(
     /// A Redmine issue category id.
     IssueCategoryId
 );
+id_newtype!(
+    /// A Redmine attachment id (also the id Redmine assigns an uploaded-but-
+    /// not-yet-attached file, returned by `POST /uploads.json`).
+    AttachmentId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

@@ -1,0 +1,13 @@
+{
+  "attachment": {
+    "id": 6244,
+    "filename": "screenshot.png",
+    "filesize": 20480,
+    "content_type": "image/png",
+    "description": "A screenshot",
+    "content_url": "https://redmine.example.com/attachments/download/6244/screenshot.png",
+    "thumbnail_url": "https://redmine.example.com/attachments/thumbnail/6244",
+    "author": { "id": 1, "name": "Redmine Admin" },
+    "created_on": "2026-01-01T00:00:00Z"
+  }
+}

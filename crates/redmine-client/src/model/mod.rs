@@ -20,6 +20,7 @@ pub mod role;
 pub mod search;
 pub mod time_entry;
 pub mod tracker;
+pub mod upload;
 pub mod user;
 pub mod version;
 pub mod wiki;

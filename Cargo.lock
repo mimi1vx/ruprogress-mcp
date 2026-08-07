@@ -1279,6 +1279,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "futures-core",
+ "futures-util",
  "http",
  "rand 0.9.5",
  "reqwest",
