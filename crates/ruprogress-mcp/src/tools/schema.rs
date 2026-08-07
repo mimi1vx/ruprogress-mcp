@@ -73,6 +73,115 @@ fn normalize(raw: &JsonObject) -> JsonObject {
     }
 }
 
+/// Resolve every `{"$ref": "#/$defs/Name", …siblings}` node in `value`
+/// against `defs`, in place. Sibling keys (e.g. `description`) override the
+/// same key in the resolved def. Resolution recurses into the substituted
+/// value, so a def that itself contains a `$ref` to another def (the only
+/// nesting this server's schemas have — `ImportEntryParams` -> `ProjectRef`)
+/// resolves too.
+///
+/// Every input schema's `$defs` are non-recursive (no cycles), so this
+/// cannot loop forever; a `$ref` pointing anywhere other than `#/$defs/<name
+/// present in defs>` is left untouched rather than silently mangled (`debug_assert`
+/// catches it in tests/dev builds).
+fn resolve_refs(value: &mut Value, defs: &serde_json::Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                let target = reference
+                    .strip_prefix("#/$defs/")
+                    .and_then(|name| defs.get(name));
+                let Some(target) = target else {
+                    debug_assert!(
+                        false,
+                        "to_portable: $ref {reference:?} does not resolve against $defs"
+                    );
+                    return;
+                };
+                let mut resolved = target.clone();
+                map.remove("$ref");
+                if let Value::Object(resolved_map) = &mut resolved {
+                    for (key, sibling_value) in std::mem::take(map) {
+                        resolved_map.insert(key, sibling_value);
+                    }
+                }
+                *value = resolved;
+                resolve_refs(value, defs);
+                return;
+            }
+            for v in map.values_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                resolve_refs(v, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove the root `$defs` object, inlining every reference to it throughout
+/// `schema` (see [`resolve_refs`]). A no-op if `schema` has no `$defs`.
+fn inline_defs(schema: &mut Value) {
+    let Some(root) = schema.as_object_mut() else {
+        return;
+    };
+    let Some(defs_value) = root.remove("$defs") else {
+        return;
+    };
+    let Value::Object(defs) = defs_value else {
+        debug_assert!(false, "to_portable: $defs is not a JSON object");
+        root.insert("$defs".to_string(), defs_value);
+        return;
+    };
+    resolve_refs(schema, &defs);
+}
+
+/// Rewrite `{"type": ["T", "null"]}` (exactly two elements, one of them
+/// `"null"`) to `{"type": "T"}` throughout `schema`, dropping the portable
+/// dialect's ability to represent an explicit-null field. Any other array
+/// shape under `"type"` (there are none today) is left untouched.
+fn collapse_nullable_types(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Array(types)) = map.get("type")
+                && let [a, b] = types.as_slice()
+                && (a == "null") != (b == "null")
+            {
+                let non_null = if a == "null" { b.clone() } else { a.clone() };
+                map.insert("type".to_string(), non_null);
+            }
+            for v in map.values_mut() {
+                collapse_nullable_types(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collapse_nullable_types(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a rich JSON Schema 2020-12 `inputSchema` (as normalized by
+/// [`input`]) to the lossy, `Portable`-dialect form some clients require
+/// (`REDMINE_MCP_SCHEMA_DIALECT=portable`; see `crate::config::SchemaDialect`
+/// and `docs/adr/0007-json-schema-format-normalization.md`). Only inlines
+/// `$ref`/`$defs` and collapses nullable `type` arrays — `additionalProperties`,
+/// `default`, `enum`, `format`, `$schema`, and `anyOf` unions all survive.
+pub(crate) fn to_portable(schema: &JsonObject) -> JsonObject {
+    let mut value = Value::Object(schema.clone());
+    inline_defs(&mut value);
+    collapse_nullable_types(&mut value);
+    match value {
+        Value::Object(object) => object,
+        _ => unreachable!("schema root is always a JSON object"),
+    }
+}
+
 /// Build a tool's `outputSchema`, normalized to drop non-standard `uint*`
 /// formats (see module docs).
 pub(crate) fn output<T: JsonSchema + Any>() -> Arc<JsonObject> {
@@ -212,5 +321,113 @@ mod tests {
         strip_non_standard_formats(&mut value);
         assert_eq!(value["kind"], "uint64");
         assert!(value["nested"].get("format").is_none());
+    }
+
+    // --- `to_portable` (stage 1) --------------------------------------
+
+    /// A nested `$ref` (a `$def` — `Outer` — containing a `$ref` to another
+    /// `$def` — `Inner`, matching `ImportEntryParams` -> `ProjectRef`)
+    /// resolves fully: no `$ref`/`$defs` survive anywhere in the result.
+    #[test]
+    fn to_portable_inlines_a_nested_ref() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Inner": {"type": "string", "description": "inner"},
+                "Outer": {
+                    "type": "object",
+                    "properties": {"inner": {"$ref": "#/$defs/Inner"}}
+                }
+            },
+            "properties": {
+                "items": {"type": "array", "items": {"$ref": "#/$defs/Outer"}}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        let text = serde_json::to_string(&portable).unwrap();
+        assert!(!text.contains("$ref"), "expected no $ref, got {text}");
+        assert!(!text.contains("$defs"), "expected no $defs, got {text}");
+        assert_eq!(
+            portable["properties"]["items"]["items"]["properties"]["inner"]["type"],
+            "string"
+        );
+    }
+
+    /// A sibling key next to a `$ref` (e.g. a property-level `description`)
+    /// overrides the same key on the resolved `$def`.
+    #[test]
+    fn to_portable_sibling_description_overrides_the_defs_own() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Named": {"type": "string", "description": "the def's own description"}
+            },
+            "properties": {
+                "name": {"$ref": "#/$defs/Named", "description": "the property's own description"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(
+            portable["properties"]["name"]["description"],
+            "the property's own description"
+        );
+        assert_eq!(portable["properties"]["name"]["type"], "string");
+    }
+
+    #[test]
+    fn to_portable_collapses_a_two_element_nullable_type_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": ["string", "null"]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(portable["properties"]["name"]["type"], "string");
+    }
+
+    /// Only an exactly-two-element array with one `"null"` member collapses;
+    /// any other array shape under `"type"` is left alone.
+    #[test]
+    fn to_portable_leaves_a_non_nullable_type_array_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"value": {"type": ["string", "integer"]}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(
+            portable["properties"]["value"]["type"],
+            serde_json::json!(["string", "integer"])
+        );
+    }
+
+    /// Stage 1's deliberate limit: an untagged-union `$def` (`ProjectRef`'s
+    /// shape) keeps its `anyOf` — union collapsing is stage 2, gated on
+    /// whether stage 1 alone satisfies Vertex.
+    #[test]
+    fn to_portable_keeps_an_untagged_ref_anyof() {
+        let schema = input::<RefParams>();
+        let portable = to_portable(&schema);
+        let text = serde_json::to_string(&portable).unwrap();
+        assert!(!text.contains("$ref"), "expected no $ref, got {text}");
+        assert!(!text.contains("$defs"), "expected no $defs, got {text}");
+        assert!(
+            text.contains("anyOf"),
+            "expected the untagged union's anyOf to survive stage 1, got {text}"
+        );
     }
 }

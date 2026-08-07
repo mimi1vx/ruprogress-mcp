@@ -34,6 +34,22 @@ pub struct Config {
     /// Hard cap on a single tool response's serialized size in bytes
     /// (`REDMINE_MCP_MAX_RESPONSE_BYTES`, default 256 KiB).
     pub max_response_bytes: usize,
+    /// Which JSON Schema dialect served tool `inputSchema`s use
+    /// (`REDMINE_MCP_SCHEMA_DIALECT`, default `strict`).
+    pub schema_dialect: SchemaDialect,
+}
+
+/// Which JSON Schema dialect served `inputSchema`s use. `outputSchema` is
+/// unaffected either way — see `docs/adr/0007-json-schema-format-normalization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaDialect {
+    /// The rich JSON Schema 2020-12 form rmcp/schemars produce: `$ref`/
+    /// `$defs`, `anyOf` unions, and `type` arrays for nullable fields.
+    Strict,
+    /// A lossy OpenAPI-3.0-subset dialect for clients (Google Vertex/Gemini)
+    /// whose function-calling schema validator rejects `$ref`/`$defs` and
+    /// nullable `type` arrays. See `crate::tools::schema::to_portable`.
+    Portable,
 }
 
 /// Redmine connection settings.
@@ -609,6 +625,18 @@ fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, Confi
     }
 }
 
+fn parse_schema_dialect(vars: &EnvMap) -> Result<SchemaDialect, ConfigError> {
+    match optional(vars, "REDMINE_MCP_SCHEMA_DIALECT").as_deref() {
+        None | Some("strict") => Ok(SchemaDialect::Strict),
+        Some("portable") => Ok(SchemaDialect::Portable),
+        Some(other) => Err(ConfigError::Invalid {
+            var: "REDMINE_MCP_SCHEMA_DIALECT",
+            expected: "one of \"strict\", \"portable\"",
+            because: format!("got {other:?}"),
+        }),
+    }
+}
+
 fn parse_plugins(vars: &EnvMap) -> Result<PluginFlags, ConfigError> {
     Ok(PluginFlags {
         agile: optional_bool(vars, "REDMINE_AGILE_ENABLED", false)?,
@@ -688,6 +716,7 @@ impl Config {
                 "REDMINE_MCP_MAX_RESPONSE_BYTES",
                 DEFAULT_MAX_RESPONSE_BYTES,
             )?,
+            schema_dialect: parse_schema_dialect(vars)?,
         })
     }
 
@@ -705,6 +734,13 @@ impl Config {
         match &self.auth {
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => "legacy",
             AuthMode::OAuth(_) => "oauth",
+        }
+    }
+
+    pub(crate) fn schema_dialect_label(&self) -> &'static str {
+        match self.schema_dialect {
+            SchemaDialect::Strict => "strict",
+            SchemaDialect::Portable => "portable",
         }
     }
 
@@ -751,6 +787,7 @@ impl Config {
             "transport": transport,
             "read_only_mode": self.read_only,
             "plugin_flags": self.plugin_flags_json(),
+            "schema_dialect": self.schema_dialect_label(),
         })
     }
 }
@@ -1000,6 +1037,41 @@ mod tests {
         let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
         assert!(config.plugins.dmsf);
         assert!(!config.plugins.agile);
+    }
+
+    #[test]
+    fn schema_dialect_defaults_to_strict() {
+        let config =
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.schema_dialect, SchemaDialect::Strict);
+    }
+
+    #[test]
+    fn schema_dialect_parses_portable() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_SCHEMA_DIALECT".to_string(),
+            "portable".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.schema_dialect, SchemaDialect::Portable);
+    }
+
+    #[test]
+    fn schema_dialect_rejects_unknown_values() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_SCHEMA_DIALECT".to_string(),
+            "bogus".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_SCHEMA_DIALECT",
+                ..
+            }
+        ));
     }
 
     #[test]

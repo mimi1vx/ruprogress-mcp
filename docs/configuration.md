@@ -25,6 +25,7 @@ real process environment.
 | `REDMINE_MCP_BASE_URL` | yes, in `oauth` mode | — | Public base URL of this MCP server. Full OAuth wiring is not implemented yet; only presence is validated here. |
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
+| `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
 | `REDMINE_AGILE_ENABLED` | no | `false` | Surfaced in `plugin_flags.agile` (`get_mcp_server_info`). No agile tools exist yet. |
 | `REDMINE_CHECKLISTS_ENABLED` | no | `false` | `plugin_flags.checklists`. |
 | `REDMINE_PRODUCTS_ENABLED` | no | `false` | `plugin_flags.products`. |

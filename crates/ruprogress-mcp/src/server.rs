@@ -9,8 +9,9 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
-use crate::config::{AuthMode, Config};
+use crate::config::{AuthMode, Config, SchemaDialect};
 use crate::readonly::write_tools;
+use crate::tools::schema;
 
 #[derive(Clone, Debug)]
 pub struct RedmineMcp {
@@ -42,6 +43,11 @@ impl RedmineMcp {
         if config.read_only {
             for name in write_tools::ALL {
                 router.remove_route(name);
+            }
+        }
+        if config.schema_dialect == SchemaDialect::Portable {
+            for route in router.map.values_mut() {
+                route.attr.input_schema = Arc::new(schema::to_portable(&route.attr.input_schema));
             }
         }
         Self {

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in `REDMINE_MCP_SCHEMA_DIALECT=portable` for clients whose provider
+  rejects `$ref`/`$defs` and nullable type arrays in function-calling
+  declarations (Google Vertex/Gemini). Default `strict` is unchanged.
 - Streamable HTTP transport (`--transport http`), serving the same MCP server
   as stdio at `FASTMCP_STREAMABLE_HTTP_PATH` (default `/mcp`). Stateless mode:
   `GET`/`DELETE` on the MCP route return `405`, and no session id is issued.

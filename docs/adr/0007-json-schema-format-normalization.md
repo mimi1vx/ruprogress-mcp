@@ -79,3 +79,38 @@ if a future tool's author forgets to route a new struct through this module.
   today; `tools/schema.rs`'s unit tests pin the behavior — only the `format`
   *key* is touched, never a string value — so this stays intentional rather
   than accidental.
+
+## 2026-08 amendment: portable dialect
+
+Google Vertex's `FunctionDeclaration.parameters` is an OpenAPI-3.0-subset
+`Schema`: a single-valued `type` enum, no `$ref`/`$defs`, and no `type`
+arrays. It rejects this server's `tools/list` outright (`parameters.project_id
+schema didn't specify the schema type field`) rather than warning like Ajv
+does for the `uint*` `format` case above.
+
+`tools::schema::to_portable` extends this module's central-normalizer
+pattern with two more transforms, gated behind
+`REDMINE_MCP_SCHEMA_DIALECT=portable` (`crate::config::SchemaDialect`,
+default `strict`):
+
+- Inline every `$ref`/`$defs` pair (all 16 of this server's input-schema
+  `$defs` are small and non-recursive, so inlining is safe and — since a
+  `$ref` node repeated in `properties` no longer shares a single `$defs`
+  entry — even shrinks `tools/list` slightly).
+- Collapse `{"type":["T","null"]}` (every `Option<T>` for a scalar `T`) to
+  `{"type":"T"}`.
+
+This is opt-in, not the default, because the portable form is **lossy**: a
+model can no longer see that an optional field may be explicitly `null`, nor
+— for the untagged `integer | string` unions (`ProjectRef`, `AssignedToRef`,
+`UserRef`) still expressed as a bare `anyOf` node with no `type` of its own
+— that Vertex might still reject it (deferred to a stage 2 scalar-union
+collapse, landed only if that turns out to be necessary). Runtime
+deserialization is unaffected either way; the worst case for a client that
+handles the rich form correctly (Claude, GPT) is that switching to `portable`
+would degrade its view of the schema for no reason, hence the flag defaults
+to `strict`.
+
+`outputSchema` is untouched by either dialect: Gemini never sees it, and
+opencode validates `structuredContent` against it with Ajv, where the richer
+form is strictly better.

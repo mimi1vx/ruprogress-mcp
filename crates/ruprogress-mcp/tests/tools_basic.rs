@@ -776,6 +776,78 @@ async fn every_served_schema_format_is_in_the_ajv_strict_mode_allowlist() {
     }
 }
 
+/// Recursively assert that no node under `value` has a `"$ref"` key, a
+/// `"$defs"` key, or a `"type"` whose value is a JSON array — the three
+/// shapes `REDMINE_MCP_SCHEMA_DIALECT=portable` (`tools::schema::to_portable`)
+/// must remove from every served `inputSchema`. `path` names the offending
+/// location for a useful failure message.
+fn assert_portable(value: &Value, tool: &str, path: &str) {
+    match value {
+        Value::Object(map) => {
+            assert!(
+                !map.contains_key("$ref"),
+                "{tool}: {path} still has \"$ref\""
+            );
+            assert!(
+                !map.contains_key("$defs"),
+                "{tool}: {path} still has \"$defs\""
+            );
+            if let Some(t) = map.get("type") {
+                assert!(!t.is_array(), "{tool}: {path}/type is a JSON array: {t:?}");
+            }
+            for (key, v) in map {
+                assert_portable(v, tool, &format!("{path}/{key}"));
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                assert_portable(v, tool, &format!("{path}/{i}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn portable_schema_dialect_serves_no_refs_defs_or_nullable_type_arrays() {
+    let h = support::harness(&[("REDMINE_MCP_SCHEMA_DIALECT", "portable")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    assert!(!tools.tools.is_empty(), "expected at least one tool");
+    for tool in &tools.tools {
+        assert_portable(
+            &Value::Object(tool.input_schema.as_ref().clone()),
+            &tool.name,
+            "inputSchema",
+        );
+    }
+}
+
+/// The flag is a flag, not a rename: the **default** dialect must still
+/// serve the rich form (at least one tool's `inputSchema` still has
+/// `$defs`), so the portable test above is proven to be testing something
+/// that the default dialect does not already satisfy.
+#[tokio::test]
+async fn default_schema_dialect_still_serves_defs() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let any_has_defs = tools
+        .tools
+        .iter()
+        .any(|tool| tool.input_schema.contains_key("$defs"));
+    assert!(
+        any_has_defs,
+        "expected at least one tool's default-dialect inputSchema to still have $defs"
+    );
+}
+
 #[test]
 #[should_panic(expected = "must be a JSON object")]
 fn conformance_helper_rejects_a_bare_array_structured_content() {
