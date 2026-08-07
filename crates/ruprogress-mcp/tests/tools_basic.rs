@@ -42,6 +42,14 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "manage_time_entry",
     "list_time_entry_activities",
     "import_time_entries",
+    "create_redmine_issue",
+    "update_redmine_issue",
+    "delete_redmine_issue",
+    "copy_issue",
+    "manage_issue_relation",
+    "manage_issue_watcher",
+    "manage_issue_note",
+    "manage_issue_category",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -125,6 +133,14 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "manage_time_entry",
     "list_time_entry_activities",
     "import_time_entries",
+    "create_redmine_issue",
+    "update_redmine_issue",
+    "delete_redmine_issue",
+    "copy_issue",
+    "manage_issue_relation",
+    "manage_issue_watcher",
+    "manage_issue_note",
+    "manage_issue_category",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -360,8 +376,15 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
             .annotations
             .as_ref()
             .unwrap_or_else(|| panic!("{} is missing annotations", tool.name));
-        let is_write_tool =
-            ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref());
+        // A tool "mutates Redmine" (for annotation purposes) if it is
+        // removed from the router entirely in read-only mode (`ALL`), or if
+        // it has at least one write `action` gated internally rather than
+        // by router removal (`PARTIAL_WRITE`, D8) — either way
+        // `read_only_hint` describes what the tool *can* do, not whether
+        // read-only mode currently allows all of it.
+        let is_write_tool = ruprogress_mcp::readonly::write_tools::ALL
+            .contains(&tool.name.as_ref())
+            || ruprogress_mcp::readonly::write_tools::PARTIAL_WRITE.contains(&tool.name.as_ref());
         assert_eq!(
             annotations.read_only_hint,
             Some(!is_write_tool),
@@ -516,9 +539,14 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .expect("list_tools should succeed");
     for tool in &tools.tools {
         // Write tools (`manage_*` with no read-only action, see D8/F1) are
-        // exercised in `tests/tools_projects.rs` instead, with real
-        // request/response bodies per action.
-        if ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref()) {
+        // exercised in `tests/tools_projects.rs`/`tests/tools_time.rs`/
+        // `tests/tools_issues_write.rs` instead, with real request/response
+        // bodies per action. `PARTIAL_WRITE` tools (D8's mixed-action case)
+        // are exercised in `tests/tools_issues_write.rs` too, since their
+        // `action` parameter needs a value this loop does not supply.
+        if ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref())
+            || ruprogress_mcp::readonly::write_tools::PARTIAL_WRITE.contains(&tool.name.as_ref())
+        {
             continue;
         }
         let mut request = CallToolRequestParams::new(tool.name.clone());

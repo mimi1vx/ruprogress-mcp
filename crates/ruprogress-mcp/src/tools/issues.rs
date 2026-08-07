@@ -1,9 +1,9 @@
-//! Issue read tools (4b-read): `get_redmine_issue`, `list_redmine_issues`,
-//! `search_redmine_issues`, `list_subtasks`, `get_private_notes`. The
-//! write/mixed issue tools (`create_redmine_issue`, `update_redmine_issue`,
+//! Issue tools. Reads (4b-read): `get_redmine_issue`, `list_redmine_issues`,
+//! `search_redmine_issues`, `list_subtasks`, `get_private_notes`. Writes/
+//! mixed (4b-write): `create_redmine_issue`, `update_redmine_issue`,
 //! `delete_redmine_issue`, `copy_issue`, `manage_issue_relation`,
-//! `manage_issue_watcher`, `manage_issue_note`, `manage_issue_category`) land
-//! in a later sub-phase (4b-write) — see `plans/phase-4b-issues.md`.
+//! `manage_issue_watcher`, `manage_issue_note`, `manage_issue_category` — see
+//! `plans/phase-4b-issues.md`.
 //!
 //! `JournalOut` deliberately omits `details` (the field-change history
 //! attached to a journal): no example in the reference contract renders it,
@@ -16,14 +16,18 @@ use chrono::{DateTime, NaiveDate, Utc};
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
 use redmine_client::model::issue::{
-    Issue, IssueChild as ClientIssueChild, IssueChildLeaf as ClientIssueChildLeaf, IssueInclude,
-    IssueQuery, StatusFilter, UserFilter,
+    Issue, IssueChild as ClientIssueChild, IssueChildLeaf as ClientIssueChildLeaf, IssueCreate,
+    IssueInclude, IssueQuery, IssueUpdate, StatusFilter, UserFilter,
 };
-use redmine_client::model::journal::Journal as ClientJournal;
-use redmine_client::model::relation::IssueRelation as ClientIssueRelation;
+use redmine_client::model::issue_category::{IssueCategoryCreate, IssueCategoryUpdate};
+use redmine_client::model::journal::{Journal as ClientJournal, JournalUpdate};
+use redmine_client::model::relation::{IssueRelation as ClientIssueRelation, IssueRelationCreate};
 use redmine_client::model::search::{SearchQuery, SearchScope};
+use redmine_client::model::time_entry::TimeEntryQuery;
 use redmine_client::model::{CustomField, IdName};
-use redmine_client::{IssueId, UserId};
+use redmine_client::{
+    IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::service::RequestContext;
@@ -35,7 +39,7 @@ use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
-use crate::tools::output::{self, Pagination};
+use crate::tools::output::{self, ErrorCode, Pagination};
 
 // --- shared output shapes ---
 
@@ -621,6 +625,550 @@ pub(crate) struct PrivateNotesOutput {
     pub(crate) private_notes: Vec<PrivateNoteOut>,
 }
 
+// --- 4b-write: create_redmine_issue / update_redmine_issue ---
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateRedmineIssueParams {
+    /// The project to create the issue in: numeric id or slug identifier.
+    pub(crate) project_id: ProjectRef,
+    /// The issue subject/title. Must not be empty.
+    pub(crate) subject: String,
+    /// The issue description.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    /// The tracker id, if not the project's default.
+    #[serde(default)]
+    pub(crate) tracker_id: Option<u64>,
+    /// The status id, if not the tracker's default.
+    #[serde(default)]
+    pub(crate) status_id: Option<u64>,
+    /// The priority id, if not the default.
+    #[serde(default)]
+    pub(crate) priority_id: Option<u64>,
+    /// Who to assign the issue to.
+    #[serde(default)]
+    pub(crate) assigned_to_id: Option<u64>,
+    /// The issue category id.
+    #[serde(default)]
+    pub(crate) category_id: Option<u64>,
+    /// The target version (roadmap milestone) id.
+    #[serde(default)]
+    pub(crate) fixed_version_id: Option<u64>,
+    /// Parent issue id, to create this as a sub-issue.
+    #[serde(default)]
+    pub(crate) parent_issue_id: Option<u64>,
+    /// Planned start date (`YYYY-MM-DD`).
+    #[serde(default)]
+    pub(crate) start_date: Option<NaiveDate>,
+    /// Planned due date (`YYYY-MM-DD`).
+    #[serde(default)]
+    pub(crate) due_date: Option<NaiveDate>,
+    /// Percent done, 0-100.
+    #[serde(default)]
+    pub(crate) done_ratio: Option<u8>,
+    /// Estimated hours.
+    #[serde(default)]
+    pub(crate) estimated_hours: Option<f64>,
+    /// Whether the issue is private.
+    #[serde(default)]
+    pub(crate) is_private: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct CreateRedmineIssueOutput {
+    pub(crate) success: bool,
+    pub(crate) issue: IssueDetailOutput,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one bool (is_private) among many independent optional fields; splitting it out would not help readability"
+)]
+pub(crate) struct UpdateRedmineIssueParams {
+    /// The id of the issue to update.
+    pub(crate) issue_id: u64,
+    /// New subject, if changing it.
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    /// New description. An empty string clears it; omit to leave unchanged.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    /// New tracker id.
+    #[serde(default)]
+    pub(crate) tracker_id: Option<u64>,
+    /// New status id.
+    #[serde(default)]
+    pub(crate) status_id: Option<u64>,
+    /// New priority id.
+    #[serde(default)]
+    pub(crate) priority_id: Option<u64>,
+    /// New assignee user id.
+    #[serde(default)]
+    pub(crate) assigned_to_id: Option<u64>,
+    /// New category id.
+    #[serde(default)]
+    pub(crate) category_id: Option<u64>,
+    /// New target version id.
+    #[serde(default)]
+    pub(crate) fixed_version_id: Option<u64>,
+    /// New parent issue id, to reparent this issue.
+    #[serde(default)]
+    pub(crate) parent_issue_id: Option<u64>,
+    /// New planned start date.
+    #[serde(default)]
+    pub(crate) start_date: Option<NaiveDate>,
+    /// New planned due date.
+    #[serde(default)]
+    pub(crate) due_date: Option<NaiveDate>,
+    /// New percent done, 0-100.
+    #[serde(default)]
+    pub(crate) done_ratio: Option<u8>,
+    /// New estimated hours.
+    #[serde(default)]
+    pub(crate) estimated_hours: Option<f64>,
+    /// New privacy flag.
+    #[serde(default)]
+    pub(crate) is_private: Option<bool>,
+    /// A note to add to the issue's history, independent of any field
+    /// change above. An empty string is rejected as meaningless (use `None`
+    /// to add no note).
+    #[serde(default)]
+    pub(crate) notes: Option<String>,
+    /// Whether the note added via `notes` is private. Requires the "set
+    /// notes private" permission; ignored if `notes` is not given.
+    #[serde(default)]
+    pub(crate) private_notes: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct UpdateRedmineIssueOutput {
+    pub(crate) success: bool,
+    pub(crate) issue: IssueDetailOutput,
+}
+
+// --- delete_redmine_issue ---
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeleteRedmineIssueParams {
+    /// The id of the issue to delete.
+    pub(crate) issue_id: u64,
+    /// When `false` (default), the tool refuses and returns an impact
+    /// preview instead of deleting anything. Pass `true` to actually
+    /// delete.
+    #[serde(default)]
+    pub(crate) confirm_delete: bool,
+    /// When the issue has direct subtasks, `confirm_delete=true` alone still
+    /// refuses with `code: "CHILDREN_PRESENT"`. Pass this too to opt in:
+    /// Redmine cascade-deletes subtasks automatically, with no way to keep
+    /// them.
+    #[serde(default)]
+    pub(crate) confirm_delete_with_children: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared `_count` suffix is the point: this is a preview of what deleting the issue would count away"
+)]
+pub(crate) struct DeleteImpactOut {
+    /// Direct subtasks only (Redmine's `parent_id` filter is not
+    /// transitive) — grandchildren are not counted here, but Redmine still
+    /// cascade-deletes the whole subtree.
+    pub(crate) children_count: u64,
+    pub(crate) journals_count: u64,
+    pub(crate) attachments_count: u64,
+    pub(crate) relations_count: u64,
+    pub(crate) time_entries_count: u64,
+}
+
+/// A single schema covering both the refusal and success shapes (see
+/// `plans/phase-4b-issues.md` 4b-write decisions): the reference contract
+/// treats a delete refusal as a normal result the model should inspect and
+/// react to, not an error (`isError` stays `false` either way).
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct DeleteRedmineIssueOutput {
+    pub(crate) success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<ErrorCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) impact: Option<DeleteImpactOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deleted_issue_id: Option<u64>,
+    /// Number of subtasks Redmine cascade-deleted along with the issue
+    /// (equal to `impact.children_count` from the preview, since Redmine's
+    /// destroy always cascades the full subtree once it proceeds at all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cascade_deleted: Option<u64>,
+}
+
+// --- copy_issue ---
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CopyIssueParams {
+    /// The id of the source issue to copy.
+    pub(crate) issue_id: u64,
+    /// Target project for the copy: numeric id or slug identifier. Defaults
+    /// to the source issue's project.
+    #[serde(default)]
+    pub(crate) project_id: Option<ProjectRef>,
+    /// New subject for the copy. Defaults to the source subject.
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    /// Create a `copied_to`/`copied_from` relation between the original and
+    /// the copy. Default true.
+    #[serde(default = "default_true")]
+    pub(crate) link_original: bool,
+    /// Recursively copy the source's direct subtasks (and their own
+    /// subtasks, up to a bounded depth/count). Default true.
+    #[serde(default = "default_true")]
+    pub(crate) copy_subtasks: bool,
+    /// Override the assignee on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) assigned_to_id: Option<u64>,
+    /// Override the tracker on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) tracker_id: Option<u64>,
+    /// Override the priority on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) priority_id: Option<u64>,
+    /// Override the category on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) category_id: Option<u64>,
+    /// Override the target version on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) fixed_version_id: Option<u64>,
+    /// Override the description on the copy. Defaults to the source's.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct CopyIssueOutput {
+    pub(crate) success: bool,
+    pub(crate) issue: IssueDetailOutput,
+    /// Total number of subtasks copied (0 if `copy_subtasks=false` or the
+    /// source had none).
+    pub(crate) subtasks_copied: u64,
+    /// `true` if the subtask copy stopped early because of this server's
+    /// bounded copy limit — never a silent cut (D9's spirit applied to a
+    /// mutating tool: what was copied is real and complete in itself, just
+    /// not the *whole* source subtree).
+    pub(crate) subtasks_truncated: bool,
+}
+
+// --- manage_issue_relation ---
+
+const RELATION_TYPES: &[&str] = &[
+    "relates",
+    "duplicates",
+    "duplicated",
+    "blocks",
+    "blocked",
+    "precedes",
+    "follows",
+    "copied_to",
+    "copied_from",
+];
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ManageIssueRelationAction {
+    List,
+    Create,
+    Delete,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManageIssueRelationParams {
+    /// Operation to perform. `list` is always available, even in read-only
+    /// mode; `create`/`delete` are blocked in read-only mode.
+    pub(crate) action: ManageIssueRelationAction,
+    /// Source issue id. Required for `action="list"` and `action="create"`.
+    #[serde(default)]
+    pub(crate) issue_id: Option<u64>,
+    /// Target issue id. Required for `action="create"`.
+    #[serde(default)]
+    pub(crate) issue_to_id: Option<u64>,
+    /// Relation id. Required for `action="delete"`.
+    #[serde(default)]
+    pub(crate) relation_id: Option<u64>,
+    /// One of `relates`, `duplicates`, `duplicated`, `blocks`, `blocked`,
+    /// `precedes`, `follows`, `copied_to`, `copied_from`. Defaults to
+    /// `relates` on create.
+    #[serde(default)]
+    pub(crate) relation_type: Option<String>,
+    /// Delay in days. Only meaningful for `precedes`.
+    #[serde(default)]
+    pub(crate) delay: Option<i64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ManageIssueRelationOutput {
+    pub(crate) success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) relation: Option<RelationOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) relations: Option<Vec<RelationOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deleted_relation_id: Option<u64>,
+}
+
+// --- manage_issue_watcher ---
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ManageIssueWatcherAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManageIssueWatcherParams {
+    pub(crate) action: ManageIssueWatcherAction,
+    /// The issue id.
+    pub(crate) issue_id: u64,
+    /// The user id to add or remove as a watcher.
+    pub(crate) user_id: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ManageIssueWatcherOutput {
+    pub(crate) success: bool,
+    pub(crate) issue_id: u64,
+    pub(crate) user_id: u64,
+}
+
+// --- manage_issue_note ---
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManageIssueNoteAction {
+    Edit,
+    SetPrivate,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManageIssueNoteParams {
+    pub(crate) action: ManageIssueNoteAction,
+    /// The journal (note) id, from `get_redmine_issue` with
+    /// `include_journals=true` or `get_private_notes`.
+    pub(crate) journal_id: u64,
+    /// New note text. May be empty to clear it. Required for
+    /// `action="edit"`.
+    #[serde(default)]
+    pub(crate) notes: Option<String>,
+    /// Toggle the private flag while editing. Optional for
+    /// `action="edit"`.
+    #[serde(default)]
+    pub(crate) private_notes: Option<bool>,
+    /// `true` to mark the note private, `false` to make it public. Required
+    /// for `action="set_private"`.
+    #[serde(default)]
+    pub(crate) is_private: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ManageIssueNoteOutput {
+    pub(crate) success: bool,
+    pub(crate) journal_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) private_notes: Option<bool>,
+}
+
+// --- manage_issue_category ---
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ManageIssueCategoryAction {
+    List,
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManageIssueCategoryParams {
+    /// Operation to perform. `list` is always available, even in read-only
+    /// mode; `create`/`update`/`delete` are blocked in read-only mode.
+    pub(crate) action: ManageIssueCategoryAction,
+    /// Project identifier. Required for `action="list"` and
+    /// `action="create"`.
+    #[serde(default)]
+    pub(crate) project_id: Option<ProjectRef>,
+    /// Category id. Required for `action="update"` and `action="delete"`.
+    #[serde(default)]
+    pub(crate) category_id: Option<u64>,
+    /// Category name. Required for `action="create"`; optional (but not
+    /// blank if given) for `action="update"`.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    /// Default assignee user id. For `create`/`update`.
+    #[serde(default)]
+    pub(crate) assigned_to_id: Option<u64>,
+    /// Reassign the deleted category's issues to this category id instead
+    /// of leaving them uncategorised. For `delete` only.
+    #[serde(default)]
+    pub(crate) reassign_to_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct IssueCategoryOut {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) project: Option<IdNameOut>,
+    pub(crate) assigned_to: Option<IdNameOut>,
+}
+
+fn issue_category_out(
+    boundary: &Boundary,
+    c: &redmine_client::model::issue_category::IssueCategory,
+) -> IssueCategoryOut {
+    IssueCategoryOut {
+        id: c.id,
+        name: boundary.wrap("issue_category.name", &c.name),
+        project: c
+            .project
+            .as_ref()
+            .map(|p| id_name_out(boundary, "project.name", p)),
+        assigned_to: c
+            .assigned_to
+            .as_ref()
+            .map(|u| id_name_out(boundary, "user.name", u)),
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ManageIssueCategoryOutput {
+    pub(crate) success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) category: Option<IssueCategoryOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) categories: Option<Vec<IssueCategoryOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deleted_category_id: Option<u64>,
+}
+
+/// Build an [`IssueDetailOutput`] from a fetched [`Issue`], applying journal
+/// pagination (G2) when `journal_limit` is given. Shared by
+/// `get_redmine_issue`, `create_redmine_issue`, and `update_redmine_issue`
+/// (the latter two always pass `journal_limit: None` — Redmine's
+/// create/update responses never include journals in the first place, so
+/// `issue.journals` is `None` and the match's last arm applies).
+fn issue_detail_out(
+    boundary: &Boundary,
+    mut issue: Issue,
+    journal_limit: Option<u32>,
+    journal_offset: Option<u64>,
+) -> IssueDetailOutput {
+    let (journals, journal_pagination) = match (issue.journals.take(), journal_limit) {
+        (Some(all), Some(limit)) => {
+            let offset = journal_offset.unwrap_or(0);
+            let total = u64::try_from(all.len()).unwrap_or(u64::MAX);
+            let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+            let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+            let page: Vec<JournalOut> = all
+                .iter()
+                .skip(offset_usize)
+                .take(limit_usize)
+                .map(|j| journal_out(boundary, j))
+                .collect();
+            let count = u64::try_from(page.len()).unwrap_or(u64::MAX);
+            let has_more = offset.saturating_add(count) < total;
+            (
+                Some(page),
+                Some(JournalPagination {
+                    total,
+                    offset,
+                    limit,
+                    count,
+                    has_more,
+                }),
+            )
+        }
+        (Some(all), None) => (
+            Some(all.iter().map(|j| journal_out(boundary, j)).collect()),
+            None,
+        ),
+        (None, _) => (None, None),
+    };
+
+    IssueDetailOutput {
+        id: issue.id,
+        project: id_name_out(boundary, "project.name", &issue.project),
+        tracker: id_name_out(boundary, "tracker.name", &issue.tracker),
+        status: id_name_out(boundary, "issue_status.name", &issue.status),
+        priority: id_name_out(boundary, "issue_priority.name", &issue.priority),
+        author: id_name_out(boundary, "user.name", &issue.author),
+        assigned_to: issue
+            .assigned_to
+            .as_ref()
+            .map(|u| id_name_out(boundary, "user.name", u)),
+        parent: issue.parent.as_ref().map(|p| IdOnlyOut { id: p.id }),
+        category: issue
+            .category
+            .as_ref()
+            .map(|c| id_name_out(boundary, "issue_category.name", c)),
+        fixed_version: issue
+            .fixed_version
+            .as_ref()
+            .map(|v| id_name_out(boundary, "version.name", v)),
+        subject: boundary.wrap("issue.subject", &issue.subject),
+        description: issue
+            .description
+            .as_deref()
+            .map(|d| boundary.wrap("issue.description", d)),
+        start_date: issue.start_date,
+        due_date: issue.due_date,
+        done_ratio: issue.done_ratio,
+        is_private: issue.is_private,
+        estimated_hours: issue.estimated_hours,
+        spent_hours: issue.spent_hours,
+        custom_fields: issue.custom_fields.as_ref().map(|fields| {
+            fields
+                .iter()
+                .map(|cf| custom_field_value_out(boundary, cf))
+                .collect()
+        }),
+        created_on: issue.created_on,
+        updated_on: issue.updated_on,
+        closed_on: issue.closed_on,
+        journals,
+        journal_pagination,
+        attachments: issue
+            .attachments
+            .as_ref()
+            .map(|atts| atts.iter().map(|a| attachment_out(boundary, a)).collect()),
+        watchers: issue.watchers.as_ref().map(|ws| {
+            ws.iter()
+                .map(|w| id_name_out(boundary, "user.name", w))
+                .collect()
+        }),
+        relations: issue
+            .relations
+            .as_ref()
+            .map(|rs| rs.iter().map(relation_out).collect()),
+        children: issue
+            .children
+            .as_ref()
+            .map(|cs| cs.iter().map(|c| issue_child_out(boundary, c)).collect()),
+    }
+}
+
 #[tool_router(router = issues_tool_router, vis = "pub(crate)")]
 impl RedmineMcp {
     /// `GET /issues/{id}.json?include=...`.
@@ -663,100 +1211,12 @@ impl RedmineMcp {
         }
 
         let boundary = Boundary::new();
-
-        let (journals, journal_pagination) = match (issue.journals.take(), params.journal_limit) {
-            (Some(all), Some(limit)) => {
-                let offset = params.journal_offset.unwrap_or(0);
-                let total = u64::try_from(all.len()).unwrap_or(u64::MAX);
-                let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
-                let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-                let page: Vec<JournalOut> = all
-                    .iter()
-                    .skip(offset_usize)
-                    .take(limit_usize)
-                    .map(|j| journal_out(&boundary, j))
-                    .collect();
-                let count = u64::try_from(page.len()).unwrap_or(u64::MAX);
-                let has_more = offset.saturating_add(count) < total;
-                (
-                    Some(page),
-                    Some(JournalPagination {
-                        total,
-                        offset,
-                        limit,
-                        count,
-                        has_more,
-                    }),
-                )
-            }
-            (Some(all), None) => (
-                Some(all.iter().map(|j| journal_out(&boundary, j)).collect()),
-                None,
-            ),
-            (None, _) => (None, None),
-        };
-
-        let output = IssueDetailOutput {
-            id: issue.id,
-            project: id_name_out(&boundary, "project.name", &issue.project),
-            tracker: id_name_out(&boundary, "tracker.name", &issue.tracker),
-            status: id_name_out(&boundary, "issue_status.name", &issue.status),
-            priority: id_name_out(&boundary, "issue_priority.name", &issue.priority),
-            author: id_name_out(&boundary, "user.name", &issue.author),
-            assigned_to: issue
-                .assigned_to
-                .as_ref()
-                .map(|u| id_name_out(&boundary, "user.name", u)),
-            parent: issue.parent.as_ref().map(|p| IdOnlyOut { id: p.id }),
-            category: issue
-                .category
-                .as_ref()
-                .map(|c| id_name_out(&boundary, "issue_category.name", c)),
-            fixed_version: issue
-                .fixed_version
-                .as_ref()
-                .map(|v| id_name_out(&boundary, "version.name", v)),
-            subject: boundary.wrap("issue.subject", &issue.subject),
-            description: issue
-                .description
-                .as_deref()
-                .map(|d| boundary.wrap("issue.description", d)),
-            start_date: issue.start_date,
-            due_date: issue.due_date,
-            done_ratio: issue.done_ratio,
-            is_private: issue.is_private,
-            estimated_hours: issue.estimated_hours,
-            spent_hours: issue.spent_hours,
-            custom_fields: issue.custom_fields.as_ref().map(|fields| {
-                fields
-                    .iter()
-                    .map(|cf| custom_field_value_out(&boundary, cf))
-                    .collect()
-            }),
-            created_on: issue.created_on,
-            updated_on: issue.updated_on,
-            closed_on: issue.closed_on,
-            journals,
-            journal_pagination,
-            attachments: issue
-                .attachments
-                .as_ref()
-                .map(|atts| atts.iter().map(|a| attachment_out(&boundary, a)).collect()),
-            watchers: issue.watchers.as_ref().map(|ws| {
-                ws.iter()
-                    .map(|w| id_name_out(&boundary, "user.name", w))
-                    .collect()
-            }),
-            relations: issue
-                .relations
-                .as_ref()
-                .map(|rs| rs.iter().map(relation_out).collect()),
-            children: issue
-                .children
-                .as_ref()
-                .map(|cs| cs.iter().map(|c| issue_child_out(&boundary, c)).collect()),
-        };
-
+        let output = issue_detail_out(
+            &boundary,
+            issue,
+            params.journal_limit,
+            params.journal_offset,
+        );
         Ok(output::ok(&output, self.output_caps()))
     }
 
@@ -961,5 +1421,813 @@ impl RedmineMcp {
             &PrivateNotesOutput { private_notes },
             self.output_caps(),
         ))
+    }
+
+    /// `POST /issues.json`.
+    #[tool(
+        description = "Create a new Redmine issue. Use this to add a task, bug, or feature request to a project. Only project_id and subject are required; every other field defaults to the project's/tracker's own default when omitted. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<CreateRedmineIssueParams>(),
+        output_schema = crate::tools::schema::output::<CreateRedmineIssueOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn create_redmine_issue(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<CreateRedmineIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.subject.trim().is_empty() {
+            return Err(McpError::invalid_params("subject must not be empty", None));
+        }
+        let project_id = resolve_project_ref(params.project_id)?;
+
+        let create = IssueCreate {
+            project_id,
+            subject: params.subject,
+            tracker_id: params.tracker_id,
+            status_id: params.status_id,
+            priority_id: params.priority_id,
+            category_id: params.category_id,
+            fixed_version_id: params.fixed_version_id,
+            description: params.description,
+            assigned_to_id: params.assigned_to_id.map(UserId),
+            parent_issue_id: params.parent_issue_id.map(IssueId),
+            start_date: params.start_date,
+            due_date: params.due_date,
+            done_ratio: params.done_ratio,
+            estimated_hours: params.estimated_hours,
+            is_private: params.is_private,
+        };
+
+        let scoped = self.scoped(&ctx)?;
+        let issue = match scoped.create_issue(&create).await {
+            Ok(issue) => issue,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let boundary = Boundary::new();
+        let issue_out = issue_detail_out(&boundary, issue, None, None);
+        Ok(output::ok(
+            &CreateRedmineIssueOutput {
+                success: true,
+                issue: issue_out,
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// `PUT /issues/{id}.json`, then a follow-up `GET`.
+    #[tool(
+        description = "Update fields on an existing issue, or add a note to its history. Use this when a field needs to change or a comment should be added; omit any parameter to leave that field unchanged. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<UpdateRedmineIssueParams>(),
+        output_schema = crate::tools::schema::output::<UpdateRedmineIssueOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn update_redmine_issue(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UpdateRedmineIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(notes) = &params.notes
+            && notes.is_empty()
+        {
+            return Err(McpError::invalid_params(
+                "notes must not be an empty string; omit the field to add no note",
+                None,
+            ));
+        }
+        let nothing_to_change = params.subject.is_none()
+            && params.description.is_none()
+            && params.tracker_id.is_none()
+            && params.status_id.is_none()
+            && params.priority_id.is_none()
+            && params.assigned_to_id.is_none()
+            && params.category_id.is_none()
+            && params.fixed_version_id.is_none()
+            && params.parent_issue_id.is_none()
+            && params.start_date.is_none()
+            && params.due_date.is_none()
+            && params.done_ratio.is_none()
+            && params.estimated_hours.is_none()
+            && params.is_private.is_none()
+            && params.notes.is_none();
+        if nothing_to_change {
+            return Err(McpError::invalid_params(
+                "at least one field to change, or notes, must be given",
+                None,
+            ));
+        }
+
+        let patch = IssueUpdate {
+            subject: params.subject,
+            description: params.description,
+            tracker_id: params.tracker_id,
+            status_id: params.status_id,
+            priority_id: params.priority_id,
+            category_id: params.category_id,
+            fixed_version_id: params.fixed_version_id,
+            assigned_to_id: params.assigned_to_id.map(UserId),
+            parent_issue_id: params.parent_issue_id.map(IssueId),
+            start_date: params.start_date,
+            due_date: params.due_date,
+            done_ratio: params.done_ratio,
+            estimated_hours: params.estimated_hours,
+            is_private: params.is_private,
+            notes: params.notes,
+            private_notes: params.private_notes,
+        };
+
+        let scoped = self.scoped(&ctx)?;
+        let issue = match scoped.update_issue(IssueId(params.issue_id), &patch).await {
+            Ok(issue) => issue,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let boundary = Boundary::new();
+        let issue_out = issue_detail_out(&boundary, issue, None, None);
+        Ok(output::ok(
+            &UpdateRedmineIssueOutput {
+                success: true,
+                issue: issue_out,
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// Impact preview via `GET /issues/{id}.json?include=journals,attachments,relations`
+    /// plus `GET /issues.json?parent_id={id}&status_id=*` and one
+    /// `GET /time_entries.json?issue_id={id}&limit=1`, then (once confirmed)
+    /// `DELETE /issues/{id}.json`.
+    #[tool(
+        description = "Delete a Redmine issue. Refuses by default and returns an impact preview (children/journals/attachments/relations/time-entry counts); pass confirm_delete=true to proceed, and confirm_delete_with_children=true too if it has subtasks. A refusal is a normal result, not an error. Use when the user explicitly asks to delete an issue. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<DeleteRedmineIssueParams>(),
+        output_schema = crate::tools::schema::output::<DeleteRedmineIssueOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn delete_redmine_issue(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DeleteRedmineIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let issue_id = IssueId(params.issue_id);
+        let scoped = self.scoped(&ctx)?;
+
+        let issue = match scoped
+            .get_issue(
+                issue_id,
+                &[
+                    IssueInclude::Journals,
+                    IssueInclude::Attachments,
+                    IssueInclude::Relations,
+                ],
+            )
+            .await
+        {
+            Ok(issue) => issue,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+        let children_count = match scoped.list_subtasks(issue_id).await {
+            Ok(children) => u64::try_from(children.len()).unwrap_or(u64::MAX),
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+        let time_entries_count = match scoped
+            .list_time_entries_page(
+                &TimeEntryQuery {
+                    issue_id: Some(issue_id),
+                    ..TimeEntryQuery::default()
+                },
+                1,
+                0,
+            )
+            .await
+        {
+            Ok(page) => page.total_count,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let impact = DeleteImpactOut {
+            children_count,
+            journals_count: u64::try_from(issue.journals.map_or(0, |j| j.len()))
+                .unwrap_or(u64::MAX),
+            attachments_count: u64::try_from(issue.attachments.map_or(0, |a| a.len()))
+                .unwrap_or(u64::MAX),
+            relations_count: u64::try_from(issue.relations.map_or(0, |r| r.len()))
+                .unwrap_or(u64::MAX),
+            time_entries_count,
+        };
+
+        if !params.confirm_delete {
+            return Ok(output::ok(
+                &DeleteRedmineIssueOutput {
+                    success: false,
+                    error: Some(
+                        "deletion requires confirm_delete=true; nothing has been deleted"
+                            .to_string(),
+                    ),
+                    code: Some(ErrorCode::ConfirmationRequired),
+                    hint: Some(
+                        "review impact, then retry with confirm_delete=true (and confirm_delete_with_children=true if children_count > 0)"
+                            .to_string(),
+                    ),
+                    impact: Some(impact),
+                    deleted_issue_id: None,
+                    cascade_deleted: None,
+                },
+                self.output_caps(),
+            ));
+        }
+        if impact.children_count > 0 && !params.confirm_delete_with_children {
+            return Ok(output::ok(
+                &DeleteRedmineIssueOutput {
+                    success: false,
+                    error: Some(format!(
+                        "issue has {} direct subtask(s); deleting it cascade-deletes them all, with no way to keep them",
+                        impact.children_count
+                    )),
+                    code: Some(ErrorCode::ChildrenPresent),
+                    hint: Some(
+                        "retry with confirm_delete_with_children=true to proceed, or reassign/detach the subtasks first"
+                            .to_string(),
+                    ),
+                    impact: Some(impact),
+                    deleted_issue_id: None,
+                    cascade_deleted: None,
+                },
+                self.output_caps(),
+            ));
+        }
+
+        if let Err(e) = scoped.delete_issue(issue_id).await {
+            return Ok(to_tool_error(e));
+        }
+
+        Ok(output::ok(
+            &DeleteRedmineIssueOutput {
+                success: true,
+                error: None,
+                code: None,
+                hint: None,
+                impact: None,
+                deleted_issue_id: Some(params.issue_id),
+                cascade_deleted: Some(impact.children_count),
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// `GET /issues/{id}.json`, `POST /issues.json` for the root copy, then
+    /// (bounded) `GET /issues.json?parent_id=...&status_id=*` +
+    /// `POST /issues.json` per subtask, and optionally one
+    /// `POST /issues/{source_id}/relations.json`.
+    #[tool(
+        description = "Copy an issue to a new one, optionally into another project, optionally recursively copying subtasks. Most fields are copied from the source unless overridden; status is never copied. Attachments are never copied. Bounded to 50 issues per call. Use this instead of create_redmine_issue when duplicating an existing issue. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<CopyIssueParams>(),
+        output_schema = crate::tools::schema::output::<CopyIssueOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn copy_issue(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<CopyIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        const COPY_MAX_TOTAL: usize = 50;
+        const COPY_MAX_DEPTH: u32 = 5;
+
+        let scoped = self.scoped(&ctx)?;
+        let source = match scoped.get_issue(IssueId(params.issue_id), &[]).await {
+            Ok(issue) => issue,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let target_project = match params.project_id {
+            Some(project_ref) => resolve_project_ref(project_ref)?,
+            None => ProjectIdent::Id(ProjectId(source.project.id)),
+        };
+
+        let root_create = IssueCreate {
+            project_id: target_project.clone(),
+            subject: params.subject.unwrap_or_else(|| source.subject.clone()),
+            tracker_id: Some(params.tracker_id.unwrap_or(source.tracker.id)),
+            status_id: None,
+            priority_id: Some(params.priority_id.unwrap_or(source.priority.id)),
+            category_id: params
+                .category_id
+                .or_else(|| source.category.as_ref().map(|c| c.id)),
+            fixed_version_id: params
+                .fixed_version_id
+                .or_else(|| source.fixed_version.as_ref().map(|v| v.id)),
+            description: params.description.or_else(|| source.description.clone()),
+            assigned_to_id: params
+                .assigned_to_id
+                .map(UserId)
+                .or_else(|| source.assigned_to.as_ref().map(|u| UserId(u.id))),
+            parent_issue_id: None,
+            start_date: source.start_date,
+            due_date: source.due_date,
+            done_ratio: source.done_ratio,
+            estimated_hours: source.estimated_hours,
+            is_private: source.is_private,
+        };
+
+        let created = match scoped.create_issue(&root_create).await {
+            Ok(issue) => issue,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        if params.link_original {
+            // Best-effort: the copy itself already succeeded, and a relation
+            // failure (e.g. cross-project relations disabled) should not
+            // make the tool report the whole copy as failed.
+            let _ = scoped
+                .create_relation(
+                    IssueId(params.issue_id),
+                    &IssueRelationCreate {
+                        issue_to_id: IssueId(created.id),
+                        relation_type: Some("copied_to".to_string()),
+                        delay: None,
+                    },
+                )
+                .await;
+        }
+
+        let mut subtasks_copied: u64 = 0;
+        let mut subtasks_truncated = false;
+        let mut total_created: usize = 1;
+
+        if params.copy_subtasks {
+            let mut queue: std::collections::VecDeque<(IssueId, IssueId, u32)> =
+                std::collections::VecDeque::new();
+            queue.push_back((IssueId(params.issue_id), IssueId(created.id), 0));
+
+            'outer: while let Some((source_id, new_parent_id, depth)) = queue.pop_front() {
+                if depth >= COPY_MAX_DEPTH {
+                    subtasks_truncated = true;
+                    continue;
+                }
+                let Ok(children) = scoped.list_subtasks(source_id).await else {
+                    subtasks_truncated = true;
+                    continue;
+                };
+                for child in children {
+                    if total_created >= COPY_MAX_TOTAL {
+                        subtasks_truncated = true;
+                        break 'outer;
+                    }
+                    let child_create = IssueCreate {
+                        project_id: target_project.clone(),
+                        subject: child.subject.clone(),
+                        tracker_id: Some(child.tracker.id),
+                        status_id: None,
+                        priority_id: Some(child.priority.id),
+                        category_id: child.category.as_ref().map(|c| c.id),
+                        fixed_version_id: child.fixed_version.as_ref().map(|v| v.id),
+                        description: child.description.clone(),
+                        assigned_to_id: child.assigned_to.as_ref().map(|u| UserId(u.id)),
+                        parent_issue_id: Some(new_parent_id),
+                        start_date: child.start_date,
+                        due_date: child.due_date,
+                        done_ratio: child.done_ratio,
+                        estimated_hours: child.estimated_hours,
+                        is_private: child.is_private,
+                    };
+                    match scoped.create_issue(&child_create).await {
+                        Ok(new_child) => {
+                            subtasks_copied = subtasks_copied.saturating_add(1);
+                            total_created = total_created.saturating_add(1);
+                            queue.push_back((
+                                IssueId(child.id),
+                                IssueId(new_child.id),
+                                depth.saturating_add(1),
+                            ));
+                        }
+                        Err(_) => {
+                            subtasks_truncated = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let boundary = Boundary::new();
+        let issue_out = issue_detail_out(&boundary, created, None, None);
+        Ok(output::ok(
+            &CopyIssueOutput {
+                success: true,
+                issue: issue_out,
+                subtasks_copied,
+                subtasks_truncated,
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// `action="list"`: `GET /issues/{issue_id}/relations.json`.
+    /// `action="create"`: `POST /issues/{issue_id}/relations.json`.
+    /// `action="delete"`: `DELETE /relations/{relation_id}.json`.
+    #[tool(
+        description = "Manage relations between issues (relates, blocks, precedes, ...). Use this to list (issue_id, works read-only), create (issue_id+issue_to_id), or delete (relation_id) a relation. create/delete are blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<ManageIssueRelationParams>(),
+        output_schema = crate::tools::schema::output::<ManageIssueRelationOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn manage_issue_relation(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ManageIssueRelationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(rt) = &params.relation_type
+            && !RELATION_TYPES.contains(&rt.as_str())
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "relation_type must be one of {}, got {rt:?}",
+                    RELATION_TYPES.join(", ")
+                ),
+                None,
+            ));
+        }
+
+        let scoped = self.scoped(&ctx)?;
+
+        match params.action {
+            ManageIssueRelationAction::List => {
+                let issue_id = params.issue_id.ok_or_else(|| {
+                    McpError::invalid_params("issue_id is required for action=\"list\"", None)
+                })?;
+                let relations = match scoped.list_relations(IssueId(issue_id)).await {
+                    Ok(relations) => relations,
+                    Err(e) => return Ok(to_tool_error(e)),
+                };
+                Ok(output::ok(
+                    &ManageIssueRelationOutput {
+                        success: true,
+                        relation: None,
+                        relations: Some(relations.iter().map(relation_out).collect()),
+                        deleted_relation_id: None,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueRelationAction::Create => {
+                if self.inner.config.read_only {
+                    return Ok(output::err(
+                        ErrorCode::ReadOnly,
+                        "this server is running in read-only mode; manage_issue_relation(action=\"create\") is disabled",
+                        Some(
+                            "use action=\"list\" instead, or ask the operator to disable read-only mode",
+                        ),
+                    ));
+                }
+                let issue_id = params.issue_id.ok_or_else(|| {
+                    McpError::invalid_params("issue_id is required for action=\"create\"", None)
+                })?;
+                let issue_to_id = params.issue_to_id.ok_or_else(|| {
+                    McpError::invalid_params("issue_to_id is required for action=\"create\"", None)
+                })?;
+                let new = IssueRelationCreate {
+                    issue_to_id: IssueId(issue_to_id),
+                    relation_type: params.relation_type,
+                    delay: params.delay,
+                };
+                let relation = match scoped.create_relation(IssueId(issue_id), &new).await {
+                    Ok(relation) => relation,
+                    Err(e) => return Ok(to_tool_error(e)),
+                };
+                Ok(output::ok(
+                    &ManageIssueRelationOutput {
+                        success: true,
+                        relation: Some(relation_out(&relation)),
+                        relations: None,
+                        deleted_relation_id: None,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueRelationAction::Delete => {
+                if self.inner.config.read_only {
+                    return Ok(output::err(
+                        ErrorCode::ReadOnly,
+                        "this server is running in read-only mode; manage_issue_relation(action=\"delete\") is disabled",
+                        Some(
+                            "use action=\"list\" instead, or ask the operator to disable read-only mode",
+                        ),
+                    ));
+                }
+                let relation_id = params.relation_id.ok_or_else(|| {
+                    McpError::invalid_params("relation_id is required for action=\"delete\"", None)
+                })?;
+                if let Err(e) = scoped.delete_relation(RelationId(relation_id)).await {
+                    return Ok(to_tool_error(e));
+                }
+                Ok(output::ok(
+                    &ManageIssueRelationOutput {
+                        success: true,
+                        relation: None,
+                        relations: None,
+                        deleted_relation_id: Some(relation_id),
+                    },
+                    self.output_caps(),
+                ))
+            }
+        }
+    }
+
+    /// `action="add"`: `POST /issues/{issue_id}/watchers.json`.
+    /// `action="remove"`: `DELETE /issues/{issue_id}/watchers/{user_id}.json`.
+    #[tool(
+        description = "Add or remove a watcher on an issue. Use this to subscribe/unsubscribe a user to an issue's notifications. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<ManageIssueWatcherParams>(),
+        output_schema = crate::tools::schema::output::<ManageIssueWatcherOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn manage_issue_watcher(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ManageIssueWatcherParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scoped = self.scoped(&ctx)?;
+        let issue_id = IssueId(params.issue_id);
+        let user_id = UserId(params.user_id);
+
+        let result = match params.action {
+            ManageIssueWatcherAction::Add => scoped.add_watcher(issue_id, user_id).await,
+            ManageIssueWatcherAction::Remove => scoped.remove_watcher(issue_id, user_id).await,
+        };
+        if let Err(e) = result {
+            return Ok(to_tool_error(e));
+        }
+
+        Ok(output::ok(
+            &ManageIssueWatcherOutput {
+                success: true,
+                issue_id: params.issue_id,
+                user_id: params.user_id,
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// `PUT /journals/{id}.json`.
+    #[tool(
+        description = "Edit an issue note's text and/or private flag. Use this to edit (journal_id+notes; empty string clears it) or set_private (journal_id+is_private) alone. journal_id comes from get_redmine_issue or get_private_notes. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<ManageIssueNoteParams>(),
+        output_schema = crate::tools::schema::output::<ManageIssueNoteOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn manage_issue_note(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ManageIssueNoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scoped = self.scoped(&ctx)?;
+        let journal_id = JournalId(params.journal_id);
+
+        match params.action {
+            ManageIssueNoteAction::Edit => {
+                let notes = params.notes.ok_or_else(|| {
+                    McpError::invalid_params("notes is required for action=\"edit\"", None)
+                })?;
+                let patch = JournalUpdate {
+                    notes: Some(notes.clone()),
+                    private_notes: params.private_notes,
+                };
+                if let Err(e) = scoped.update_journal(journal_id, &patch).await {
+                    return Ok(to_tool_error(e));
+                }
+                Ok(output::ok(
+                    &ManageIssueNoteOutput {
+                        success: true,
+                        journal_id: params.journal_id,
+                        notes: Some(notes),
+                        private_notes: params.private_notes,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueNoteAction::SetPrivate => {
+                let is_private = params.is_private.ok_or_else(|| {
+                    McpError::invalid_params(
+                        "is_private is required for action=\"set_private\"",
+                        None,
+                    )
+                })?;
+                let patch = JournalUpdate {
+                    notes: None,
+                    private_notes: Some(is_private),
+                };
+                if let Err(e) = scoped.update_journal(journal_id, &patch).await {
+                    return Ok(to_tool_error(e));
+                }
+                Ok(output::ok(
+                    &ManageIssueNoteOutput {
+                        success: true,
+                        journal_id: params.journal_id,
+                        notes: None,
+                        private_notes: Some(is_private),
+                    },
+                    self.output_caps(),
+                ))
+            }
+        }
+    }
+
+    /// `action="list"`: `GET /projects/{id}/issue_categories.json`.
+    /// `action="create"`: `POST /projects/{id}/issue_categories.json`.
+    /// `action="update"`: `PUT /issue_categories/{id}.json`.
+    /// `action="delete"`: `DELETE /issue_categories/{id}.json`.
+    #[tool(
+        description = "Manage issue categories on a project. Use this to list (project_id, works read-only), create (project_id+name), update, or delete (category_id) categories; delete accepts reassign_to_id to move issues instead of leaving them uncategorised. create/update/delete are blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<ManageIssueCategoryParams>(),
+        output_schema = crate::tools::schema::output::<ManageIssueCategoryOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn manage_issue_category(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ManageIssueCategoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scoped = self.scoped(&ctx)?;
+        let boundary = Boundary::new();
+
+        match params.action {
+            ManageIssueCategoryAction::List => {
+                let project_ref = params.project_id.ok_or_else(|| {
+                    McpError::invalid_params("project_id is required for action=\"list\"", None)
+                })?;
+                let project_id = resolve_project_ref(project_ref)?;
+                let categories = match scoped.list_issue_categories(&project_id).await {
+                    Ok(categories) => categories,
+                    Err(e) => return Ok(to_tool_error(e)),
+                };
+                Ok(output::ok(
+                    &ManageIssueCategoryOutput {
+                        success: true,
+                        category: None,
+                        categories: Some(
+                            categories
+                                .iter()
+                                .map(|c| issue_category_out(&boundary, c))
+                                .collect(),
+                        ),
+                        deleted_category_id: None,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueCategoryAction::Create => {
+                if self.inner.config.read_only {
+                    return Ok(output::err(
+                        ErrorCode::ReadOnly,
+                        "this server is running in read-only mode; manage_issue_category(action=\"create\") is disabled",
+                        Some(
+                            "use action=\"list\" instead, or ask the operator to disable read-only mode",
+                        ),
+                    ));
+                }
+                let project_ref = params.project_id.ok_or_else(|| {
+                    McpError::invalid_params("project_id is required for action=\"create\"", None)
+                })?;
+                let project_id = resolve_project_ref(project_ref)?;
+                let name = params
+                    .name
+                    .filter(|n| !n.trim().is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "name is required (and must not be blank) for action=\"create\"",
+                            None,
+                        )
+                    })?;
+                let new = IssueCategoryCreate {
+                    name,
+                    assigned_to_id: params.assigned_to_id.map(UserId),
+                };
+                let category = match scoped.create_issue_category(&project_id, &new).await {
+                    Ok(category) => category,
+                    Err(e) => return Ok(to_tool_error(e)),
+                };
+                Ok(output::ok(
+                    &ManageIssueCategoryOutput {
+                        success: true,
+                        category: Some(issue_category_out(&boundary, &category)),
+                        categories: None,
+                        deleted_category_id: None,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueCategoryAction::Update => {
+                if self.inner.config.read_only {
+                    return Ok(output::err(
+                        ErrorCode::ReadOnly,
+                        "this server is running in read-only mode; manage_issue_category(action=\"update\") is disabled",
+                        Some(
+                            "use action=\"list\" instead, or ask the operator to disable read-only mode",
+                        ),
+                    ));
+                }
+                let category_id = params.category_id.ok_or_else(|| {
+                    McpError::invalid_params("category_id is required for action=\"update\"", None)
+                })?;
+                if let Some(name) = &params.name
+                    && name.trim().is_empty()
+                {
+                    return Err(McpError::invalid_params(
+                        "name must not be blank if given",
+                        None,
+                    ));
+                }
+                let patch = IssueCategoryUpdate {
+                    name: params.name,
+                    assigned_to_id: params.assigned_to_id.map(UserId),
+                };
+                let category = match scoped
+                    .update_issue_category(IssueCategoryId(category_id), &patch)
+                    .await
+                {
+                    Ok(category) => category,
+                    Err(e) => return Ok(to_tool_error(e)),
+                };
+                Ok(output::ok(
+                    &ManageIssueCategoryOutput {
+                        success: true,
+                        category: Some(issue_category_out(&boundary, &category)),
+                        categories: None,
+                        deleted_category_id: None,
+                    },
+                    self.output_caps(),
+                ))
+            }
+            ManageIssueCategoryAction::Delete => {
+                if self.inner.config.read_only {
+                    return Ok(output::err(
+                        ErrorCode::ReadOnly,
+                        "this server is running in read-only mode; manage_issue_category(action=\"delete\") is disabled",
+                        Some(
+                            "use action=\"list\" instead, or ask the operator to disable read-only mode",
+                        ),
+                    ));
+                }
+                let category_id = params.category_id.ok_or_else(|| {
+                    McpError::invalid_params("category_id is required for action=\"delete\"", None)
+                })?;
+                if let Err(e) = scoped
+                    .delete_issue_category(
+                        IssueCategoryId(category_id),
+                        params.reassign_to_id.map(IssueCategoryId),
+                    )
+                    .await
+                {
+                    return Ok(to_tool_error(e));
+                }
+                Ok(output::ok(
+                    &ManageIssueCategoryOutput {
+                        success: true,
+                        category: None,
+                        categories: None,
+                        deleted_category_id: Some(category_id),
+                    },
+                    self.output_caps(),
+                ))
+            }
+        }
     }
 }

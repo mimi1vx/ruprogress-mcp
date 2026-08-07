@@ -10,10 +10,14 @@ use url::Url;
 
 use crate::auth::Credential;
 use crate::error::Error;
-use crate::ids::{IssueId, MembershipId, ProjectIdent, TimeEntryId, VersionId};
+use crate::ids::{
+    IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent, RelationId, TimeEntryId,
+    UserId, VersionId,
+};
 use crate::model::{
-    BareCollection, Collection, custom_field, enumeration, issue, issue_status, membership,
-    project, query, role, search, time_entry, tracker, user, version,
+    BareCollection, Collection, custom_field, enumeration, issue, issue_category, issue_status,
+    journal, membership, project, query, relation, role, search, time_entry, tracker, user,
+    version,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -468,6 +472,29 @@ impl Scoped<'_> {
         Ok(())
     }
 
+    /// Like [`Self::delete`], but with query parameters (e.g.
+    /// `?reassign_to_id=...`).
+    pub(crate) async fn delete_with_query(&self, path: &str, q: &Query) -> crate::Result<()> {
+        let url = self.build_url(path, Some(q))?;
+        let template = self.credential.apply(self.inner.http.delete(url));
+        self.send_with_retry(&http::Method::DELETE, &template)
+            .await?;
+        Ok(())
+    }
+
+    /// Like [`Self::post_json`], for endpoints that answer `204 No Content`
+    /// with no body to decode (e.g. `POST /issues/{id}/watchers.json`).
+    pub(crate) async fn post_json_no_content<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> crate::Result<()> {
+        let url = self.build_url(path, None)?;
+        let template = self.credential.apply(self.inner.http.post(url)).json(body);
+        self.send_with_retry(&http::Method::POST, &template).await?;
+        Ok(())
+    }
+
     /// Walk every page of a Redmine collection endpoint, subject to
     /// [`Limits`]. Terminates when (1) all items have been collected, (2) a
     /// cap is hit — returned as `truncated = true`, not an error, so a big
@@ -786,18 +813,252 @@ impl Scoped<'_> {
         Ok(env.issue)
     }
 
-    /// `PUT /issues/{id}.json`.
+    /// `PUT /issues/{id}.json`, then a follow-up `GET` to return the full
+    /// updated resource — Redmine's `PUT` itself answers `204 No Content`
+    /// (matching `update_version`/`update_membership`/`update_time_entry`).
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or Redmine rejects the payload
-    /// (e.g. 422 with validation errors).
-    pub async fn update_issue(&self, id: IssueId, patch: &issue::IssueUpdate) -> crate::Result<()> {
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// update (e.g. 422 with validation errors).
+    pub async fn update_issue(
+        &self,
+        id: IssueId,
+        patch: &issue::IssueUpdate,
+    ) -> crate::Result<issue::Issue> {
         self.put_json(
             &format!("issues/{id}.json"),
             &issue::IssueUpdateEnvelope { issue: patch },
         )
+        .await?;
+        self.get_issue(id, &[]).await
+    }
+
+    /// `DELETE /issues/{id}.json`. Redmine cascade-deletes descendant issues
+    /// automatically (`Redmine::NestedSet::IssueNestedSet#destroy_children`,
+    /// a `before_destroy` callback) — there is no separate "cascade" request
+    /// parameter to send. The caller (`delete_redmine_issue`) is responsible
+    /// for the confirmation dance and the impact preview; this method only
+    /// ever sends the one `DELETE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_issue(&self, id: IssueId) -> crate::Result<()> {
+        self.delete(&format!("issues/{id}.json")).await
+    }
+
+    /// `GET /issues/{issue_id}/relations.json` — no pagination envelope at
+    /// all (not even `total_count`; verified against
+    /// `issue_relations/index.api.rsb`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response unexpectedly carries a
+    /// pagination envelope.
+    pub async fn list_relations(
+        &self,
+        issue_id: IssueId,
+    ) -> crate::Result<Vec<relation::IssueRelation>> {
+        self.get_collection::<relation::IssueRelationsEnvelope>(
+            &format!("issues/{issue_id}/relations.json"),
+            &Query::default(),
+        )
         .await
+    }
+
+    /// `POST /issues/{issue_id}/relations.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine rejects the payload
+    /// (e.g. 422 for a same-project violation or a circular dependency).
+    pub async fn create_relation(
+        &self,
+        issue_id: IssueId,
+        new: &relation::IssueRelationCreate,
+    ) -> crate::Result<relation::IssueRelation> {
+        let env: relation::IssueRelationEnvelope = self
+            .post_json(
+                &format!("issues/{issue_id}/relations.json"),
+                &relation::IssueRelationCreateEnvelope { relation: new },
+            )
+            .await?;
+        Ok(env.relation)
+    }
+
+    /// `DELETE /relations/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 if the relation is not deletable by this
+    /// credential).
+    pub async fn delete_relation(&self, id: RelationId) -> crate::Result<()> {
+        self.delete(&format!("relations/{id}.json")).await
+    }
+
+    /// `POST /issues/{issue_id}/watchers.json`, body `{"user_id": ...}`.
+    /// Redmine answers `204 No Content` on success, per
+    /// `watchers_controller.rb#create`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 without `add_issue_watchers`).
+    pub async fn add_watcher(&self, issue_id: IssueId, user_id: UserId) -> crate::Result<()> {
+        #[derive(Serialize)]
+        struct Body {
+            user_id: UserId,
+        }
+        self.post_json_no_content(
+            &format!("issues/{issue_id}/watchers.json"),
+            &Body { user_id },
+        )
+        .await
+    }
+
+    /// `DELETE /issues/{issue_id}/watchers/{user_id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 without `delete_issue_watchers`, 404 for an
+    /// unknown user id).
+    pub async fn remove_watcher(&self, issue_id: IssueId, user_id: UserId) -> crate::Result<()> {
+        self.delete(&format!("issues/{issue_id}/watchers/{user_id}.json"))
+            .await
+    }
+
+    /// `PUT /journals/{id}.json`. Redmine answers `204 No Content` with no
+    /// body (`journals_controller.rb#update`) — there is no `GET
+    /// /journals/{id}.json` to follow up with, unlike every other `update_*`
+    /// method in this client; the caller echoes back what it sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (403 if the note is not editable by this
+    /// credential; Redmine silently no-ops rather than 422 on a journal-only
+    /// validation failure, per `journals_controller.rb`).
+    pub async fn update_journal(
+        &self,
+        id: JournalId,
+        patch: &journal::JournalUpdate,
+    ) -> crate::Result<()> {
+        self.put_json(
+            &format!("journals/{id}.json"),
+            &journal::JournalUpdateEnvelope { journal: patch },
+        )
+        .await
+    }
+
+    /// `GET /projects/{id}/issue_categories.json`. Carries a `total_count`
+    /// but no `offset`/`limit` (the controller loads every category
+    /// unconditionally, `@categories = @project.issue_categories.to_a`) —
+    /// neither [`Self::fetch_all`] nor [`Self::get_collection`] fit, so this
+    /// reads the envelope directly and ignores `total_count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn list_issue_categories(
+        &self,
+        project: &ProjectIdent,
+    ) -> crate::Result<Vec<issue_category::IssueCategory>> {
+        let env: issue_category::IssueCategoriesEnvelope = self
+            .get_json(
+                &format!("projects/{project}/issue_categories.json"),
+                &Query::default(),
+            )
+            .await?;
+        Ok(env.into_items())
+    }
+
+    /// `GET /issue_categories/{id}.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_issue_category(
+        &self,
+        id: IssueCategoryId,
+    ) -> crate::Result<issue_category::IssueCategory> {
+        let env: issue_category::IssueCategoryEnvelope = self
+            .get_json(&format!("issue_categories/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.issue_category)
+    }
+
+    /// `POST /projects/{id}/issue_categories.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine rejects the payload
+    /// (e.g. 422 with a blank name).
+    pub async fn create_issue_category(
+        &self,
+        project: &ProjectIdent,
+        new: &issue_category::IssueCategoryCreate,
+    ) -> crate::Result<issue_category::IssueCategory> {
+        let env: issue_category::IssueCategoryEnvelope = self
+            .post_json(
+                &format!("projects/{project}/issue_categories.json"),
+                &issue_category::IssueCategoryCreateEnvelope {
+                    issue_category: new,
+                },
+            )
+            .await?;
+        Ok(env.issue_category)
+    }
+
+    /// `PUT /issue_categories/{id}.json`, then a follow-up `GET` — same
+    /// 204-then-fetch pattern as [`Self::update_version`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails, or if Redmine rejects the
+    /// update.
+    pub async fn update_issue_category(
+        &self,
+        id: IssueCategoryId,
+        patch: &issue_category::IssueCategoryUpdate,
+    ) -> crate::Result<issue_category::IssueCategory> {
+        self.put_json(
+            &format!("issue_categories/{id}.json"),
+            &issue_category::IssueCategoryUpdateEnvelope {
+                issue_category: patch,
+            },
+        )
+        .await?;
+        self.get_issue_category(id).await
+    }
+
+    /// `DELETE /issue_categories/{id}.json`, optionally with a
+    /// `reassign_to_id` query parameter to bulk-reassign the category's
+    /// issues instead of leaving them uncategorised (a top-level query
+    /// parameter, not nested under `issue_category` — confirmed against
+    /// `test/integration/api_test/issue_categories_test.rb`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_issue_category(
+        &self,
+        id: IssueCategoryId,
+        reassign_to_id: Option<IssueCategoryId>,
+    ) -> crate::Result<()> {
+        let mut q = Query::default();
+        if let Some(reassign_to_id) = reassign_to_id {
+            q.insert("reassign_to_id", reassign_to_id.to_string());
+        }
+        self.delete_with_query(&format!("issue_categories/{id}.json"), &q)
+            .await
     }
 
     /// `GET /time_entries.json`.

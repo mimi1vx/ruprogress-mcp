@@ -163,6 +163,12 @@ pub struct IssueCreate {
     /// The priority id, if not the default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority_id: Option<u64>,
+    /// The category id, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<u64>,
+    /// The target version (roadmap milestone) id, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_version_id: Option<u64>,
     /// The description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -178,6 +184,15 @@ pub struct IssueCreate {
     /// Planned due date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_date: Option<NaiveDate>,
+    /// Percent done, 0-100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_ratio: Option<u8>,
+    /// Estimated hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_hours: Option<f64>,
+    /// Whether the issue is private.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_private: Option<bool>,
 }
 
 impl IssueCreate {
@@ -191,34 +206,78 @@ impl IssueCreate {
             tracker_id: None,
             status_id: None,
             priority_id: None,
+            category_id: None,
+            fixed_version_id: None,
             description: None,
             assigned_to_id: None,
             parent_issue_id: None,
             start_date: None,
             due_date: None,
+            done_ratio: None,
+            estimated_hours: None,
+            is_private: None,
         }
     }
 }
 
 /// Payload for `PUT /issues/{id}.json`. All fields optional: only those set
 /// are changed. `notes` adds a journal entry without changing any field.
+/// There is no supported way to *clear* `assigned_to_id`/`category_id`/
+/// `fixed_version_id`/`parent_issue_id` back to unset through this type —
+/// Redmine accepts an empty string for that over the wire, but this client
+/// only ever sends a present value or omits the field entirely (see
+/// `plans/phase-4b-issues.md` 4b-write decisions).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IssueUpdate {
     /// New subject, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// New description, if changing it. An empty string clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// New tracker id, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracker_id: Option<u64>,
     /// New status id, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_id: Option<u64>,
+    /// New priority id, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_id: Option<u64>,
+    /// New category id, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<u64>,
+    /// New target version id, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_version_id: Option<u64>,
     /// New assignee, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_to_id: Option<UserId>,
+    /// New parent issue, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_issue_id: Option<IssueId>,
+    /// New planned start date, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<NaiveDate>,
+    /// New planned due date, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<NaiveDate>,
     /// New done ratio, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_ratio: Option<u8>,
+    /// New estimated hours, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_hours: Option<f64>,
+    /// New privacy flag, if changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_private: Option<bool>,
     /// A journal note to add, independent of any field change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Whether the note added via `notes` (if any) is private. Ignored by
+    /// Redmine when `notes` is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_notes: Option<bool>,
 }
 
 /// `include=` values accepted by the issue endpoints.

@@ -28,10 +28,35 @@ pub mod write_tools {
     /// same "no read action to preserve" reasoning as F1) and
     /// `import_time_entries` (always writes when called, by construction).
     /// See `plans/phase-4d-time.md` decisions H5/H6.
+    ///
+    /// 4b-write adds `create_redmine_issue`, `update_redmine_issue`,
+    /// `delete_redmine_issue`, `copy_issue` (each always mutates when
+    /// called), and `manage_issue_watcher`/`manage_issue_note` (both
+    /// `action` enums are exclusively mutating — same "no read action to
+    /// preserve" reasoning as F1/H5). `manage_issue_relation` and
+    /// `manage_issue_category` are deliberately **not** here: both have a
+    /// genuine `action="list"` that must survive read-only mode per the
+    /// parent plan's D8 ("read-only mode gates per action, not per tool") —
+    /// see [`PARTIAL_WRITE`] instead.
     pub const ALL: &[&str] = &[
         "manage_redmine_version",
         "manage_project_member",
         "manage_time_entry",
         "import_time_entries",
+        "create_redmine_issue",
+        "update_redmine_issue",
+        "delete_redmine_issue",
+        "copy_issue",
+        "manage_issue_watcher",
+        "manage_issue_note",
     ];
+
+    /// Tools with a mix of read and write `action`s (D8): never removed from
+    /// the router by read-only mode (unlike [`ALL`]), but the write actions
+    /// inside them check `config.read_only` themselves and refuse with
+    /// `code: "READ_ONLY"`. Both declare `read_only_hint = false` /
+    /// `destructive_hint = true` in their tool annotations, same as an
+    /// `ALL` tool — the annotation describes what the tool *can* do, not
+    /// what read-only mode currently allows.
+    pub const PARTIAL_WRITE: &[&str] = &["manage_issue_relation", "manage_issue_category"];
 }

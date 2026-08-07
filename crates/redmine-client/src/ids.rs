@@ -48,6 +48,18 @@ id_newtype!(
     /// A Redmine time entry id.
     TimeEntryId
 );
+id_newtype!(
+    /// A Redmine issue relation id.
+    RelationId
+);
+id_newtype!(
+    /// A Redmine journal (issue note) id.
+    JournalId
+);
+id_newtype!(
+    /// A Redmine issue category id.
+    IssueCategoryId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

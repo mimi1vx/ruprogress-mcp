@@ -3,7 +3,7 @@
 //! endpoint exists — journals are only ever read as part of an issue.
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{IdName, permissive_datetime};
 
@@ -54,6 +54,26 @@ pub struct Journal {
     pub details: Option<Vec<JournalDetail>>,
 }
 
+/// Payload for `PUT /journals/{id}.json`. `notes` requires
+/// `edit_issue_notes` (or `edit_own_issue_notes` for the note's own author);
+/// `private_notes` requires `set_notes_private` — Redmine enforces both
+/// server-side (403), not this client.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JournalUpdate {
+    /// New note text. An empty string clears it. `None` leaves it
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Toggle the private-note flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_notes: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct JournalUpdateEnvelope<'a> {
+    pub journal: &'a JournalUpdate,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -87,6 +107,21 @@ mod tests {
         let journal: Journal = serde_json::from_str(json).expect("should parse");
         assert_eq!(journal.notes, None);
         assert!(journal.user.is_none());
+    }
+
+    #[test]
+    fn journal_update_serializes_only_set_fields() {
+        let patch = JournalUpdate {
+            notes: Some(String::new()),
+            private_notes: None,
+        };
+        let value = serde_json::to_value(JournalUpdateEnvelope { journal: &patch }).unwrap();
+        let obj = value
+            .get("journal")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert_eq!(obj["notes"], "");
+        assert!(!obj.contains_key("private_notes"));
     }
 
     #[test]

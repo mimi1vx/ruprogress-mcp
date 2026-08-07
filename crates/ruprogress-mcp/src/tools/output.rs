@@ -141,11 +141,20 @@ pub(crate) fn ok<T: Serialize>(value: &T, caps: OutputCaps) -> CallToolResult {
 }
 
 /// The closed set of machine-readable error codes every tool's in-band error
-/// envelope carries (D4). `#[non_exhaustive]`: sub-phases beyond 4.0 add
-/// `READ_ONLY`, `CONFIRMATION_REQUIRED`, `CHILDREN_PRESENT`, and
-/// `FEATURE_DISABLED` once a tool exists that can produce them.
+/// envelope carries (D4). `#[non_exhaustive]`: sub-phases beyond 4b-write add
+/// `FEATURE_DISABLED` once a tool exists that can produce it.
+///
+/// `ReadOnly`/`ConfirmationRequired`/`ChildrenPresent` (added in 4b-write)
+/// are used slightly differently from the rest: `ReadOnly` goes through
+/// [`err`] like every other code (`isError: true` — the model asked for a
+/// write the server administrator has disabled, an argument-shaped mistake
+/// it should not retry). `ConfirmationRequired`/`ChildrenPresent` are
+/// `delete_redmine_issue`-specific and are **not** sent via [`err`]: the
+/// reference contract treats a delete refusal as a normal, non-error result
+/// carrying `{success: false, code, hint, impact}\` so the model can inspect
+/// the impact preview — see `tools/issues.rs::DeleteRedmineIssueOutput`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ErrorCode {
     Unauthorized,
@@ -157,6 +166,9 @@ pub(crate) enum ErrorCode {
     UnexpectedResponse,
     LimitExceeded,
     Misconfigured,
+    ReadOnly,
+    ConfirmationRequired,
+    ChildrenPresent,
 }
 
 impl ErrorCode {
@@ -274,6 +286,9 @@ mod tests {
             ErrorCode::UnexpectedResponse,
             ErrorCode::LimitExceeded,
             ErrorCode::Misconfigured,
+            ErrorCode::ReadOnly,
+            ErrorCode::ConfirmationRequired,
+            ErrorCode::ChildrenPresent,
         ] {
             assert!(!code.is_retryable());
         }

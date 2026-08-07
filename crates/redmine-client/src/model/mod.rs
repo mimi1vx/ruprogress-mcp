@@ -9,6 +9,7 @@ pub mod attachment;
 pub mod custom_field;
 pub mod enumeration;
 pub mod issue;
+pub mod issue_category;
 pub mod issue_status;
 pub mod journal;
 pub mod membership;
