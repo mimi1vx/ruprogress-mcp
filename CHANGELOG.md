@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A local attachment store (no tool uses it yet): `AttachmentStore` stages
+  downloaded Redmine attachments under `ATTACHMENTS_DIR` in per-UUID
+  directories with a sanitised basename, enforces a per-file
+  (`ATTACHMENT_MAX_DOWNLOAD_BYTES`) and whole-store
+  (`ATTACHMENT_STORE_MAX_BYTES`) byte cap, and expires entries after
+  `ATTACHMENT_EXPIRES_MINUTES` both lazily (on lookup) and via a background
+  sweeper (`AUTO_CLEANUP_ENABLED`, `CLEANUP_INTERVAL_MINUTES`) that also
+  reclaims a predecessor process's orphaned files after a restart.
+- `GET /files/{uuid}` (HTTP transport only): serves a stored file with
+  `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`,
+  `Cache-Control: no-store`, and the same `Host` allowlist check as `/mcp`.
+- `PUBLIC_SCHEME` and a derived `public_base` origin, for building
+  `/files/{uuid}` URLs correctly behind a TLS-terminating proxy.
+- `REDMINE_MCP_UPLOAD_FILE_ROOTS`, `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`, and
+  `REDMINE_PUBLIC_URL` are now validated (previously listed as "not yet
+  implemented"); none of them are consulted by any tool yet.
 - Opt-in `REDMINE_MCP_SCHEMA_DIALECT=portable` for clients whose provider
   rejects `$ref`/`$defs` and nullable type arrays in function-calling
   declarations (Google Vertex/Gemini). Default `strict` is unchanged.

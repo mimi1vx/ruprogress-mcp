@@ -9,6 +9,7 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
+use crate::attachments::AttachmentStore;
 use crate::config::{AuthMode, Config, SchemaDialect};
 use crate::readonly::write_tools;
 use crate::tools::schema;
@@ -23,6 +24,7 @@ pub struct RedmineMcp {
 pub(crate) struct ServerInner {
     pub(crate) client: RedmineClient,
     pub(crate) config: Config,
+    pub(crate) attachments: Arc<AttachmentStore>,
 }
 
 impl RedmineMcp {
@@ -31,7 +33,7 @@ impl RedmineMcp {
     /// `#[tool_router]` block), then remove write-tool routes if configured
     /// read-only.
     #[must_use]
-    pub fn new(client: RedmineClient, config: Config) -> Self {
+    pub fn new(client: RedmineClient, config: Config, attachments: Arc<AttachmentStore>) -> Self {
         let mut router = ToolRouter::new();
         router.merge(Self::meta_tool_router());
         router.merge(Self::discovery_tool_router());
@@ -51,9 +53,20 @@ impl RedmineMcp {
             }
         }
         Self {
-            inner: Arc::new(ServerInner { client, config }),
+            inner: Arc::new(ServerInner {
+                client,
+                config,
+                attachments,
+            }),
             tool_router: router,
         }
+    }
+
+    /// The attachment store handle, for `transport::http::router` to hand to
+    /// the `/files/{uuid}` route as its `axum` state.
+    #[must_use]
+    pub fn attachments(&self) -> Arc<AttachmentStore> {
+        Arc::clone(&self.inner.attachments)
     }
 
     /// THE credential choke point. Every tool starts with this line: since

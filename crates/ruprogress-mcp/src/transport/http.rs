@@ -11,15 +11,22 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::Router;
+use axum::body::Body;
+use axum::extract::{Path as AxumPath, Request, State};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
+use crate::attachments::AttachmentStore;
 use crate::config::HttpConfig;
 use crate::health::{self, HealthState};
 use crate::server::RedmineMcp;
@@ -53,6 +60,7 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         .with_allowed_origins(cfg.allowed_origins.clone())
         .with_max_request_body_bytes(cfg.max_request_body_bytes);
 
+    let attachments = server.attachments();
     let health_state = HealthState::new(server.clone(), cfg.health_ttl);
     let mcp_service: StreamableHttpService<RedmineMcp, SessionManager> = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -89,7 +97,10 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         .nest_service(&cfg.mcp_path, mcp_service)
         .layer(TraceLayer::new_for_http());
 
-    let mut router = Router::new().merge(mcp_route).merge(health_routes);
+    let mut router = Router::new()
+        .merge(mcp_route)
+        .merge(health_routes)
+        .merge(files_route(attachments, cfg.allowed_hosts.clone()));
 
     if let Some(cors) = cors_layer(cfg) {
         router = router.layer(cors);
@@ -127,6 +138,199 @@ fn cors_layer(cfg: &HttpConfig) -> Option<CorsLayer> {
             ])
             .expose_headers([http::HeaderName::from_static("mcp-protocol-version")]),
     )
+}
+
+/// `GET /files/{uuid}`: serves a stored attachment (phase 5c wires the tool
+/// that populates the store; this route just serves what is there).
+///
+/// Reuses `HttpConfig::allowed_hosts` for a `Host` allowlist check (decision
+/// J10/K7 in `plans/phase-5b-store-and-route.md`): rmcp's own `Host` check
+/// runs only inside `StreamableHttpService`, so a route mounted ourselves
+/// needs its own copy of the same check, not a weaker one.
+fn files_route(store: Arc<AttachmentStore>, allowed_hosts: Vec<String>) -> Router {
+    Router::new()
+        .route("/files/{uuid}", get(serve_file))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let allowed_hosts = allowed_hosts.clone();
+            async move {
+                match validate_files_host(&req, &allowed_hosts) {
+                    Ok(()) => next.run(req).await,
+                    Err((status, message)) => (status, message).into_response(),
+                }
+            }
+        }))
+        .layer(SetResponseHeaderLayer::overriding(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-store"),
+        ))
+        .with_state(store)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn parse_authority(raw: &str) -> Option<RequestAuthority> {
+    let authority = http::uri::Authority::try_from(raw.trim()).ok()?;
+    Some(RequestAuthority {
+        host: normalize_host(authority.host()),
+        port: authority.port_u16(),
+    })
+}
+
+fn request_authority(req: &Request) -> Option<RequestAuthority> {
+    if let Some(host) = req.headers().get(http::header::HOST) {
+        return parse_authority(host.to_str().ok()?);
+    }
+    // HTTP/2 carries the host in `:authority`, which some middleware can
+    // separate from an explicit `Host` header — same fallback rmcp uses.
+    let authority = req.uri().authority()?;
+    Some(RequestAuthority {
+        host: normalize_host(authority.host()),
+        port: authority.port_u16(),
+    })
+}
+
+fn host_is_allowed(host: &RequestAuthority, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+    allowed_hosts
+        .iter()
+        .filter_map(|raw| parse_authority(raw))
+        .any(|allowed| {
+            allowed.host == host.host
+                && match allowed.port {
+                    Some(port) => host.port == Some(port),
+                    None => true,
+                }
+        })
+}
+
+/// `Err` carries a status and a static message rather than a built
+/// `Response`, which would make this `Result`'s error variant large enough
+/// to trip `clippy::result_large_err` for no benefit — the caller builds the
+/// response at the one call site that needs one.
+fn validate_files_host(
+    req: &Request,
+    allowed_hosts: &[String],
+) -> Result<(), (http::StatusCode, &'static str)> {
+    let Some(authority) = request_authority(req) else {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            "Bad Request: missing or invalid Host header",
+        ));
+    };
+    if host_is_allowed(&authority, allowed_hosts) {
+        Ok(())
+    } else {
+        tracing::warn!(
+            host = ?authority,
+            "rejected /files request with disallowed Host header"
+        );
+        Err((
+            http::StatusCode::FORBIDDEN,
+            "Forbidden: Host header is not allowed",
+        ))
+    }
+}
+
+/// Percent-encodes everything outside the RFC 5987 `attr-char` set
+/// (unreserved characters only), for the `filename*=UTF-8''...` parameter.
+/// Hand-rolled rather than pulling in a new dependency for one header value.
+fn percent_encode_attr_char(input: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Builds a `Content-Disposition: attachment` header value with both a
+/// quoted-ASCII fallback and an RFC 5987 `filename*` parameter, since the
+/// filename came from Redmine (via [`AttachmentStore::reserve`]'s
+/// sanitisation, which permits non-ASCII).
+fn content_disposition(filename: &str) -> http::HeaderValue {
+    let ascii_fallback: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ascii_fallback = if ascii_fallback.is_empty() {
+        "attachment".to_string()
+    } else {
+        ascii_fallback
+    };
+    let encoded = percent_encode_attr_char(filename);
+    let value = format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}");
+    http::HeaderValue::from_str(&value)
+        .unwrap_or_else(|_| http::HeaderValue::from_static("attachment"))
+}
+
+/// A `Content-Type` built from Redmine-supplied data must be validated as a
+/// well-formed header value before use: Redmine's `content_type` is
+/// attacker-influenced (decision in `plans/phase-5b-store-and-route.md`),
+/// and a value containing e.g. embedded CRLF must not reach the response.
+fn content_type_header(content_type: Option<&str>) -> http::HeaderValue {
+    content_type
+        .and_then(|ct| http::HeaderValue::from_str(ct).ok())
+        .unwrap_or_else(|| http::HeaderValue::from_static("application/octet-stream"))
+}
+
+async fn serve_file(
+    State(store): State<Arc<AttachmentStore>>,
+    AxumPath(uuid): AxumPath<Uuid>,
+) -> Response {
+    let Some(stored) = store.get(uuid).await else {
+        return (http::StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let file = match tokio::fs::File::open(&stored.path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::error!(%error, %uuid, "failed to open a stored attachment file");
+            return (http::StatusCode::NOT_FOUND, "not found").into_response();
+        }
+    };
+    let body = Body::from_stream(ReaderStream::new(file));
+
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        content_type_header(stored.content_type.as_deref()),
+    );
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&stored.size.to_string())
+            .unwrap_or_else(|_| http::HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        http::header::CONTENT_DISPOSITION,
+        content_disposition(&stored.filename),
+    );
+    response
 }
 
 /// Bind and serve until `shutdown` is cancelled, then let in-flight requests

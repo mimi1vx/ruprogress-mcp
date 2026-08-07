@@ -5,10 +5,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use redmine_client::RedmineClientBuilder;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt as _};
+use ruprogress_mcp::attachments::AttachmentStore;
 use ruprogress_mcp::config::{AuthMode, Config, TransportKind};
 use ruprogress_mcp::server::RedmineMcp;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +36,19 @@ fn build_server(
         .or_insert_with(|| redmine.uri());
     vars.entry("REDMINE_API_KEY".to_string())
         .or_insert_with(|| "test-api-key".to_string());
+    // A unique dir per server, not the shared per-machine default: tests run
+    // concurrently and must not trip over each other's attachment files.
+    vars.entry("ATTACHMENTS_DIR".to_string())
+        .or_insert_with(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "ruprogress-mcp-test-attachments-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .to_string_lossy()
+                .into_owned()
+        });
 
     let config = Config::from_map(&vars, kind).expect("test config should be valid");
 
@@ -42,8 +57,14 @@ fn build_server(
         builder = builder.credential(credential.clone());
     }
     let redmine_client = builder.build().expect("redmine client should build");
+    let attachments = Arc::new(
+        AttachmentStore::init(&config.attachments).expect("attachment store should initialize"),
+    );
 
-    (RedmineMcp::new(redmine_client, config.clone()), config)
+    (
+        RedmineMcp::new(redmine_client, config.clone(), attachments),
+        config,
+    )
 }
 
 /// Start a mock Redmine and an in-process `RedmineMcp` server pointed at it,
@@ -73,6 +94,9 @@ pub(crate) struct HttpHarness {
     pub(crate) redmine: wiremock::MockServer,
     /// `http://127.0.0.1:<ephemeral>` — no trailing slash.
     pub(crate) base_url: String,
+    /// The same store handle `/files/{uuid}` serves from, for tests that
+    /// need to populate an entry directly rather than through a tool.
+    pub(crate) attachments: Arc<AttachmentStore>,
     /// Stops accepting and starts axum's graceful drain. Kept separate from
     /// the service token for the same reason production does: cancelling
     /// rmcp's token aborts in-flight tool calls.
@@ -109,6 +133,7 @@ pub(crate) async fn http_harness(env: &[(&str, &str)]) -> HttpHarness {
         .expect("http transport requested")
         .clone();
 
+    let attachments = server.attachments();
     let service_ct = CancellationToken::new();
     let router = ruprogress_mcp::transport::http::router(server, &http, service_ct.clone());
 
@@ -128,6 +153,7 @@ pub(crate) async fn http_harness(env: &[(&str, &str)]) -> HttpHarness {
     HttpHarness {
         redmine,
         base_url: format!("http://127.0.0.1:{}", addr.port()),
+        attachments,
         shutdown,
         service_ct,
     }

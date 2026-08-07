@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use redmine_client::Credential;
@@ -97,7 +98,11 @@ pub enum TransportKind {
 #[derive(Debug, Clone)]
 pub enum TransportConfig {
     Stdio,
-    Http(HttpConfig),
+    // Boxed: `HttpConfig` (which carries a `Url`, several `String`s, and a
+    // `Vec`) is large enough that an unboxed variant would make every
+    // `TransportConfig` — including every `Stdio` one — pay for the size of
+    // the bigger variant.
+    Http(Box<HttpConfig>),
 }
 
 impl TransportConfig {
@@ -144,6 +149,11 @@ pub struct HttpConfig {
     /// Applied to the health routes only — never to the MCP route, whose
     /// responses may be long-lived SSE streams.
     pub request_timeout: Duration,
+    /// The origin clients use to reach `/files/{uuid}` URLs
+    /// (`get_redmine_attachment`, phase 5c). Derived from `PUBLIC_HOST`/
+    /// `PUBLIC_PORT`/`PUBLIC_SCHEME` when `PUBLIC_HOST` is set, or from the
+    /// bind address for a loopback bind — see `parse_public_base`.
+    pub public_base: Url,
 }
 
 const DEFAULT_MAX_RESPONSE_ITEMS: usize = 200;
@@ -173,9 +183,36 @@ pub struct PluginFlags {
     pub tags: bool,
 }
 
-/// Reserved for attachment storage; not yet implemented.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AttachmentConfig;
+/// Local attachment-store settings (phase 5). None of these are read by any
+/// tool yet as of phase 5b — `get_redmine_attachment` (5c) and
+/// `upload_file`/`cleanup_attachment_files` (5e) are the consumers — but the
+/// whole surface is validated together, same pattern as
+/// `REDMINE_PER_USER_AUDIT_IDENTITY` before per-user auth existed.
+#[derive(Debug, Clone)]
+pub struct AttachmentConfig {
+    /// `ATTACHMENTS_DIR`. Created `0700` at startup by `AttachmentStore::init`.
+    pub dir: PathBuf,
+    /// `ATTACHMENT_MAX_DOWNLOAD_BYTES`: the per-file cap (J11).
+    pub max_download_bytes: u64,
+    /// `ATTACHMENT_STORE_MAX_BYTES`: the whole-store cap (J11, decision K3
+    /// enforces `>= max_download_bytes` at startup).
+    pub store_max_bytes: u64,
+    /// `AUTO_CLEANUP_ENABLED`: whether the background sweeper task runs.
+    pub auto_cleanup_enabled: bool,
+    /// `CLEANUP_INTERVAL_MINUTES`: how often the sweeper runs.
+    pub cleanup_interval: Duration,
+    /// `ATTACHMENT_EXPIRES_MINUTES`: how long a served file stays fetchable.
+    pub expires_after: Duration,
+    /// `REDMINE_MCP_UPLOAD_FILE_ROOTS`: allowed roots for `upload_file`'s
+    /// `file_path` source (5e). Empty means every `file_path` upload is
+    /// refused.
+    pub upload_file_roots: Vec<PathBuf>,
+    /// `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`: gates `cleanup_attachment_files` (5e).
+    pub expose_admin_tools: bool,
+    /// `REDMINE_PUBLIC_URL`: rewrites `content_url` values whose origin
+    /// matches `REDMINE_URL`'s (5f). `None` disables the rewrite.
+    pub public_url_rewrite: Option<Url>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -509,6 +546,73 @@ fn validate_authority(var: &'static str, value: &str) -> Result<(), ConfigError>
     Ok(())
 }
 
+/// `PUBLIC_SCHEME` (O1): defaults to `https` only when `PUBLIC_PORT == 443`,
+/// since that is the one case where guessing `http` would almost certainly
+/// be wrong (a TLS-terminating proxy on the standard HTTPS port).
+fn parse_public_scheme(
+    vars: &EnvMap,
+    public_port: Option<u16>,
+) -> Result<&'static str, ConfigError> {
+    match optional(vars, "PUBLIC_SCHEME").as_deref() {
+        None => Ok(if public_port == Some(443) {
+            "https"
+        } else {
+            "http"
+        }),
+        Some("http") => Ok("http"),
+        Some("https") => Ok("https"),
+        Some(other) => Err(ConfigError::Invalid {
+            var: "PUBLIC_SCHEME",
+            expected: "\"http\" or \"https\"",
+            because: format!("got {other:?}"),
+        }),
+    }
+}
+
+/// Derives the origin used to build `/files/{uuid}` URLs (O1/O2, phase 5b
+/// decisions K5/K6).
+///
+/// With `PUBLIC_HOST` set, builds `{PUBLIC_SCHEME}://{PUBLIC_HOST}[:{PUBLIC_PORT}]`.
+/// Without it, only a loopback bind can derive one (`http://<bind-ip>:<port>`,
+/// which is correct for a client on the same machine); a non-loopback bind
+/// without `PUBLIC_HOST` is a `Missing` error here even if
+/// `REDMINE_MCP_ALLOWED_HOSTS` was set explicitly and so bypassed
+/// [`parse_allowed_hosts`]'s own `PUBLIC_HOST` requirement (K6) — an
+/// unreachable `0.0.0.0`-hosted URL is worse than refusing to start.
+fn public_base_from_loopback_bind(bind: SocketAddr) -> Result<String, ConfigError> {
+    if !bind.ip().is_loopback() {
+        return Err(ConfigError::Missing {
+            var: "PUBLIC_HOST",
+            because: "SERVER_HOST is not a loopback address, so the public URL used to build \
+                      /files/{uuid} links cannot be derived without PUBLIC_HOST",
+        });
+    }
+    let host = match bind.ip() {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    };
+    Ok(format!("http://{host}:{}", bind.port()))
+}
+
+fn parse_public_base(vars: &EnvMap, bind: SocketAddr) -> Result<Url, ConfigError> {
+    let public_port = parse_port(vars, "PUBLIC_PORT")?;
+    let public_host = optional(vars, "PUBLIC_HOST");
+    let scheme = parse_public_scheme(vars, public_port)?;
+    let raw = if let Some(host) = public_host {
+        match public_port {
+            Some(port) => format!("{scheme}://{host}:{port}"),
+            None => format!("{scheme}://{host}"),
+        }
+    } else {
+        public_base_from_loopback_bind(bind)?
+    };
+    raw.parse().map_err(|_| ConfigError::Invalid {
+        var: "PUBLIC_HOST",
+        expected: "a value that, combined with PUBLIC_SCHEME/PUBLIC_PORT, forms a valid URL",
+        because: format!("{raw:?} could not be parsed as a URL"),
+    })
+}
+
 fn parse_http(vars: &EnvMap) -> Result<HttpConfig, ConfigError> {
     let bind = parse_bind(vars)?;
     let allowed_hosts = parse_allowed_hosts(vars, bind)?;
@@ -571,6 +675,7 @@ fn parse_http(vars: &EnvMap) -> Result<HttpConfig, ConfigError> {
         max_request_body_bytes,
         health_ttl: Duration::from_secs(health_ttl_seconds),
         request_timeout: Duration::from_secs(10),
+        public_base: parse_public_base(vars, bind)?,
     })
 }
 
@@ -671,6 +776,129 @@ fn positive_usize(vars: &EnvMap, var: &'static str, default: usize) -> Result<us
     Ok(value)
 }
 
+const DEFAULT_ATTACHMENT_MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_STORE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_CLEANUP_INTERVAL_MINUTES: u64 = 15;
+const DEFAULT_ATTACHMENT_EXPIRES_MINUTES: u64 = 60;
+
+/// Parses a positive `u64` env var, rejecting `0`.
+fn positive_u64(vars: &EnvMap, var: &'static str, default: u64) -> Result<u64, ConfigError> {
+    let Some(raw) = optional(vars, var) else {
+        return Ok(default);
+    };
+    let invalid = |because: String| ConfigError::Invalid {
+        var,
+        expected: "a positive integer",
+        because,
+    };
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| invalid("the value could not be parsed as a number".to_string()))?;
+    if value == 0 {
+        return Err(invalid("0 is not a usable value here".to_string()));
+    }
+    Ok(value)
+}
+
+fn parse_attachments_dir(vars: &EnvMap) -> PathBuf {
+    optional(vars, "ATTACHMENTS_DIR").map_or_else(
+        || std::env::temp_dir().join("ruprogress-mcp-attachments"),
+        PathBuf::from,
+    )
+}
+
+/// `REDMINE_MCP_UPLOAD_FILE_ROOTS` (K4): a csv of absolute directory paths.
+/// Relative paths are rejected outright — a prefix check against a relative
+/// root is meaningless once the caller's cwd is anything but the one the
+/// operator had in mind.
+fn parse_upload_file_roots(vars: &EnvMap) -> Result<Vec<PathBuf>, ConfigError> {
+    const VAR: &str = "REDMINE_MCP_UPLOAD_FILE_ROOTS";
+    let Some(entries) = parse_csv(vars, VAR)? else {
+        return Ok(Vec::new());
+    };
+    entries
+        .into_iter()
+        .map(|raw| {
+            let path = PathBuf::from(&raw);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(ConfigError::Invalid {
+                    var: VAR,
+                    expected: "a comma-separated list of absolute directory paths",
+                    because: format!("{raw:?} is not an absolute path"),
+                })
+            }
+        })
+        .collect()
+}
+
+fn parse_public_url_rewrite(vars: &EnvMap) -> Result<Option<Url>, ConfigError> {
+    const VAR: &str = "REDMINE_PUBLIC_URL";
+    let Some(raw) = optional(vars, VAR) else {
+        return Ok(None);
+    };
+    let url: Url = raw.parse().map_err(|_| ConfigError::Invalid {
+        var: VAR,
+        expected: "a valid http(s) URL",
+        because: "the value could not be parsed as a URL".to_string(),
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "an http or https URL",
+            because: format!("scheme {:?} is not http/https", url.scheme()),
+        });
+    }
+    Ok(Some(url))
+}
+
+fn parse_attachments(vars: &EnvMap) -> Result<AttachmentConfig, ConfigError> {
+    let max_download_bytes = positive_u64(
+        vars,
+        "ATTACHMENT_MAX_DOWNLOAD_BYTES",
+        DEFAULT_ATTACHMENT_MAX_DOWNLOAD_BYTES,
+    )?;
+    let store_max_bytes = positive_u64(
+        vars,
+        "ATTACHMENT_STORE_MAX_BYTES",
+        DEFAULT_ATTACHMENT_STORE_MAX_BYTES,
+    )?;
+    // K3: a store cap smaller than the per-file cap means no download could
+    // ever succeed — a misconfiguration to catch at boot, not a capacity
+    // condition to discover on a client's first request.
+    if store_max_bytes < max_download_bytes {
+        return Err(ConfigError::Conflict {
+            because: format!(
+                "ATTACHMENT_STORE_MAX_BYTES ({store_max_bytes}) is smaller than \
+                 ATTACHMENT_MAX_DOWNLOAD_BYTES ({max_download_bytes}); no single download could \
+                 ever fit"
+            ),
+        });
+    }
+    let cleanup_interval_minutes = positive_u64(
+        vars,
+        "CLEANUP_INTERVAL_MINUTES",
+        DEFAULT_CLEANUP_INTERVAL_MINUTES,
+    )?;
+    let expires_minutes = positive_u64(
+        vars,
+        "ATTACHMENT_EXPIRES_MINUTES",
+        DEFAULT_ATTACHMENT_EXPIRES_MINUTES,
+    )?;
+    Ok(AttachmentConfig {
+        dir: parse_attachments_dir(vars),
+        max_download_bytes,
+        store_max_bytes,
+        auto_cleanup_enabled: optional_bool(vars, "AUTO_CLEANUP_ENABLED", true)?,
+        cleanup_interval: Duration::from_secs(cleanup_interval_minutes.saturating_mul(60)),
+        expires_after: Duration::from_secs(expires_minutes.saturating_mul(60)),
+        upload_file_roots: parse_upload_file_roots(vars)?,
+        expose_admin_tools: optional_bool(vars, "REDMINE_MCP_EXPOSE_ADMIN_TOOLS", false)?,
+        public_url_rewrite: parse_public_url_rewrite(vars)?,
+    })
+}
+
 impl Config {
     /// Validate and build a `Config` from an injected env-var map. `kind`
     /// comes from the CLI (`--transport`) rather than `vars`; the transport's
@@ -686,7 +914,7 @@ impl Config {
         let auth = parse_auth(vars, kind)?;
         let transport = match kind {
             TransportKind::Stdio => TransportConfig::Stdio,
-            TransportKind::Http => TransportConfig::Http(parse_http(vars)?),
+            TransportKind::Http => TransportConfig::Http(Box::new(parse_http(vars)?)),
         };
 
         if let (TransportConfig::Http(http), AuthMode::Legacy { .. }) = (&transport, &auth)
@@ -705,7 +933,7 @@ impl Config {
             transport,
             read_only: optional_bool(vars, "REDMINE_MCP_READ_ONLY", false)?,
             plugins: parse_plugins(vars)?,
-            attachments: AttachmentConfig,
+            attachments: parse_attachments(vars)?,
             max_response_items: positive_usize(
                 vars,
                 "REDMINE_MCP_MAX_RESPONSE_ITEMS",
@@ -1141,7 +1369,7 @@ mod tests {
             vars.insert((*k).to_string(), (*v).to_string());
         }
         Config::from_map(&vars, TransportKind::Http).map(|c| match c.transport {
-            TransportConfig::Http(h) => h,
+            TransportConfig::Http(h) => *h,
             TransportConfig::Stdio => panic!("asked for http, got stdio"),
         })
     }
@@ -1265,9 +1493,13 @@ mod tests {
 
     #[test]
     fn allowed_hosts_star_disables_validation_and_yields_an_empty_list() {
+        // PUBLIC_HOST is required here even though REDMINE_MCP_ALLOWED_HOSTS=*
+        // bypasses parse_allowed_hosts's own PUBLIC_HOST requirement (K6):
+        // public_base still needs an origin to build /files/{uuid} URLs from.
         let cfg = http(&[
             ("SERVER_HOST", "0.0.0.0"),
             ("REDMINE_MCP_ALLOWED_HOSTS", "*"),
+            ("PUBLIC_HOST", "mcp.example.com"),
         ])
         .expect("the explicit opt-out should be accepted");
         assert!(cfg.allowed_hosts.is_empty());
@@ -1364,12 +1596,14 @@ mod tests {
 
     #[test]
     fn allowed_hosts_replaces_the_derived_list_entirely() {
+        // PUBLIC_HOST is required here for the same reason as above (K6).
         let cfg = http(&[
             ("SERVER_HOST", "0.0.0.0"),
             (
                 "REDMINE_MCP_ALLOWED_HOSTS",
                 "a.example.com, b.example.com:9000",
             ),
+            ("PUBLIC_HOST", "a.example.com"),
         ])
         .expect("should be valid");
         assert_eq!(cfg.allowed_hosts, ["a.example.com", "b.example.com:9000"]);
@@ -1482,5 +1716,237 @@ mod tests {
             stdio.redacted_summary()["transport"],
             json!({"kind": "stdio"})
         );
+    }
+
+    // --- Attachment config (phase 5b) ------------------------------------
+
+    #[test]
+    fn attachments_default_to_a_temp_dir_with_sensible_caps() {
+        let config =
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
+        let a = &config.attachments;
+        assert_eq!(
+            a.dir,
+            std::env::temp_dir().join("ruprogress-mcp-attachments")
+        );
+        assert_eq!(a.max_download_bytes, 200 * 1024 * 1024);
+        assert_eq!(a.store_max_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(a.auto_cleanup_enabled);
+        assert_eq!(a.cleanup_interval, Duration::from_mins(15));
+        assert_eq!(a.expires_after, Duration::from_hours(1));
+        assert!(a.upload_file_roots.is_empty());
+        assert!(!a.expose_admin_tools);
+        assert!(a.public_url_rewrite.is_none());
+    }
+
+    #[test]
+    fn attachments_dir_reads_from_env() {
+        let mut vars = valid_legacy();
+        vars.insert("ATTACHMENTS_DIR".to_string(), "/tmp/custom-dir".to_string());
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.attachments.dir, PathBuf::from("/tmp/custom-dir"));
+    }
+
+    #[test]
+    fn store_max_bytes_smaller_than_download_cap_is_conflict() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "ATTACHMENT_MAX_DOWNLOAD_BYTES".to_string(),
+            "1000".to_string(),
+        );
+        vars.insert("ATTACHMENT_STORE_MAX_BYTES".to_string(), "999".to_string());
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn store_max_bytes_equal_to_download_cap_is_accepted() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "ATTACHMENT_MAX_DOWNLOAD_BYTES".to_string(),
+            "1000".to_string(),
+        );
+        vars.insert("ATTACHMENT_STORE_MAX_BYTES".to_string(), "1000".to_string());
+        Config::from_map(&vars, TransportKind::Stdio).expect("equal caps should be accepted");
+    }
+
+    #[test]
+    fn zero_byte_caps_are_invalid() {
+        for var in [
+            "ATTACHMENT_MAX_DOWNLOAD_BYTES",
+            "ATTACHMENT_STORE_MAX_BYTES",
+        ] {
+            let mut vars = valid_legacy();
+            vars.insert(var.to_string(), "0".to_string());
+            let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { var: v, .. } if v == var));
+        }
+    }
+
+    #[test]
+    fn zero_minute_durations_are_invalid() {
+        for var in ["CLEANUP_INTERVAL_MINUTES", "ATTACHMENT_EXPIRES_MINUTES"] {
+            let mut vars = valid_legacy();
+            vars.insert(var.to_string(), "0".to_string());
+            let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { var: v, .. } if v == var));
+        }
+    }
+
+    #[test]
+    fn auto_cleanup_enabled_parses_false() {
+        let mut vars = valid_legacy();
+        vars.insert("AUTO_CLEANUP_ENABLED".to_string(), "false".to_string());
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert!(!config.attachments.auto_cleanup_enabled);
+    }
+
+    #[test]
+    fn upload_file_roots_parses_absolute_paths() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_UPLOAD_FILE_ROOTS".to_string(),
+            "/srv/uploads, /data/uploads".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(
+            config.attachments.upload_file_roots,
+            vec![
+                PathBuf::from("/srv/uploads"),
+                PathBuf::from("/data/uploads")
+            ]
+        );
+    }
+
+    #[test]
+    fn upload_file_roots_rejects_a_relative_path() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_UPLOAD_FILE_ROOTS".to_string(),
+            "relative/path".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_UPLOAD_FILE_ROOTS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expose_admin_tools_defaults_false_and_parses_true() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_MCP_EXPOSE_ADMIN_TOOLS".to_string(),
+            "true".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert!(config.attachments.expose_admin_tools);
+    }
+
+    #[test]
+    fn public_url_rewrite_parses_a_valid_url() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_PUBLIC_URL".to_string(),
+            "https://public.example.com".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(
+            config.attachments.public_url_rewrite.map(|u| u.to_string()),
+            Some("https://public.example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn public_url_rewrite_rejects_non_http_scheme() {
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_PUBLIC_URL".to_string(), "ftp://x".to_string());
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_PUBLIC_URL",
+                ..
+            }
+        ));
+    }
+
+    // --- public_base (O1/O2, decisions K5/K6) ----------------------------
+
+    #[test]
+    fn public_base_defaults_to_the_loopback_bind_when_no_public_host_is_set() {
+        let cfg = http(&[]).expect("loopback default should be valid");
+        assert_eq!(cfg.public_base.to_string(), "http://127.0.0.1:8000/");
+    }
+
+    #[test]
+    fn public_base_uses_public_host_scheme_and_port() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+            ("PUBLIC_PORT", "8443"),
+            ("PUBLIC_SCHEME", "https"),
+        ])
+        .expect("should be valid");
+        assert_eq!(cfg.public_base.to_string(), "https://mcp.example.com:8443/");
+    }
+
+    #[test]
+    fn public_scheme_defaults_to_https_only_when_public_port_is_443() {
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+            ("PUBLIC_PORT", "443"),
+        ])
+        .expect("should be valid");
+        assert_eq!(cfg.public_base.scheme(), "https");
+
+        let cfg = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+            ("PUBLIC_PORT", "8080"),
+        ])
+        .expect("should be valid");
+        assert_eq!(cfg.public_base.scheme(), "http");
+    }
+
+    #[test]
+    fn public_scheme_rejects_unknown_values() {
+        let err = http(&[("PUBLIC_SCHEME", "gopher")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "PUBLIC_SCHEME",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_non_loopback_bind_with_an_explicit_star_allowlist_but_no_public_host_still_fails_for_public_base()
+     {
+        // REDMINE_MCP_ALLOWED_HOSTS=* bypasses parse_allowed_hosts's own
+        // PUBLIC_HOST requirement (K6), but public_base still needs one.
+        let err = http(&[
+            ("SERVER_HOST", "0.0.0.0"),
+            ("REDMINE_MCP_ALLOWED_HOSTS", "*"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "PUBLIC_HOST",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn public_base_for_a_loopback_v6_bind_brackets_the_address() {
+        let cfg = http(&[("SERVER_HOST", "::1")]).expect("loopback v6 should be valid");
+        assert_eq!(cfg.public_base.to_string(), "http://[::1]:8000/");
     }
 }

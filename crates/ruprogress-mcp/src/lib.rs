@@ -2,6 +2,7 @@
 //! wrapper; integration tests import this crate directly to build in-process
 //! servers over `tokio::io::duplex` (see `tests/support/mod.rs`).
 
+pub mod attachments;
 pub mod auth;
 pub mod config;
 pub mod error;

@@ -7,15 +7,18 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
 use redmine_client::{RedmineClient, RedmineClientBuilder};
+use ruprogress_mcp::attachments::{self, AttachmentStore};
 use ruprogress_mcp::config::{AuthMode, Config, TransportKind};
 use ruprogress_mcp::server::RedmineMcp;
 use ruprogress_mcp::transport;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 /// How long in-flight HTTP requests get to finish after a shutdown signal.
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,6 +98,41 @@ fn print_config(config: &Config) -> anyhow::Result<()> {
     stdout.write_all(summary.as_bytes())?;
     stdout.write_all(b"\n")?;
     Ok(())
+}
+
+/// If `AUTO_CLEANUP_ENABLED`, spawns the background sweeper and returns the
+/// tracker plus the token that stops it; `None` otherwise, in which case
+/// there is nothing to join on shutdown.
+fn maybe_spawn_sweeper(
+    config: &Config,
+    store: &Arc<AttachmentStore>,
+) -> Option<(TaskTracker, CancellationToken)> {
+    if !config.attachments.auto_cleanup_enabled {
+        return None;
+    }
+    let ct = CancellationToken::new();
+    let tracker = attachments::spawn_sweeper(
+        Arc::clone(store),
+        config.attachments.cleanup_interval,
+        ct.clone(),
+    );
+    Some((tracker, ct))
+}
+
+/// Cancels and joins the sweeper task, if one was spawned. Bounded by the
+/// same drain timeout as the HTTP transport: the sweeper does nothing that
+/// should ever take long, so a hang here is a bug, not something to wait out.
+async fn stop_sweeper(sweeper: Option<(TaskTracker, CancellationToken)>) {
+    let Some((tracker, ct)) = sweeper else {
+        return;
+    };
+    ct.cancel();
+    if tokio::time::timeout(HTTP_DRAIN_TIMEOUT, tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("attachment sweeper task did not exit before the drain timeout");
+    }
 }
 
 fn build_redmine_client(config: &Config) -> anyhow::Result<RedmineClient> {
@@ -208,10 +246,17 @@ async fn main() -> anyhow::Result<()> {
 
     let http = config.transport.as_http().cloned();
     let client = build_redmine_client(&config)?;
-    let server = RedmineMcp::new(client, config);
+    let attachments = Arc::new(
+        AttachmentStore::init(&config.attachments)
+            .context("failed to initialize the attachment store")?,
+    );
+    let sweeper = maybe_spawn_sweeper(&config, &attachments);
+    let server = RedmineMcp::new(client, config, attachments);
 
-    match &http {
+    let result = match &http {
         Some(cfg) => run_http(server, cfg).await,
         None => run_stdio(server).await,
-    }
+    };
+    stop_sweeper(sweeper).await;
+    result
 }

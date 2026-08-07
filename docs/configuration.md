@@ -52,6 +52,7 @@ Both allowlists reject a value that is set but contains no usable entries
 `Host` allowlist means *allow every host*.
 | `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` | no | `4194304` (4 MiB) | 1 KiB – 64 MiB. Enforced while streaming the body, so `Content-Length` cannot be lied about; oversized payloads get `413`. |
 | `HEALTH_INTROSPECTION_TTL_SECONDS` | no | `30` | 0–3600. How long a `/readyz` Redmine probe stays cached. `0` disables caching. |
+| `PUBLIC_SCHEME` | no | `https` if `PUBLIC_PORT` is `443`, else `http` | `http` or `https`. Feeds the origin used to build `/files/{uuid}` attachment URLs (`public_base`); has no effect on the `Host` allowlist. |
 
 The derived `Host` allowlist is always `localhost`, `127.0.0.1`, `::1`, plus
 the `PUBLIC_HOST` entry when set. It is logged at `INFO` on startup, so a `403`
@@ -60,7 +61,23 @@ can be diagnosed from the boot line.
 `Host` validation applies to the MCP route only — the health endpoints answer
 regardless of the `Host` header. They carry no configuration, so the exposure
 is the single bit of "is Redmine reachable", but a rebound browser page can
-read it.
+read it. `/files/{uuid}` (below) gets its own copy of the same `Host` check,
+reusing the same allowlist.
+
+### `public_base`: the origin used for `/files/{uuid}` links
+
+Building an attachment download URL needs an origin, not just a `Host`
+allowlist. It is derived once at startup, independently of
+`REDMINE_MCP_ALLOWED_HOSTS`:
+
+- With `PUBLIC_HOST` set: `{PUBLIC_SCHEME}://{PUBLIC_HOST}[:{PUBLIC_PORT}]`.
+- Without it: only a **loopback** `SERVER_HOST` can derive one
+  (`http://<bind-ip>:<port>`, correct for a client on the same machine).
+
+A non-loopback `SERVER_HOST` with no `PUBLIC_HOST` is a startup error here
+even when `REDMINE_MCP_ALLOWED_HOSTS=*` was set — that variable disables the
+`Host` *check*, but building a working `/files/{uuid}` URL still needs a real
+origin a client could reach.
 
 `ConfigError::Invalid` never echoes a secret value — it describes the
 expected shape instead (e.g. "must be a valid http(s) URL without userinfo",
@@ -72,18 +89,46 @@ mistake).
 These are read by the upstream reference server but not by
 `ruprogress-mcp` yet; setting them today has no effect.
 
-`REDMINE_USERNAME`, `REDMINE_PASSWORD`, `REDMINE_PUBLIC_URL`,
+`REDMINE_USERNAME`, `REDMINE_PASSWORD`,
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
 `REDMINE_INTROSPECT_CLIENT_ID`, `REDMINE_INTROSPECT_CLIENT_SECRET`(`_FILE`),
 `REDMINE_OAUTH_SCOPE_ENFORCEMENT`, `REDMINE_OAUTH_DISCOVERY_AS`,
 `REDMINE_MCP_SCOPES`, `REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
 `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,
-`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`), `ATTACHMENTS_DIR`,
-`ATTACHMENT_MAX_DOWNLOAD_BYTES`, `AUTO_CLEANUP_ENABLED`,
-`CLEANUP_INTERVAL_MINUTES`, `ATTACHMENT_EXPIRES_MINUTES`,
-`REDMINE_MCP_UPLOAD_FILE_ROOTS`, `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`,
+`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`),
 `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS`,
 `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
+
+The 8 attachment-related variables the parent reference server reads are now
+*validated* (see "Attachment store" below), but — other than the store
+existing and its background sweeper running — nothing consumes them yet: no
+tool reads or writes an attachment. `REDMINE_PUBLIC_URL` in particular parses
+and is stored but its `content_url`-rewriting behaviour is not applied until
+a later sub-phase.
+
+## Attachment store
+
+Local, on-disk staging for downloaded Redmine attachments. The store always
+exists (there is no way to disable it) and the directory is created at
+startup; no tool uses it yet.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `ATTACHMENTS_DIR` | no | `{temp_dir}/ruprogress-mcp-attachments` | Created `0700` on Unix at startup; a `WARN` is logged on other platforms, where permissions rely on inherited ACLs. Per-installation, not per-process, so a restarted process can still reap a predecessor's files. |
+| `ATTACHMENT_MAX_DOWNLOAD_BYTES` | no | `209715200` (200 MiB) | Positive integer. The per-file cap. |
+| `ATTACHMENT_STORE_MAX_BYTES` | no | `2147483648` (2 GiB) | Positive integer. The whole-store cap. Must be `>=` `ATTACHMENT_MAX_DOWNLOAD_BYTES`, or a startup `Conflict` — a smaller store cap would mean no single download could ever fit. |
+| `AUTO_CLEANUP_ENABLED` | no | `true` | Whether the background sweeper task runs at all. |
+| `CLEANUP_INTERVAL_MINUTES` | no | `15` | Positive integer. How often the sweeper runs. |
+| `ATTACHMENT_EXPIRES_MINUTES` | no | `60` | Positive integer. How long a stored file stays fetchable. Checked on every lookup (not just by the interval sweeper), so an expired file is refused immediately rather than up to `CLEANUP_INTERVAL_MINUTES` late. |
+| `REDMINE_MCP_UPLOAD_FILE_ROOTS` | no | `[]` | Comma-separated **absolute** directory paths. Unread until a later sub-phase adds `upload_file`'s `file_path` source; empty means every such upload will be refused then. |
+| `REDMINE_MCP_EXPOSE_ADMIN_TOOLS` | no | `false` | Unread until a later sub-phase registers `cleanup_attachment_files`. |
+| `REDMINE_PUBLIC_URL` | no | — | Must be a valid `http`/`https` URL. Parsed and validated now; the `content_url`-rewriting behaviour it controls is not applied until a later sub-phase. |
+
+`GET /files/{uuid}` (HTTP transport only) serves a stored file:
+`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`,
+`Cache-Control: no-store`, and a sanitised filename. `404` for an unknown or
+expired UUID; `403` for a `Host` header outside the same allowlist `/mcp`
+uses (see "`public_base`" above).
 
 ## Exposing the server on a network
 
@@ -223,3 +268,8 @@ behaviour difference is worse than a documented one.
    `REDMINE_MCP_ALLOWED_HOSTS` refuses to start.** Porting an upstream `.env`
    that sets only `SERVER_HOST=0.0.0.0` requires adding one variable. See
    "Exposing the server on a network".
+4. **`PUBLIC_HOST` is required for a non-loopback `SERVER_HOST` even when
+   `REDMINE_MCP_ALLOWED_HOSTS=*` is set.** That variable turns off the `Host`
+   *check*, but `/files/{uuid}` URLs still need a real origin to build from —
+   an unreachable `http://0.0.0.0:8000/files/...` link is worse than a
+   startup error naming the fix.
