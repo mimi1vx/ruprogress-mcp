@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `REDMINE_AUTH_MODE=legacy-per-user` is now implemented: each HTTP request
+  carries its own Redmine credential in `X-Redmine-API-Key` instead of the
+  server holding one shared key. No ambient fallback and no cross-request
+  reuse — a missing, empty, malformed, oversized, or duplicated header is
+  rejected before any Redmine request is attempted, while `initialize`/
+  `tools/list` still succeed with no header. `REDMINE_PER_USER_AUDIT_IDENTITY`
+  logs a non-reversible per-process fingerprint of the caller's key, never the
+  key itself. See `docs/legacy-per-user-auth.md` for the threat model.
 - `create_redmine_issue`/`update_redmine_issue` accept an optional `uploads`
   array (max 10 items) to attach files in the same request, via the same
   `content_base64`/`file_path` sources as `upload_file`

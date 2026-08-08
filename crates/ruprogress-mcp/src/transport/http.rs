@@ -146,6 +146,14 @@ fn cors_layer(cfg: &HttpConfig) -> Option<CorsLayer> {
 /// Reuses `HttpConfig::allowed_hosts` for a `Host` allowlist check: rmcp's
 /// own `Host` check runs only inside `StreamableHttpService`, so a route
 /// mounted ourselves needs its own copy of the same check, not a weaker one.
+///
+/// SECURITY: this route checks no Redmine credential in any auth mode,
+/// including `legacy-per-user`. The UUID is an unguessable, TTL-bounded
+/// bearer capability, and the route exists precisely so a browser or other
+/// non-MCP HTTP client can fetch the bytes from a plain URL with no Redmine
+/// credential of its own — binding it to a fetching request's
+/// `X-Redmine-API-Key` would defeat that use case, and disabling it would
+/// break `get_redmine_attachment`. See `docs/legacy-per-user-auth.md`.
 fn files_route(store: Arc<AttachmentStore>, allowed_hosts: Vec<String>) -> Router {
     Router::new()
         .route("/files/{uuid}", get(serve_file))

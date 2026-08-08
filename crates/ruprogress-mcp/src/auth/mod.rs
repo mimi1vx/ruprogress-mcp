@@ -3,3 +3,4 @@
 //! `legacy_per_user`/`oauth` siblings alongside `legacy`.
 
 pub(crate) mod legacy;
+pub(crate) mod per_user;

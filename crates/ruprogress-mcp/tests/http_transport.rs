@@ -111,11 +111,13 @@ async fn get_mcp_server_info_reports_the_http_transport() {
 }
 
 #[tokio::test]
-async fn legacy_per_user_serves_over_http_but_tools_still_report_not_implemented() {
+async fn legacy_per_user_without_a_header_is_rejected_as_a_protocol_error() {
     // The config boundary: `legacy-per-user` is *constructible* on HTTP (it is
-    // a `Conflict` on stdio), but the credential choke point has nothing to
-    // hand out yet, so a tool call must fail loudly rather than silently fall
-    // back to a server-owned key.
+    // a `Conflict` on stdio), and with no `X-Redmine-API-Key` header a tool
+    // call must fail loudly rather than silently fall back to a server-owned
+    // key. Full coverage (happy path, concurrency, rejections) lives in
+    // `tests/auth_per_user.rs`; this test only pins the transport-level
+    // wiring.
     let harness = support::http_harness(&[
         ("REDMINE_AUTH_MODE", "legacy-per-user"),
         ("REDMINE_PER_USER_TRUST_PROXY", "true"),
@@ -126,9 +128,9 @@ async fn legacy_per_user_serves_over_http_but_tools_still_report_not_implemented
     let error = client
         .call_tool(CallToolRequestParams::new("get_current_user"))
         .await
-        .expect_err("per-user auth is not implemented yet");
+        .expect_err("a per-user tool call with no credential header must be rejected");
     assert!(
-        format!("{error}").contains("not yet implemented"),
+        format!("{error}").contains("X-Redmine-API-Key"),
         "unexpected error: {error}"
     );
     client.cancel().await.ok();

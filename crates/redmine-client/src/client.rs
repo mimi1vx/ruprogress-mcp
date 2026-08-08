@@ -279,9 +279,23 @@ pub struct RedmineClient {
 impl RedmineClient {
     /// Scope requests to `credential`. This is the only way to reach the API
     /// surface: a credential must always be named explicitly, so one can
-    /// never be picked up ambiently.
+    /// never be picked up ambiently. Clones `credential` into the returned
+    /// `Scoped` (see [`Self::as_user_owned`] to avoid that clone when the
+    /// caller already owns the credential outright).
     #[must_use]
-    pub fn as_user<'a>(&'a self, credential: &'a Credential) -> Scoped<'a> {
+    pub fn as_user(&self, credential: &Credential) -> Scoped<'_> {
+        Scoped {
+            inner: &self.inner,
+            credential: credential.clone(),
+        }
+    }
+
+    /// Like [`Self::as_user`], but takes ownership of `credential` instead of
+    /// cloning it — for callers (e.g. a per-request credential built fresh
+    /// from an inbound header) that would otherwise clone once to construct
+    /// the credential and again to hand it to `as_user`.
+    #[must_use]
+    pub fn as_user_owned(&self, credential: Credential) -> Scoped<'_> {
         Scoped {
             inner: &self.inner,
             credential,
@@ -304,17 +318,20 @@ impl RedmineClient {
             })?;
         Ok(Scoped {
             inner: &self.inner,
-            credential,
+            credential: credential.clone(),
         })
     }
 }
 
 /// A [`RedmineClient`] scoped to one credential. The only handle that can
-/// perform a request.
+/// perform a request. Owns its `Credential` (a cheap ~40-byte clone from the
+/// caller) rather than borrowing it, so a per-request credential built
+/// locally (e.g. from an inbound header) can be scoped without a lifetime
+/// tying it to the caller's stack frame.
 #[derive(Debug)]
 pub struct Scoped<'a> {
     inner: &'a Inner,
-    credential: &'a Credential,
+    credential: Credential,
 }
 
 impl Scoped<'_> {

@@ -33,7 +33,9 @@ before changing `SERVER_HOST`.
 
 - Full tool parity with the reference server (~51 tools).
 - Both stdio and streamable HTTP transports.
-- Four auth modes: `legacy`, `legacy-per-user`, `oauth`, `oauth-proxy`.
+- Four auth modes: `legacy` and `legacy-per-user` implemented (the latter
+  documented in `docs/legacy-per-user-auth.md`); `oauth`/`oauth-proxy` not
+  yet.
 - A reusable `redmine-client` crate, independent of MCP.
 
 See `docs/adr/` for the design decisions made along the way.

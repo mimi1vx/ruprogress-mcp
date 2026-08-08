@@ -76,13 +76,12 @@ impl RedmineMcp {
     /// THE credential choke point. Every tool starts with this line: since
     /// `redmine-client` exposes the Redmine API only on `Scoped`, a tool
     /// physically cannot reach Redmine without going through here.
-    pub(crate) fn scoped(&self, _ctx: &RequestContext<RoleServer>) -> Result<Scoped<'_>, McpError> {
+    pub(crate) fn scoped(&self, ctx: &RequestContext<RoleServer>) -> Result<Scoped<'_>, McpError> {
         match &self.inner.config.auth {
             AuthMode::Legacy { .. } => crate::auth::legacy::scoped(&self.inner.client),
-            AuthMode::LegacyPerUser { .. } => Err(McpError::internal_error(
-                "legacy-per-user auth is not yet implemented",
-                None,
-            )),
+            AuthMode::LegacyPerUser { audit_identity, .. } => {
+                crate::auth::per_user::scoped(&self.inner.client, ctx, *audit_identity)
+            }
             AuthMode::OAuth(_) => Err(McpError::internal_error(
                 "oauth auth is not yet implemented",
                 None,

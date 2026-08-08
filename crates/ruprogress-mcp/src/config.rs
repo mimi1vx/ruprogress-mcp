@@ -66,7 +66,8 @@ pub enum AuthMode {
     Legacy {
         credential: Credential,
     },
-    /// Not yet implemented. Each request carries its own Redmine credential.
+    /// Each request carries its own Redmine credential in the
+    /// `X-Redmine-API-Key` header — see `auth::per_user`.
     LegacyPerUser {
         trust: ProxyTrust,
         audit_identity: bool,
@@ -925,6 +926,15 @@ impl Config {
             );
         }
 
+        if matches!(auth, AuthMode::LegacyPerUser { .. }) {
+            tracing::warn!(
+                "legacy-per-user auth mode trusts that a TLS-terminating proxy sits in front of \
+                 this server and does not forward a client-supplied X-Forwarded-Proto; \
+                 REDMINE_PER_USER_TRUST_PROXY=true is the operator's attestation of that and is \
+                 not something this process can verify"
+            );
+        }
+
         Ok(Self {
             redmine,
             auth,
@@ -958,7 +968,8 @@ impl Config {
 
     pub(crate) fn auth_mode_label(&self) -> &'static str {
         match &self.auth {
-            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => "legacy",
+            AuthMode::Legacy { .. } => "legacy",
+            AuthMode::LegacyPerUser { .. } => "legacy-per-user",
             AuthMode::OAuth(_) => "oauth",
         }
     }

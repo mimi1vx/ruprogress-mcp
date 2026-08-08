@@ -105,6 +105,16 @@ fn print_config_over_http_reports_the_bind_address() {
 }
 
 #[test]
+fn print_config_reports_legacy_per_user_auth_mode() {
+    let output =
+        print_http_config("REDMINE_AUTH_MODE=legacy-per-user\nREDMINE_PER_USER_TRUST_PROXY=true\n");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(summary["auth_mode"], "legacy-per-user");
+}
+
+#[test]
 fn a_non_loopback_bind_without_a_host_policy_refuses_to_start() {
     let output = print_http_config("SERVER_HOST=0.0.0.0\n");
     assert!(
@@ -167,6 +177,14 @@ fn a_non_loopback_bind_under_legacy_auth_warns_about_the_shared_key() {
         stderr.contains("single shared Redmine API key"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn legacy_per_user_warns_about_the_trust_proxy_assumption() {
+    let stderr =
+        config_stderr("REDMINE_AUTH_MODE=legacy-per-user\nREDMINE_PER_USER_TRUST_PROXY=true\n");
+    assert!(stderr.contains("WARN"), "stderr: {stderr}");
+    assert!(stderr.contains("TLS-terminating proxy"), "stderr: {stderr}");
 }
 
 #[test]
