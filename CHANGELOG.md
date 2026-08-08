@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `list_files`: lists a project's Files-module entries (`GET
+  /projects/{id}/files.json`) — not issue attachments, not DMSF.
+- `delete_file`: deletes an attachment by id (`DELETE /attachments/{id}.json`).
+  Redmine's endpoint deletes any attachment this credential can reach, not
+  just project Files, so the tool always requires
+  `confirm_delete_any_attachment=true`; write tool, blocked in read-only
+  mode.
 - `get_redmine_attachment`: downloads a Redmine attachment by id and stages
   it in the local attachment store, returning a `/files/{uuid}` URL over
   HTTP or an absolute `file_path` over stdio (`uri_type` tells you which).

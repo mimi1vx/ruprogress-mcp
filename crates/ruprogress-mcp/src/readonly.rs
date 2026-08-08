@@ -38,6 +38,9 @@ pub mod write_tools {
     /// genuine `action="list"` that must survive read-only mode per the
     /// parent plan's D8 ("read-only mode gates per action, not per tool") —
     /// see [`PARTIAL_WRITE`] instead.
+    ///
+    /// 5d adds `delete_file` (always mutates when called). `list_files` is
+    /// not here: it is a read, matching `get_redmine_attachment` (5c).
     pub const ALL: &[&str] = &[
         "manage_redmine_version",
         "manage_project_member",
@@ -49,6 +52,7 @@ pub mod write_tools {
         "copy_issue",
         "manage_issue_watcher",
         "manage_issue_note",
+        "delete_file",
     ];
 
     /// Tools with a mix of read and write `action`s (D8): never removed from

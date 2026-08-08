@@ -1,6 +1,10 @@
-//! e2e: `get_redmine_attachment`. Happy path per transport (the `uri_type`
+//! e2e: `get_redmine_attachment`, `list_files`, `delete_file`.
+//! `get_redmine_attachment`: happy path per transport (the `uri_type`
 //! branch), the `FILE_TOO_LARGE` pre-check and mid-stream enforcement,
 //! `STORE_FULL`, and the dominant `redmine_client::Error` passthrough.
+//! `list_files`: the Files-module shape, including `digest`/`downloads`/
+//! `version`. `delete_file`: the unconditional confirmation guard (M1/M2 in
+//! `plans/phase-5d-list-and-delete-file.md`) and the success shape.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,13 +21,21 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-async fn call(h: &support::Harness, args: serde_json::Value) -> rmcp::model::CallToolResult {
-    let mut request = CallToolRequestParams::new("get_redmine_attachment".to_string());
+async fn call_tool(
+    h: &support::Harness,
+    name: &str,
+    args: serde_json::Value,
+) -> rmcp::model::CallToolResult {
+    let mut request = CallToolRequestParams::new(name.to_string());
     request.arguments = args.as_object().cloned();
     h.client
         .call_tool(request)
         .await
         .expect("call_tool should succeed")
+}
+
+async fn call(h: &support::Harness, args: serde_json::Value) -> rmcp::model::CallToolResult {
+    call_tool(h, "get_redmine_attachment", args).await
 }
 
 async fn mock_attachment(
@@ -203,6 +215,122 @@ async fn a_404_from_redmine_surfaces_as_not_found() {
         .await;
 
     let result = call(&h, json!({"attachment_id": 999})).await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.expect("structured error")["code"],
+        "NOT_FOUND"
+    );
+}
+
+#[tokio::test]
+async fn list_files_returns_the_files_module_shape_including_version() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1/files.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"files": [
+            {
+                "id": 11, "filename": "plan.pdf", "filesize": 1024,
+                "content_type": "application/pdf",
+                "description": "the plan",
+                "content_url": format!("{}/attachments/download/11/plan.pdf", h.redmine.uri()),
+                "digest": "d41d8cd98f00b204e9800998ecf8427e", "downloads": 3,
+                "author": {"id": 1, "name": "Alice"},
+                "created_on": "2026-01-01T00:00:00Z"
+            },
+            {
+                "id": 12, "filename": "release.zip", "filesize": 2048,
+                "content_url": format!("{}/attachments/download/12/release.zip", h.redmine.uri()),
+                "digest": "d41d8cd98f00b204e9800998ecf8427e", "downloads": 0,
+                "version": {"id": 2, "name": "1.0"},
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        ]})))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(&h, "list_files", json!({"project_id": 1})).await;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.expect("structured content");
+    let files = structured["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["filename"], "plan.pdf");
+    // `description` is Redmine-authored free text and is boundary-wrapped;
+    // `filename` is structured metadata and is returned verbatim.
+    assert!(
+        files[0]["description"]
+            .as_str()
+            .expect("description should be a string")
+            .contains("the plan")
+    );
+    assert_eq!(files[0]["digest"], "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(files[0]["downloads"], 3);
+    assert!(
+        files[0]["author"]["name"]
+            .as_str()
+            .expect("author name should be a string")
+            .contains("Alice")
+    );
+    assert!(files[0]["version"].is_null());
+    assert!(
+        files[1]["version"]["name"]
+            .as_str()
+            .expect("version name should be a string")
+            .contains("1.0")
+    );
+}
+
+#[tokio::test]
+async fn delete_file_without_the_confirm_flag_refuses_without_calling_redmine() {
+    let h = support::harness(&[]).await;
+    let delete_mock = Mock::given(method("DELETE"))
+        .and(path("/attachments/1.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0);
+    h.redmine.register(delete_mock).await;
+
+    let result = call_tool(&h, "delete_file", json!({"file_id": 1})).await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "CONFIRMATION_REQUIRED");
+    assert_eq!(structured["retryable"], false);
+}
+
+#[tokio::test]
+async fn delete_file_with_the_confirm_flag_deletes_and_returns_success() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("DELETE"))
+        .and(path("/attachments/1.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(
+        &h,
+        "delete_file",
+        json!({"file_id": 1, "confirm_delete_any_attachment": true}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(structured["success"], true);
+    assert_eq!(structured["deleted_file_id"], 1);
+}
+
+#[tokio::test]
+async fn delete_file_404_surfaces_as_not_found() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("DELETE"))
+        .and(path("/attachments/999.json"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"errors": ["not found"]})))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(
+        &h,
+        "delete_file",
+        json!({"file_id": 999, "confirm_delete_any_attachment": true}),
+    )
+    .await;
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         result.structured_content.expect("structured error")["code"],

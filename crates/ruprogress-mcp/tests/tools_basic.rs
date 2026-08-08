@@ -54,6 +54,8 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "manage_redmine_wiki_page",
     "get_gantt_chart",
     "get_redmine_attachment",
+    "list_files",
+    "delete_file",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -149,6 +151,8 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "manage_redmine_wiki_page",
     "get_gantt_chart",
     "get_redmine_attachment",
+    "list_files",
+    "delete_file",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -520,6 +524,11 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"roles": []})))
         .mount(&h.redmine)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1/files.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"files": []})))
+        .mount(&h.redmine)
+        .await;
     // Covers every `summarize_project_status` sub-query (sample, open,
     // closed, created-in-period, updated-in-period) and `list_subtasks`/
     // `list_redmine_issues`: this test does not constrain query parameters,
@@ -609,6 +618,7 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
             "list_project_members",
             "get_project_modules",
             "get_gantt_chart",
+            "list_files",
         ];
         let issue_id_only_tools = ["get_redmine_issue", "list_subtasks", "get_private_notes"];
         if project_id_only_tools.contains(&tool.name.as_ref()) {

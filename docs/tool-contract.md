@@ -8,8 +8,9 @@ For each tool: name, parameter names + types + required-ness (as given upstream)
 and a one-line return shape. This is a snapshot for drift detection, not a spec —
 the upstream doc is authoritative; re-vendor when implementing more tools.
 
-Tools currently implemented (all 36 non-app core tools from
-`plans/phase-4-core-tools.md`; kept in sync with `IMPLEMENTED_TOOLS` in
+Tools currently implemented (the 36 non-app core tools from
+`plans/phase-4-core-tools.md` plus phase 5's `get_redmine_attachment`,
+`list_files`, `delete_file`; kept in sync with `IMPLEMENTED_TOOLS` in
 `crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
 `get_mcp_server_info`, `get_current_user`, `list_redmine_projects`,
 `list_redmine_trackers`, `list_project_trackers`,
@@ -24,12 +25,13 @@ Tools currently implemented (all 36 non-app core tools from
 `create_redmine_issue`, `update_redmine_issue`, `delete_redmine_issue`,
 `copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
-`manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`
-(`list_files`/`upload_file`/`delete_file`/`cleanup_attachment_files` remain
-unimplemented). All remaining sections below (MCP Apps, the rest of File
-Operations, Checklist Tools, Products/Contacts/Documents plugin families)
-are recorded for reference as app-plugin tools out of Phase 4's scope (see
-the parent plan's "non-app core tools" framing).
+`manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`,
+`list_files`, `delete_file`
+(`upload_file`/`cleanup_attachment_files` remain unimplemented). All
+remaining sections below (MCP Apps, the rest of File Operations, Checklist
+Tools, Products/Contacts/Documents plugin families) are recorded for
+reference as app-plugin tools out of Phase 4's scope (see the parent plan's
+"non-app core tools" framing).
 
 ## Project Management
 
