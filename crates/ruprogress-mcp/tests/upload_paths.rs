@@ -1,6 +1,5 @@
-//! e2e: `upload_file`'s `file_path` source (J7/N4 in
-//! `plans/phase-5e-upload-and-cleanup.md`) — the table-driven traversal/
-//! symlink/FIFO/device suite the parent plan's risk #2 asks for. Every
+//! e2e: `upload_file`'s `file_path` source — the table-driven traversal/
+//! symlink/FIFO/device suite covering path-validation edge cases. Every
 //! rejection must come back as `PATH_NOT_ALLOWED` with no raw path in the
 //! message; every acceptance must round-trip the real bytes through the
 //! two-step upload flow.
@@ -125,7 +124,7 @@ async fn a_path_inside_attachments_dir_is_accepted_with_no_roots_configured() {
     assert_eq!(
         result.is_error,
         Some(false),
-        "ATTACHMENTS_DIR is an implicit allowed root (N3): {:?}",
+        "ATTACHMENTS_DIR is an implicit allowed root: {:?}",
         result.structured_content
     );
 
@@ -178,7 +177,7 @@ async fn a_nonexistent_path_under_an_allowed_root_is_rejected_the_same_way() {
     )
     .await;
     // Same code and no existence oracle: a caller cannot distinguish
-    // "outside the roots" from "does not exist" (N4).
+    // "outside the roots" from "does not exist".
     assert_path_not_allowed(&result, &missing.to_string_lossy());
 
     std::fs::remove_dir_all(&root).ok();

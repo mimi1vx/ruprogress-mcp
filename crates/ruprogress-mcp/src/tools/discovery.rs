@@ -37,8 +37,8 @@ pub(crate) struct TrackersOutput {
 // --- list_project_trackers ---
 
 /// A project's numeric id or slug identifier, as sent by the model.
-/// Converted to a validated [`ProjectIdent`] on the first line of the tool
-/// (D5) — this type itself performs no validation.
+/// Converted to a validated [`ProjectIdent`] on the first line of the tool —
+/// this type itself performs no validation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum ProjectRef {
@@ -56,7 +56,7 @@ pub(crate) struct ListProjectTrackersParams {
     pub(crate) project_id: ProjectRef,
 }
 
-/// Convert a [`ProjectRef`] (D5's untagged `integer | string` union) to a
+/// Convert a [`ProjectRef`] (an untagged `integer | string` union) to a
 /// validated [`ProjectIdent`], on the first line of every tool that takes a
 /// `project_id` parameter — shared by `discovery.rs` and `projects.rs`. An
 /// invalid slug identifier is an **argument** error (`McpError`), not a tool
@@ -150,7 +150,7 @@ const USERS_MIN_LIMIT: u32 = 1;
 const USERS_MAX_LIMIT: u32 = 100;
 const USERS_DEFAULT_LIMIT: u32 = 25;
 
-/// Clamp to [1, 100] (E4): a value outside the range is silently corrected
+/// Clamp to [1, 100]: a value outside the range is silently corrected
 /// rather than rejected, since the model can't act on a rejection any more
 /// usefully than on the clamp — the effective value is echoed back in
 /// `pagination.limit`.

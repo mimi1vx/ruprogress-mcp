@@ -123,10 +123,10 @@ fn a_non_loopback_bind_without_a_host_policy_refuses_to_start() {
 
 #[test]
 fn a_non_loopback_bind_starts_with_either_escape_hatch() {
-    // PUBLIC_HOST is required in both cases as of phase 5b: even the
+    // PUBLIC_HOST is required in both cases: even the
     // REDMINE_MCP_ALLOWED_HOSTS=* escape hatch (which bypasses
     // parse_allowed_hosts's own PUBLIC_HOST requirement) still needs an
-    // origin to build /files/{uuid} URLs from (decision K6).
+    // origin to build /files/{uuid} URLs from.
     for extra in [
         "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n",
         "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\nREDMINE_MCP_ALLOWED_HOSTS=*\n",
@@ -142,9 +142,9 @@ fn a_non_loopback_bind_starts_with_either_escape_hatch() {
 
 #[test]
 fn a_non_loopback_bind_with_allowed_hosts_star_but_no_public_host_still_refuses_to_start() {
-    // K6: building /files/{uuid} URLs needs an origin, which cannot be
-    // derived from a non-loopback bind even when Host validation itself has
-    // been disabled.
+    // Building /files/{uuid} URLs needs an origin, which cannot be derived
+    // from a non-loopback bind even when Host validation itself has been
+    // disabled.
     let output = print_http_config("SERVER_HOST=0.0.0.0\nREDMINE_MCP_ALLOWED_HOSTS=*\n");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");

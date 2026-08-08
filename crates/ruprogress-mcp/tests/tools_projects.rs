@@ -1,8 +1,8 @@
-//! e2e: the project-management tool family (4c) — happy path and dominant
+//! e2e: the project-management tool family — happy path and dominant
 //! error path per tool, plus behaviours specific to this family:
-//! `summarize_project_status`'s fixed 6-request fan-out (F2/Risk 6),
-//! `manage_redmine_version`/`manage_project_member`'s read-only removal
-//! (F1), and `manage_project_member`'s `user_id`/`group_id` validation.
+//! `summarize_project_status`'s fixed 6-request fan-out,
+//! `manage_redmine_version`/`manage_project_member`'s read-only removal,
+//! and `manage_project_member`'s `user_id`/`group_id` validation.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

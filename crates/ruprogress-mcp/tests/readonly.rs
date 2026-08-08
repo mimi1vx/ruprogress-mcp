@@ -4,7 +4,7 @@
 //! (`ToolRouter::remove_route`/`call`) returns a clean error rather than
 //! panicking, using a tool name from `docs/tool-contract.md` that is not
 //! registered yet — behaviourally identical to a route read-only mode will
-//! eventually remove. (iv)/(v) cover D8's per-action gating (4b-write):
+//! eventually remove. (iv)/(v) cover per-action gating:
 //! `manage_issue_relation`/`manage_issue_category` stay in the router in
 //! read-only mode (their `list` action is a read), but their write actions
 //! refuse with `code: "READ_ONLY"`.
@@ -59,8 +59,8 @@ async fn no_write_tool_name_exists_in_a_read_only_router() {
 async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
     let h = support::harness(&[]).await;
     // `get_checklist` is a real future tool name (see
-    // docs/tool-contract.md, the Checklist plugin family, not in Phase 4's
-    // 36 core tools) that does not exist in the router yet — the router's
+    // docs/tool-contract.md, the Checklist plugin family, not among the
+    // tools implemented here) that does not exist in the router yet — the router's
     // response to it is identical to what it will return for a route
     // removed by read-only mode.
     let result = h
@@ -85,7 +85,7 @@ async fn partial_write_tool_names_survive_a_read_only_router() {
     for name in write_tools::PARTIAL_WRITE {
         assert!(
             names.contains(name),
-            "{name} is a partial-write tool (D8) and must stay in a read-only router"
+            "{name} is a partial-write tool and must stay in a read-only router"
         );
     }
 }

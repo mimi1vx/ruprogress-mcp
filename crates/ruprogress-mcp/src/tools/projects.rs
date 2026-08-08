@@ -76,7 +76,7 @@ pub(crate) struct CustomFieldsOutput {
 
 /// Sample size for the status/priority/assignee breakdown — a single
 /// bounded `GET /issues.json?limit=100` call, never proportional to project
-/// size (see `plans/phase-4c-projects.md` decision F2/Risk 2).
+/// size.
 const SUMMARY_SAMPLE_LIMIT: u32 = 100;
 const DEFAULT_SUMMARY_DAYS: u32 = 30;
 
@@ -123,7 +123,7 @@ pub(crate) struct ProjectStatusOutput {
     /// How many issues the breakdowns above were computed over.
     pub(crate) sample_size: u64,
     /// `true` when `sample_size < totals.total`: the breakdowns are over a
-    /// capped sample, not every issue in the project (Risk 2).
+    /// capped sample, not every issue in the project.
     pub(crate) sample_truncated: bool,
 }
 
@@ -144,7 +144,7 @@ fn bucket_counts(names: impl Iterator<Item = String>) -> Vec<(String, u64)> {
 
 /// `status`/`status_filter` values accepted at the MCP boundary. A closed
 /// enum (rather than a raw `String`) so the generated `inputSchema` carries
-/// a JSON Schema `enum` constraint (decision F5).
+/// a JSON Schema `enum` constraint.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum VersionStatusParam {
@@ -307,7 +307,7 @@ pub(crate) struct MembershipOut {
     pub(crate) user: Option<PrincipalOut>,
     pub(crate) group: Option<PrincipalOut>,
     /// Role names are instance configuration, not user content — never
-    /// boundary-wrapped (same treatment as tracker/status names, 4a).
+    /// boundary-wrapped (same treatment as tracker/status names).
     pub(crate) roles: Vec<PrincipalOut>,
 }
 
@@ -464,8 +464,8 @@ impl RedmineMcp {
         let project_ident = resolve_project_ref(params.project_id)?;
         let scoped = self.scoped(&ctx)?;
 
-        // Resolve to a numeric id even when the caller already passed one
-        // (decision F3): `custom_fields.json`'s `projects` array is keyed by
+        // Resolve to a numeric id even when the caller already passed one:
+        // `custom_fields.json`'s `projects` array is keyed by
         // numeric id, and this also gives a `NOT_FOUND` for a bad project
         // instead of a silently empty result.
         let project = match scoped.get_project(&project_ident, &[]).await {
@@ -520,8 +520,8 @@ impl RedmineMcp {
         ))
     }
 
-    /// Six fixed HTTP requests, never proportional to project size
-    /// (decision F2): `get_project` for the name, one bounded issue sample
+    /// Six fixed HTTP requests, never proportional to project size:
+    /// `get_project` for the name, one bounded issue sample
     /// for the status/priority/assignee breakdown, and four `limit=1`
     /// count-only queries (open, closed, created-in-period,
     /// updated-in-period).
@@ -580,7 +580,7 @@ impl RedmineMcp {
         // Concurrent, not spawned: `Scoped<'a>` borrows the credential, so
         // these futures are not `'static` and cannot go through
         // `tokio::task::JoinSet` — `try_join!` gives the same bounded,
-        // countable fan-out without that requirement (decision F2).
+        // countable fan-out without that requirement.
         let result = tokio::try_join!(
             scoped.get_project(&project_ident, &[]),
             scoped.list_issues_page(&sample_query, SUMMARY_SAMPLE_LIMIT, 0),

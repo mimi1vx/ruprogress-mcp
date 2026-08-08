@@ -30,7 +30,7 @@ pub struct Config {
     pub attachments: AttachmentConfig,
     /// Hard cap on items in a single list tool's response
     /// (`REDMINE_MCP_MAX_RESPONSE_ITEMS`, default 200), enforced above
-    /// `redmine-client`'s own byte caps (D9).
+    /// `redmine-client`'s own byte caps.
     pub max_response_items: usize,
     /// Hard cap on a single tool response's serialized size in bytes
     /// (`REDMINE_MCP_MAX_RESPONSE_BYTES`, default 256 KiB).
@@ -150,7 +150,7 @@ pub struct HttpConfig {
     /// responses may be long-lived SSE streams.
     pub request_timeout: Duration,
     /// The origin clients use to reach `/files/{uuid}` URLs
-    /// (`get_redmine_attachment`, phase 5c). Derived from `PUBLIC_HOST`/
+    /// (`get_redmine_attachment`). Derived from `PUBLIC_HOST`/
     /// `PUBLIC_PORT`/`PUBLIC_SCHEME` when `PUBLIC_HOST` is set, or from the
     /// bind address for a loopback bind — see `parse_public_base`.
     pub public_base: Url,
@@ -183,19 +183,19 @@ pub struct PluginFlags {
     pub tags: bool,
 }
 
-/// Local attachment-store settings (phase 5). None of these are read by any
-/// tool yet as of phase 5b — `get_redmine_attachment` (5c) and
-/// `upload_file`/`cleanup_attachment_files` (5e) are the consumers — but the
+/// Local attachment-store settings. None of these are read by any
+/// tool yet — `get_redmine_attachment` and
+/// `upload_file`/`cleanup_attachment_files` are the consumers — but the
 /// whole surface is validated together, same pattern as
 /// `REDMINE_PER_USER_AUDIT_IDENTITY` before per-user auth existed.
 #[derive(Debug, Clone)]
 pub struct AttachmentConfig {
     /// `ATTACHMENTS_DIR`. Created `0700` at startup by `AttachmentStore::init`.
     pub dir: PathBuf,
-    /// `ATTACHMENT_MAX_DOWNLOAD_BYTES`: the per-file cap (J11).
+    /// `ATTACHMENT_MAX_DOWNLOAD_BYTES`: the per-file cap.
     pub max_download_bytes: u64,
-    /// `ATTACHMENT_STORE_MAX_BYTES`: the whole-store cap (J11, decision K3
-    /// enforces `>= max_download_bytes` at startup).
+    /// `ATTACHMENT_STORE_MAX_BYTES`: the whole-store cap, enforced to be
+    /// `>= max_download_bytes` at startup.
     pub store_max_bytes: u64,
     /// `AUTO_CLEANUP_ENABLED`: whether the background sweeper task runs.
     pub auto_cleanup_enabled: bool,
@@ -204,13 +204,12 @@ pub struct AttachmentConfig {
     /// `ATTACHMENT_EXPIRES_MINUTES`: how long a served file stays fetchable.
     pub expires_after: Duration,
     /// `REDMINE_MCP_UPLOAD_FILE_ROOTS`: allowed roots for `upload_file`'s
-    /// `file_path` source (5e). Empty means every `file_path` upload is
-    /// refused.
+    /// `file_path` source. Empty means every `file_path` upload is refused.
     pub upload_file_roots: Vec<PathBuf>,
-    /// `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`: gates `cleanup_attachment_files` (5e).
+    /// `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`: gates `cleanup_attachment_files`.
     pub expose_admin_tools: bool,
     /// `REDMINE_PUBLIC_URL`: rewrites `content_url` values whose origin
-    /// matches `REDMINE_URL`'s (5f). `None` disables the rewrite.
+    /// matches `REDMINE_URL`'s. `None` disables the rewrite.
     pub public_url_rewrite: Option<Url>,
 }
 
@@ -546,7 +545,7 @@ fn validate_authority(var: &'static str, value: &str) -> Result<(), ConfigError>
     Ok(())
 }
 
-/// `PUBLIC_SCHEME` (O1): defaults to `https` only when `PUBLIC_PORT == 443`,
+/// `PUBLIC_SCHEME` defaults to `https` only when `PUBLIC_PORT == 443`,
 /// since that is the one case where guessing `http` would almost certainly
 /// be wrong (a TLS-terminating proxy on the standard HTTPS port).
 fn parse_public_scheme(
@@ -569,15 +568,14 @@ fn parse_public_scheme(
     }
 }
 
-/// Derives the origin used to build `/files/{uuid}` URLs (O1/O2, phase 5b
-/// decisions K5/K6).
+/// Derives the origin used to build `/files/{uuid}` URLs.
 ///
 /// With `PUBLIC_HOST` set, builds `{PUBLIC_SCHEME}://{PUBLIC_HOST}[:{PUBLIC_PORT}]`.
 /// Without it, only a loopback bind can derive one (`http://<bind-ip>:<port>`,
 /// which is correct for a client on the same machine); a non-loopback bind
 /// without `PUBLIC_HOST` is a `Missing` error here even if
 /// `REDMINE_MCP_ALLOWED_HOSTS` was set explicitly and so bypassed
-/// [`parse_allowed_hosts`]'s own `PUBLIC_HOST` requirement (K6) — an
+/// [`parse_allowed_hosts`]'s own `PUBLIC_HOST` requirement — an
 /// unreachable `0.0.0.0`-hosted URL is worse than refusing to start.
 fn public_base_from_loopback_bind(bind: SocketAddr) -> Result<String, ConfigError> {
     if !bind.ip().is_loopback() {
@@ -807,7 +805,7 @@ fn parse_attachments_dir(vars: &EnvMap) -> PathBuf {
     )
 }
 
-/// `REDMINE_MCP_UPLOAD_FILE_ROOTS` (K4): a csv of absolute directory paths.
+/// `REDMINE_MCP_UPLOAD_FILE_ROOTS`: a csv of absolute directory paths.
 /// Relative paths are rejected outright — a prefix check against a relative
 /// root is meaningless once the caller's cwd is anything but the one the
 /// operator had in mind.
@@ -864,7 +862,7 @@ fn parse_attachments(vars: &EnvMap) -> Result<AttachmentConfig, ConfigError> {
         "ATTACHMENT_STORE_MAX_BYTES",
         DEFAULT_ATTACHMENT_STORE_MAX_BYTES,
     )?;
-    // K3: a store cap smaller than the per-file cap means no download could
+    // A store cap smaller than the per-file cap means no download could
     // ever succeed — a misconfiguration to catch at boot, not a capacity
     // condition to discover on a client's first request.
     if store_max_bytes < max_download_bytes {
@@ -1494,7 +1492,7 @@ mod tests {
     #[test]
     fn allowed_hosts_star_disables_validation_and_yields_an_empty_list() {
         // PUBLIC_HOST is required here even though REDMINE_MCP_ALLOWED_HOSTS=*
-        // bypasses parse_allowed_hosts's own PUBLIC_HOST requirement (K6):
+        // bypasses parse_allowed_hosts's own PUBLIC_HOST requirement:
         // public_base still needs an origin to build /files/{uuid} URLs from.
         let cfg = http(&[
             ("SERVER_HOST", "0.0.0.0"),
@@ -1596,7 +1594,7 @@ mod tests {
 
     #[test]
     fn allowed_hosts_replaces_the_derived_list_entirely() {
-        // PUBLIC_HOST is required here for the same reason as above (K6).
+        // PUBLIC_HOST is required here for the same reason as above.
         let cfg = http(&[
             ("SERVER_HOST", "0.0.0.0"),
             (
@@ -1718,7 +1716,7 @@ mod tests {
         );
     }
 
-    // --- Attachment config (phase 5b) ------------------------------------
+    // --- Attachment config -------------------------------------------------
 
     #[test]
     fn attachments_default_to_a_temp_dir_with_sensible_caps() {
@@ -1874,7 +1872,7 @@ mod tests {
         ));
     }
 
-    // --- public_base (O1/O2, decisions K5/K6) ----------------------------
+    // --- public_base -------------------------------------------------------
 
     #[test]
     fn public_base_defaults_to_the_loopback_bind_when_no_public_host_is_set() {
@@ -1929,7 +1927,7 @@ mod tests {
     fn a_non_loopback_bind_with_an_explicit_star_allowlist_but_no_public_host_still_fails_for_public_base()
      {
         // REDMINE_MCP_ALLOWED_HOSTS=* bypasses parse_allowed_hosts's own
-        // PUBLIC_HOST requirement (K6), but public_base still needs one.
+        // PUBLIC_HOST requirement, but public_base still needs one.
         let err = http(&[
             ("SERVER_HOST", "0.0.0.0"),
             ("REDMINE_MCP_ALLOWED_HOSTS", "*"),

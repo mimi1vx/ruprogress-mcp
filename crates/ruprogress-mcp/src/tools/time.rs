@@ -1,6 +1,5 @@
-//! Time-tracking tools (4d): `list_time_entries`, `manage_time_entry`,
-//! `list_time_entry_activities`, `import_time_entries`. See
-//! `plans/phase-4d-time.md`.
+//! Time-tracking tools: `list_time_entries`, `manage_time_entry`,
+//! `list_time_entry_activities`, `import_time_entries`.
 
 use std::collections::BTreeMap;
 
@@ -76,11 +75,10 @@ fn time_entry_out(boundary: &Boundary, e: &TimeEntry) -> TimeEntryOut {
     }
 }
 
-/// D5: a user id or the literal string `"me"`, as sent by the model. Kept
+/// A user id or the literal string `"me"`, as sent by the model. Kept
 /// local to this module rather than shared with `tools/issues.rs`'s
 /// `AssignedToRef`: same shape, different underlying Redmine parameter
-/// (`user_id` here vs. `assigned_to_id` there) and only one call site each —
-/// see `plans/phase-4d-time.md` decision H3.
+/// (`user_id` here vs. `assigned_to_id` there) and only one call site each.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum UserRef {
@@ -101,7 +99,7 @@ fn resolve_user_ref(r: UserRef) -> Result<UserFilter, McpError> {
     }
 }
 
-/// H1: translate the two typed dates into Redmine's single `spent_on`
+/// Translate the two typed dates into Redmine's single `spent_on`
 /// operator-syntax filter. `None` when neither is given (no filter sent).
 fn build_spent_on(from_date: Option<NaiveDate>, to_date: Option<NaiveDate>) -> Option<String> {
     match (from_date, to_date) {
@@ -114,7 +112,7 @@ fn build_spent_on(from_date: Option<NaiveDate>, to_date: Option<NaiveDate>) -> O
 
 /// Extract `(code, message)` from `to_tool_error`'s envelope, for
 /// `import_time_entries`'s per-entry error reporting — reuses the same
-/// Redmine-error-to-text mapping every other tool uses (D4), rather than
+/// Redmine-error-to-text mapping every other tool uses, rather than
 /// inventing a second one for the batch case.
 fn describe_error(e: redmine_client::Error) -> String {
     let result = to_tool_error(e);
@@ -256,7 +254,7 @@ pub(crate) struct TimeEntryActivitiesOutput {
 // --- import_time_entries ---
 
 /// Capped per the reference contract: "split larger imports into multiple
-/// invocations" (H7). Enforced as an argument error before any request is
+/// invocations". Enforced as an argument error before any request is
 /// sent, never a silent truncation.
 const IMPORT_MAX_ENTRIES: usize = 500;
 
@@ -549,7 +547,7 @@ impl RedmineMcp {
             ));
         }
 
-        // Validate every entry and resolve every project reference (D5)
+        // Validate every entry and resolve every project reference
         // before a single HTTP request is sent — a mid-batch argument error
         // must never leave some entries created and the rest rejected for a
         // reason the model could have fixed up front.

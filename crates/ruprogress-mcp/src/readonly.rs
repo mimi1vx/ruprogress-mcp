@@ -9,45 +9,41 @@ pub mod write_tools {
     /// here into a build/test failure rather than a silent read-only-mode
     /// bypass.
     ///
-    /// The 4a discovery-tool sub-phase deliberately added nothing here: all
-    /// seven of its tools (including `list_redmine_users`, which merely
-    /// *requires* an admin credential) are reads.
+    /// `manage_redmine_version` and `manage_project_member` are listed here
+    /// in full — not gated per action like `manage_issue_relation`/
+    /// `manage_issue_category`/`manage_redmine_wiki_page` below. Both tools'
+    /// `action` enums are exclusively mutating (`create`/`update`/`delete`
+    /// and `add`/`update`/`remove`); listing versions/members is a separate
+    /// tool for each (`list_redmine_versions`/`list_project_members`), so
+    /// there is no read action inside either `manage_*` tool to preserve.
+    /// The same reasoning applies to `manage_time_entry` (`action` is
+    /// `create`/`update` only) and to `manage_issue_watcher`/
+    /// `manage_issue_note` (both `action` enums are exclusively mutating).
     ///
-    /// 4c adds `manage_redmine_version` and `manage_project_member` in full
-    /// — not per-action, unlike the parent plan's general `manage_*` gating
-    /// (D8). Both tools' `action` enums are exclusively mutating
-    /// (`create`/`update`/`delete` and `add`/`update`/`remove`); listing
-    /// versions/members is a separate tool for each
-    /// (`list_redmine_versions`/`list_project_members`), so there is no read
-    /// action inside either `manage_*` tool to preserve. See
-    /// `plans/phase-4c-projects.md` decision F1.
+    /// `import_time_entries` always writes when called, by construction, as
+    /// do `create_redmine_issue`, `update_redmine_issue`,
+    /// `delete_redmine_issue`, and `copy_issue`.
     ///
-    /// 4b-read added nothing here (all five of its tools are reads).
+    /// `manage_issue_relation` and `manage_issue_category` are deliberately
+    /// **not** here: both have a genuine `action="list"` that must survive
+    /// read-only mode (read-only mode gates per action, not per tool) — see
+    /// [`PARTIAL_WRITE`] instead.
     ///
-    /// 4d adds `manage_time_entry` (action enum is `create`/`update` only —
-    /// same "no read action to preserve" reasoning as F1) and
-    /// `import_time_entries` (always writes when called, by construction).
-    /// See `plans/phase-4d-time.md` decisions H5/H6.
+    /// `delete_file` always mutates when called; `list_files` is not here —
+    /// it is a read, matching `get_redmine_attachment`. `upload_file` always
+    /// mutates Redmine when called; `uploads[]` on `create_redmine_issue`/
+    /// `update_redmine_issue` needs no entry of its own, since both tools
+    /// are already unconditionally in this list.
     ///
-    /// 4b-write adds `create_redmine_issue`, `update_redmine_issue`,
-    /// `delete_redmine_issue`, `copy_issue` (each always mutates when
-    /// called), and `manage_issue_watcher`/`manage_issue_note` (both
-    /// `action` enums are exclusively mutating — same "no read action to
-    /// preserve" reasoning as F1/H5). `manage_issue_relation` and
-    /// `manage_issue_category` are deliberately **not** here: both have a
-    /// genuine `action="list"` that must survive read-only mode per the
-    /// parent plan's D8 ("read-only mode gates per action, not per tool") —
-    /// see [`PARTIAL_WRITE`] instead.
-    ///
-    /// 5d adds `delete_file` (always mutates when called). `list_files` is
-    /// not here: it is a read, matching `get_redmine_attachment` (5c).
-    ///
-    /// 5e adds `upload_file` (always mutates Redmine when called).
     /// `cleanup_attachment_files` is deliberately **not** here: it mutates
     /// only the local attachment store, never Redmine, so read-only mode
-    /// does not gate it (J9) — it is instead removed from the router
-    /// entirely unless `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true` (see
-    /// `server.rs`).
+    /// does not gate it — it is instead removed from the router entirely
+    /// unless `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true` (see `server.rs`).
+    ///
+    /// Every tool not mentioned above (discovery, issue reads, time entry
+    /// reads, wiki reads outside `manage_redmine_wiki_page`) is a read,
+    /// including `list_redmine_users`, which merely *requires* an admin
+    /// credential rather than mutating anything.
     pub const ALL: &[&str] = &[
         "manage_redmine_version",
         "manage_project_member",
@@ -63,7 +59,7 @@ pub mod write_tools {
         "upload_file",
     ];
 
-    /// Tools with a mix of read and write `action`s (D8): never removed from
+    /// Tools with a mix of read and write `action`s: never removed from
     /// the router by read-only mode (unlike [`ALL`]), but the write actions
     /// inside them check `config.read_only` themselves and refuse with
     /// `code: "READ_ONLY"`. Both declare `read_only_hint = false` /
@@ -71,10 +67,8 @@ pub mod write_tools {
     /// `ALL` tool — the annotation describes what the tool *can* do, not
     /// what read-only mode currently allows.
     ///
-    /// 4e adds `manage_redmine_wiki_page`: `list`/`get` are reads,
-    /// `create`/`update`/`delete`/`rename` are writes — matching the
-    /// reference contract's own documented read-only behavior for this
-    /// tool exactly. See `plans/phase-4e-search-wiki.md` decision I12.
+    /// `manage_redmine_wiki_page`: `list`/`get` are reads,
+    /// `create`/`update`/`delete`/`rename` are writes.
     pub const PARTIAL_WRITE: &[&str] = &[
         "manage_issue_relation",
         "manage_issue_category",

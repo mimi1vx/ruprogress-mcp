@@ -1,9 +1,9 @@
-//! e2e: the time-tracking tool family (4d) — happy path and dominant error
+//! e2e: the time-tracking tool family — happy path and dominant error
 //! path per tool, plus behaviours specific to this family: `list_time_entries`'
-//! `from_date`/`to_date` → `spent_on` translation (H1), `manage_time_entry`'s
+//! `from_date`/`to_date` → `spent_on` translation, `manage_time_entry`'s
 //! `comments: ""` clearing an existing value, `list_time_entry_activities`'
-//! two different wire shapes (H2), and `import_time_entries`'
-//! continue-vs-stop-on-error semantics (H6).
+//! two different wire shapes, and `import_time_entries`'
+//! continue-vs-stop-on-error semantics.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

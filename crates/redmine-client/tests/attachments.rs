@@ -1,5 +1,5 @@
 //! Happy-path and dominant-error-path tests for the attachment/Files-module
-//! client primitives (phase 5a).
+//! client primitives.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;

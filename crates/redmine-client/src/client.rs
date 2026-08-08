@@ -530,7 +530,7 @@ impl Scoped<'_> {
     /// default in `ruprogress-mcp`), far past what should ever be buffered
     /// into one `Vec`. The caller (`ruprogress-mcp`'s attachment store) owns
     /// enforcing a byte cap mid-stream and writing to disk; this crate stays
-    /// filesystem-free (parent plan decision J5).
+    /// filesystem-free.
     ///
     /// `content_url` is used as given — it is expected to be a value
     /// Redmine itself returned from an earlier call in the same scope, not
@@ -823,8 +823,8 @@ impl Scoped<'_> {
     }
 
     /// `GET /search.json`, a single explicit page — genuinely paginated on
-    /// Redmine's side (unlike the four bare-collection endpoints from 4a),
-    /// so this goes through `fetch_page`, not `get_collection`.
+    /// Redmine's side (unlike the four bare-collection endpoints), so this
+    /// goes through `fetch_page`, not `get_collection`.
     ///
     /// # Errors
     ///
@@ -1308,8 +1308,7 @@ impl Scoped<'_> {
 
     /// `GET /projects/{id}/versions.json`. Always returns every version —
     /// Redmine's endpoint has no `limit`/`offset` and no server-side status
-    /// filter (see `plans/phase-4c-projects.md` decision F1); a caller
-    /// wanting a status filter applies it client-side.
+    /// filter; a caller wanting a status filter applies it client-side.
     ///
     /// # Errors
     ///
@@ -1550,7 +1549,7 @@ impl Scoped<'_> {
 
     /// `GET /projects/{id}/wiki/{title}.json`, or
     /// `GET /projects/{id}/wiki/{title}/{version}.json` when `version` is
-    /// given — a path segment, not a query parameter (decision I14).
+    /// given — a path segment, not a query parameter.
     ///
     /// # Errors
     ///
@@ -1577,7 +1576,7 @@ impl Scoped<'_> {
     }
 
     /// `PUT /projects/{id}/wiki/{title}.json`, with no follow-up `GET`. The
-    /// `rename` mechanism (I3) uses this directly rather than
+    /// `rename` mechanism uses this directly rather than
     /// [`Self::upsert_wiki_page`]: `rename` re-fetches at the *new* title
     /// afterward regardless, so a follow-up `GET` at `title` (still the
     /// *old* title at this point) would be pure waste.
@@ -1603,7 +1602,7 @@ impl Scoped<'_> {
     /// Redmine's `PUT` answers `204`-equivalent `render_api_ok` (no body)
     /// when updating an existing page, and a full body only when creating
     /// one for the first time; fetching afterward unconditionally keeps one
-    /// code path for both `create` and `update` (decision I11).
+    /// code path for both `create` and `update`.
     ///
     /// # Errors
     ///
@@ -1620,7 +1619,7 @@ impl Scoped<'_> {
     }
 
     /// `DELETE /projects/{id}/wiki/{title}.json`. Children are un-parented
-    /// (`parent_id` set to `NULL`), never cascade-deleted — see decision I6.
+    /// (`parent_id` set to `NULL`), never cascade-deleted.
     ///
     /// # Errors
     ///
@@ -1688,8 +1687,8 @@ impl Scoped<'_> {
     }
 
     /// `POST /uploads.json`, step one of attaching a file (see
-    /// `docs/tool-contract.md` and parent plan decision J8 for the request-
-    /// body-size ceiling this sits behind on the HTTP transport). Redmine
+    /// `docs/tool-contract.md` for the request-body-size ceiling this sits
+    /// behind on the HTTP transport). Redmine
     /// 406s any request whose `Content-Type` is not exactly
     /// `application/octet-stream` — this method sets it unconditionally, so
     /// `content_type` only ever affects the *stored* attachment's recorded
@@ -1809,7 +1808,7 @@ mod tests {
         assert_eq!(url.as_str(), "https://example.com/issues.json");
     }
 
-    // --- get_collection / fetch_page (D6) ---
+    // --- get_collection / fetch_page ---
 
     #[derive(Debug, serde::Deserialize)]
     struct TestWidget {
@@ -1957,7 +1956,7 @@ mod tests {
         assert!(!page.truncated);
     }
 
-    // --- Discovery-tool API methods (4a) ---
+    // --- Discovery-tool API methods ---
 
     fn discovery_client(server: &wiremock::MockServer) -> RedmineClient {
         RedmineClientBuilder::new(server.uri().parse().unwrap())
@@ -2109,7 +2108,7 @@ mod tests {
         assert!(!page.truncated);
     }
 
-    // --- Project-management tool API methods (4c) ---
+    // --- Project-management tool API methods ---
 
     #[tokio::test]
     async fn list_versions_tolerates_a_total_count_field_with_no_offset_or_limit() {
@@ -2561,7 +2560,7 @@ mod tests {
         assert!(page.items.is_empty());
     }
 
-    // --- Time-tracking API methods (4d) ---
+    // --- Time-tracking API methods ---
 
     fn sample_time_entry_json(id: u64, hours: f64) -> serde_json::Value {
         serde_json::json!({
@@ -2702,7 +2701,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- Search & wiki API methods (4e) ---
+    // --- Search & wiki API methods ---
 
     #[tokio::test]
     async fn search_entire_page_sends_a_flag_for_each_requested_resource() {

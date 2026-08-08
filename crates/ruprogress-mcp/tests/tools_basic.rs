@@ -392,7 +392,7 @@ async fn get_mcp_server_info_never_leaks_the_redmine_host() {
     );
 }
 
-// --- Sub-phase 4.0: structured output, schemas, and annotations (D1/D2/D7) ---
+// --- Structured output, schemas, and annotations ---
 
 #[tokio::test]
 async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_annotations() {
@@ -410,7 +410,7 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
         assert_eq!(
             schema.get("type").and_then(Value::as_str),
             Some("object"),
-            "{}'s outputSchema root must be \"type\": \"object\" (D2)",
+            "{}'s outputSchema root must be \"type\": \"object\"",
             tool.name
         );
         let annotations = tool
@@ -420,7 +420,7 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
         // A tool "mutates Redmine" (for annotation purposes) if it is
         // removed from the router entirely in read-only mode (`ALL`), or if
         // it has at least one write `action` gated internally rather than
-        // by router removal (`PARTIAL_WRITE`, D8) — either way
+        // by router removal (`PARTIAL_WRITE`) — either way
         // `read_only_hint` describes what the tool *can* do, not whether
         // read-only mode currently allows all of it.
         let is_write_tool = ruprogress_mcp::readonly::write_tools::ALL
@@ -429,7 +429,7 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
         assert_eq!(
             annotations.read_only_hint,
             Some(!is_write_tool),
-            "{} should be annotated read_only_hint = {} (D7)",
+            "{} should be annotated read_only_hint = {}",
             tool.name,
             !is_write_tool
         );
@@ -437,7 +437,7 @@ async fn every_implemented_tool_declares_an_object_output_schema_and_read_only_a
             assert_eq!(
                 annotations.destructive_hint,
                 Some(true),
-                "{} mutates Redmine and should declare destructive_hint (D7)",
+                "{} mutates Redmine and should declare destructive_hint",
                 tool.name
             );
         }
@@ -554,8 +554,8 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         })))
         .mount(&h.redmine)
         .await;
-    // Empty results: `search_redmine_issues` short-circuits before hydrating
-    // (G3), so no `/issues.json?issue_id=...` mock is needed here.
+    // Empty results: `search_redmine_issues` short-circuits before hydrating,
+    // so no `/issues.json?issue_id=...` mock is needed here.
     Mock::given(method("GET"))
         .and(path("/search.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -600,10 +600,10 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         .await
         .expect("list_tools should succeed");
     for tool in &tools.tools {
-        // Write tools (`manage_*` with no read-only action, see D8/F1) are
-        // exercised in `tests/tools_projects.rs`/`tests/tools_time.rs`/
+        // Write tools (`manage_*` with no read-only action) are exercised
+        // in `tests/tools_projects.rs`/`tests/tools_time.rs`/
         // `tests/tools_issues_write.rs` instead, with real request/response
-        // bodies per action. `PARTIAL_WRITE` tools (D8's mixed-action case)
+        // bodies per action. `PARTIAL_WRITE` tools (the mixed-action case)
         // are exercised in `tests/tools_issues_write.rs` too, since their
         // `action` parameter needs a value this loop does not supply.
         if ruprogress_mcp::readonly::write_tools::ALL.contains(&tool.name.as_ref())
@@ -680,39 +680,18 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
     }
 }
 
-/// Phase 4 Risk 3: 36 tools × (description + input schema + output schema) is
-/// materially more `tools/list` JSON than the reference server's 36 × two
-/// schemas. This is the baseline measurement the remaining sub-phases are
-/// checked against — a generous threshold, not a tight one, so it fails loud
-/// and early if a future sub-phase balloons descriptions or schemas rather
-/// than silently degrading context budgets.
-///
-/// Revised at 4b-read (22 tools, ~2.3 KiB/tool observed): the original
-/// 50 000-byte figure was set before any tool existed and turned out too
-/// tight by the time discovery (4a) + projects (4c) + issue reads (4b-read)
-/// landed. 100 000 leaves headroom for the ~14 tools still to come (4d,
-/// 4b-write, 4e, 4f, 4g) at the same per-tool rate, while still catching a
-/// sub-phase that blows the budget outright.
-///
-/// Revised again at 4e (36 tools, 106 813 bytes observed, ~2.97 KiB/tool —
-/// `manage_redmine_wiki_page`'s six-action, mostly-optional parameter set is
-/// this sub-phase's widest input schema, per its own Risk 3): 100 000 no
-/// longer has headroom even for 4e's own two tools. 120 000 leaves room for
-/// 4f's single `get_gantt_chart` tool and 4g's `get_mcp_server_info`
-/// extension (no new tool, more output fields) at the same per-tool rate,
-/// while still catching a runaway sub-phase.
-///
-/// 4f lands `get_gantt_chart` (37 tools, 111 038 bytes observed): 120 000
-/// still has headroom, and 4g needs no new tool (the `get_mcp_server_info`
-/// extension already landed as part of 4.0's retrofit) — this is the final
-/// tool the Phase 4 core-tools threshold needs to cover.
-///
-/// Revised at 5e (41 tools including `upload_file`'s multi-field input
-/// schema, 121 008 bytes observed): 120 000 no longer has headroom. 135 000
-/// leaves room for 5f (no new tool, `uploads[]` added to two existing input
-/// schemas) at a similar per-tool rate.
+/// `tools/list` JSON (description + input schema + output schema per tool)
+/// is materially larger than a minimal reference implementation's. This is
+/// a generous, not a tight, threshold on the total serialized size, so it
+/// fails loud and early if a tool's descriptions or schemas balloon rather
+/// than silently degrading context budgets. Revised upward each time new
+/// tools or wider input schemas (like `manage_redmine_wiki_page`'s
+/// six-action parameter set or `upload_file`'s/`uploads[]`'s multi-field
+/// shapes) push the observed size close to the current limit; currently
+/// 135 000 bytes for 41 tools (~121 000 observed), leaving headroom for
+/// future growth at a similar per-tool rate.
 #[tokio::test]
-async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold() {
+async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
     let h = support::harness(&[]).await;
     let tools = h
         .client
@@ -722,7 +701,7 @@ async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold()
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
         bytes.len() < 135_000,
-        "tools/list is {} bytes for {} tools; over the 5e baseline threshold of 135000",
+        "tools/list is {} bytes for {} tools; over the 135000 baseline threshold",
         bytes.len(),
         tools.tools.len()
     );

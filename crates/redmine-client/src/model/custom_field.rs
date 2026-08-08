@@ -78,8 +78,8 @@ struct PossibleValue {
 /// value attached to one resource. Redmine's `is_required` here is the
 /// definition's own flag; workflow rules and per-tracker settings can still
 /// make a field effectively required without it being reflected here (see
-/// `plans/phase-4c-projects.md` and the reference tool-reference.md caveat
-/// on `list_project_issue_custom_fields`).
+/// the reference tool-reference.md caveat on
+/// `list_project_issue_custom_fields`).
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CustomFieldDefinition {

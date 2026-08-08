@@ -159,14 +159,14 @@ pub(crate) async fn http_harness(env: &[(&str, &str)]) -> HttpHarness {
     }
 }
 
-/// Assert `result.structured_content` is present, is a JSON **object** (D2),
+/// Assert `result.structured_content` is present, is a JSON **object**,
 /// and validates against `schema` (a tool's declared `outputSchema`).
 ///
 /// This is a minimal structural check — object/array/scalar `type`,
 /// `properties`, `required`, array `items` — not a general JSON Schema
 /// validator. Sufficient for our own hand-written, deliberately flat output
-/// schemas (see phase-4-core-tools.md Risk 3); adopt a real validator crate
-/// if a future schema needs `anyOf`/`oneOf`/`$ref`.
+/// schemas; adopt a real validator crate if a future schema needs
+/// `anyOf`/`oneOf`/`$ref`.
 pub(crate) fn assert_structured_content_matches_schema(
     result: &rmcp::model::CallToolResult,
     schema: &serde_json::Map<String, serde_json::Value>,
@@ -177,7 +177,7 @@ pub(crate) fn assert_structured_content_matches_schema(
         .expect("tool result must carry structured_content");
     assert!(
         structured.is_object(),
-        "structuredContent must be a JSON object per D2, got {structured}"
+        "structuredContent must be a JSON object, got {structured}"
     );
     assert_schema(structured, &serde_json::Value::Object(schema.clone()), "$");
 }

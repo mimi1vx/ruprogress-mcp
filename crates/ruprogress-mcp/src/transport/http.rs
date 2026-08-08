@@ -140,13 +140,12 @@ fn cors_layer(cfg: &HttpConfig) -> Option<CorsLayer> {
     )
 }
 
-/// `GET /files/{uuid}`: serves a stored attachment (phase 5c wires the tool
-/// that populates the store; this route just serves what is there).
+/// `GET /files/{uuid}`: serves a stored attachment (a separate tool
+/// populates the store; this route just serves what is there).
 ///
-/// Reuses `HttpConfig::allowed_hosts` for a `Host` allowlist check (decision
-/// J10/K7 in `plans/phase-5b-store-and-route.md`): rmcp's own `Host` check
-/// runs only inside `StreamableHttpService`, so a route mounted ourselves
-/// needs its own copy of the same check, not a weaker one.
+/// Reuses `HttpConfig::allowed_hosts` for a `Host` allowlist check: rmcp's
+/// own `Host` check runs only inside `StreamableHttpService`, so a route
+/// mounted ourselves needs its own copy of the same check, not a weaker one.
 fn files_route(store: Arc<AttachmentStore>, allowed_hosts: Vec<String>) -> Router {
     Router::new()
         .route("/files/{uuid}", get(serve_file))
@@ -291,8 +290,8 @@ fn content_disposition(filename: &str) -> http::HeaderValue {
 
 /// A `Content-Type` built from Redmine-supplied data must be validated as a
 /// well-formed header value before use: Redmine's `content_type` is
-/// attacker-influenced (decision in `plans/phase-5b-store-and-route.md`),
-/// and a value containing e.g. embedded CRLF must not reach the response.
+/// attacker-influenced, and a value containing e.g. embedded CRLF must not
+/// reach the response.
 fn content_type_header(content_type: Option<&str>) -> http::HeaderValue {
     content_type
         .and_then(|ct| http::HeaderValue::from_str(ct).ok())

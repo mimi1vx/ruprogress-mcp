@@ -1,5 +1,5 @@
-//! `GET /files/{uuid}` (phase 5b): serving, expiry, and the `/files`-scoped
-//! `Host` allowlist check (decision J10/K7), asserted with raw `reqwest`
+//! `GET /files/{uuid}`: serving, expiry, and the `/files`-scoped
+//! `Host` allowlist check, asserted with raw `reqwest`
 //! against the real router — same style as `tests/http_edge.rs`.
 #![allow(
     clippy::unwrap_used,

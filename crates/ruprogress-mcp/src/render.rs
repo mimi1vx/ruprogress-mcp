@@ -6,7 +6,7 @@
 //!
 //! The delimiter scheme itself is explained once per session in
 //! `ServerInfo::instructions` (see `server.rs`), not repeated in every tool
-//! response — see ADR-worthy decision D3 in `plans/phase-4-core-tools.md`.
+//! response.
 
 /// Per-response random nonce used to delimit untrusted content. A fixed
 /// delimiter can be forged by anyone who reads the source; a nonce cannot.

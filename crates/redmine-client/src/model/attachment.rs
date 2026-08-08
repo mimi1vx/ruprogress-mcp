@@ -10,12 +10,10 @@
 //! `content_url`, an optional `thumbnail_url`, `author`, and `created_on`.
 //! It never renders the container. Redmine's `Attachment` model *has*
 //! `container_type`/`container_id` columns (it is a polymorphic
-//! association), but the API never exposes them. This closes the "Open
-//! verification item for 5a" in `plans/phase-5-files.md`: `delete_file`
-//! (5d) cannot implement a container-type scope check from this response
-//! and must fall back to unconditionally requiring
-//! `confirm_delete_any_attachment`, per that plan's own documented
-//! contingency.
+//! association), but the API never exposes them. As a result `delete_file`
+//! cannot implement a container-type scope check from this response and
+//! must fall back to unconditionally requiring
+//! `confirm_delete_any_attachment`.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;

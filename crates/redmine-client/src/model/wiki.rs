@@ -1,5 +1,5 @@
 //! `GET/PUT/DELETE /projects/{id}/wiki/{title}`, `GET
-//! /projects/{id}/wiki/index` — see `plans/phase-4e-search-wiki.md`.
+//! /projects/{id}/wiki/index`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,7 @@ pub(crate) struct WikiPageEnvelope {
 
 /// The body of a `PUT /projects/{id}/wiki/{title}.json` request — Redmine's
 /// single upsert endpoint for `create`, `update`, and (via `title`)
-/// `rename` (decision I11/I3).
+/// `rename`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WikiPageWrite {
     /// Page content. Required on every write: `WikiContent` validates its
@@ -108,8 +108,8 @@ pub struct WikiPageWrite {
     /// Change-log comment for this revision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comments: Option<String>,
-    /// A new title — the `rename` mechanism (I3). Silently dropped by
-    /// Redmine if the credential lacks `rename_wiki_pages` (I5): callers
+    /// A new title — the `rename` mechanism. Silently dropped by
+    /// Redmine if the credential lacks `rename_wiki_pages`: callers
     /// must re-fetch at the new title to confirm the rename actually took
     /// effect.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,7 +117,7 @@ pub struct WikiPageWrite {
     /// `Some("0")` to suppress the `WikiRedirect` `rename` would otherwise
     /// leave behind; `None` (Redmine's own default) to create it.
     ///
-    /// **Must** be the string `"0"`, never a JSON boolean (decision I4):
+    /// **Must** be the string `"0"`, never a JSON boolean:
     /// Redmine's `handle_rename_or_move` checks `redirect_existing_links ==
     /// "0"`, and a JSON-decoded `false` is not `== "0"` in Ruby, so sending
     /// `false` would silently fail to suppress the redirect.

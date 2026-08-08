@@ -10,7 +10,7 @@ use rmcp::ErrorData as McpError;
 /// Redmine API error. Stays a protocol error for the same reason the
 /// `LegacyPerUser`/`OAuth` "not implemented" arms next to this call site in
 /// `server.rs::scoped` do: it happens before any tool's Redmine request is
-/// even attempted, so `error::to_tool_error`'s Redmine-error envelope (D4)
+/// even attempted, so `error::to_tool_error`'s Redmine-error envelope
 /// does not apply.
 pub(crate) fn scoped(client: &RedmineClient) -> Result<Scoped<'_>, McpError> {
     client

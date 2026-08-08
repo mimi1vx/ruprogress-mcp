@@ -1,4 +1,4 @@
-//! Maps `redmine_client::Error` to the in-band tool-error envelope (D4):
+//! Maps `redmine_client::Error` to the in-band tool-error envelope:
 //! `{error, code, retryable, hint}`, returned as a normal `CallToolResult`
 //! with `isError: true` so the model can see and react to it, rather than as
 //! a protocol-level `McpError`. Shared by every tool so error text is

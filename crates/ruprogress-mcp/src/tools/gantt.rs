@@ -1,11 +1,10 @@
 //! Gantt tool: `get_gantt_chart`.
 //!
 //! Pure projection over existing `redmine-client` primitives (`get_project`,
-//! `list_issues_page`, `list_versions`) — no new client work, per
-//! `plans/phase-4f-gantt.md`. Dependency edges are drawn from `Issue.parent`
-//! (already present on the default `GET /issues.json` response) rather than
-//! a per-issue relations fetch, which would be an uncapped N+1 over up to
-//! 500 issues (decision J1).
+//! `list_issues_page`, `list_versions`) — no new client work. Dependency
+//! edges are drawn from `Issue.parent` (already present on the default
+//! `GET /issues.json` response) rather than a per-issue relations fetch,
+//! which would be an uncapped N+1 over up to 500 issues.
 
 use chrono::NaiveDate;
 use redmine_client::model::issue::{IssueQuery, StatusFilter};
@@ -27,7 +26,7 @@ const GANTT_MIN_LIMIT: u32 = 1;
 const GANTT_MAX_LIMIT: u32 = 500;
 const GANTT_DEFAULT_LIMIT: u32 = 100;
 
-/// Clamp to \[1, 500\] (J5/E4): a value outside the range is silently
+/// Clamp to \[1, 500\]: a value outside the range is silently
 /// corrected rather than rejected; the effective value is echoed back in
 /// `pagination.limit`.
 fn clamp_gantt_limit(limit: Option<u32>) -> u32 {
@@ -62,14 +61,14 @@ pub(crate) struct GanttIssueOut {
     pub(crate) id: u64,
     pub(crate) subject: String,
     /// Not boundary-wrapped: tracker names are instance configuration, same
-    /// treatment as elsewhere in this codebase (4a).
+    /// treatment as elsewhere in this codebase.
     pub(crate) tracker: String,
     pub(crate) status: String,
     pub(crate) start_date: Option<NaiveDate>,
     pub(crate) due_date: Option<NaiveDate>,
     pub(crate) done_ratio: Option<u8>,
     /// The parent issue's id, if this is a sub-issue — the hierarchy edge
-    /// to draw on the chart (J1: no separate relations fetch).
+    /// to draw on the chart; no separate relations fetch is needed.
     pub(crate) parent_id: Option<u64>,
 }
 
@@ -103,8 +102,8 @@ pub(crate) struct GanttChartOutput {
 
 #[tool_router(router = gantt_tool_router, vis = "pub(crate)")]
 impl RedmineMcp {
-    /// `GET /issues.json` (date-filtered, one bounded page, J6) plus
-    /// `GET /projects/{id}/versions.json` for milestones (J2).
+    /// `GET /issues.json` (date-filtered, one bounded page) plus
+    /// `GET /projects/{id}/versions.json` for milestones.
     #[tool(
         description = "Build a Gantt-chart projection for a project: issues with start/due dates, percent-done, and parent hierarchy, plus the project's versions as milestones. Use this when the user wants a timeline or roadmap view rather than a flat issue list. Defaults to open issues only; set include_closed=true for a full historical timeline.",
         input_schema = crate::tools::schema::input::<GetGanttChartParams>(),
@@ -142,7 +141,7 @@ impl RedmineMcp {
         }
 
         // Concurrent, not spawned: `Scoped<'a>` borrows the credential, same
-        // reasoning as `summarize_project_status` (F2) — `try_join!` gives a
+        // reasoning as `summarize_project_status` — `try_join!` gives a
         // fixed, three-request fan-out that never grows with project size.
         let result = tokio::try_join!(
             scoped.get_project(&project_ident, &[]),

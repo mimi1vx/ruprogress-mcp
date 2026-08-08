@@ -1,7 +1,7 @@
 //! `GET /search.json` — Redmine's cross-resource text search, used here
 //! restricted to issues (`search_redmine_issues`). Genuinely paginated
 //! (`SearchController#index` calls `api_offset_and_limit` for the API
-//! format), unlike the four bare-collection endpoints from 4a.
+//! format), unlike the four bare-collection endpoints.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -10,8 +10,7 @@ use super::{Collection, permissive_datetime};
 
 /// One search hit. Deliberately thin — Redmine's search index never embeds
 /// a full issue dict, only enough to identify and rank the match. Callers
-/// that need full issue fields hydrate the ids via a second call (see
-/// `plans/phase-4b-issues.md` decision G3).
+/// that need full issue fields hydrate the ids via a second call.
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult {
@@ -46,7 +45,7 @@ pub enum SearchScope {
     /// `my_projects` (plural) — Redmine has no singular `my_project` value;
     /// sending the reference contract's documented (singular) parameter
     /// name verbatim would silently degrade to `All` instead of restricting
-    /// anything. See `plans/phase-4b-issues.md` decision G1.
+    /// anything.
     MyProject,
     /// Restrict to the current project and its descendants. Degenerate
     /// (behaves like `All`) when no project context exists, which is always
@@ -68,10 +67,9 @@ impl SearchScope {
 /// Which Redmine search-index scope(s) `search_entire_redmine` restricts to.
 /// Wire query flags are additive (`issues=1`, `wiki_pages=1`) — Redmine's
 /// `SearchController` ORs together whichever recognized-type flags are
-/// present and only falls back to "every type" when none are given at all
-/// (`plans/phase-4e-search-wiki.md` decision I1). This client always sends
-/// an explicit flag per requested resource rather than relying on that
-/// fallback.
+/// present and only falls back to "every type" when none are given at all.
+/// This client always sends an explicit flag per requested resource rather
+/// than relying on that fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchResource {
     /// Issues.
@@ -83,7 +81,7 @@ pub enum SearchResource {
 impl SearchResource {
     /// The `search.json` query flag for this resource — also used as the
     /// bucket name in `search_entire_redmine`'s output `type`/
-    /// `results_by_type` fields (decision I2).
+    /// `results_by_type` fields.
     #[must_use]
     pub const fn wire_param(self) -> &'static str {
         match self {
@@ -116,9 +114,9 @@ pub struct EntireSearchQuery {
     /// The search text.
     pub q: String,
     /// Which resource types to search. Each is sent as its own `=1` flag;
-    /// an empty list would (per I1) fall back to Redmine's "every
-    /// registered type" default — callers should pass the full set
-    /// explicitly instead of relying on that.
+    /// an empty list would fall back to Redmine's "every registered type"
+    /// default — callers should pass the full set explicitly instead of
+    /// relying on that.
     pub resources: Vec<SearchResource>,
 }
 

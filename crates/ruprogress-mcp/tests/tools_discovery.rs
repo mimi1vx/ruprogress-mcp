@@ -1,7 +1,7 @@
-//! e2e: the discovery-tool family (4a) — happy path and dominant error path
+//! e2e: the discovery-tool family — happy path and dominant error path
 //! per tool, plus the two behaviours specific to this family: `limit`
-//! clamping on `list_redmine_users` (E4) and `list_project_trackers`
-//! rejecting a hostile project identifier as an argument error (D5).
+//! clamping on `list_redmine_users` and `list_project_trackers`
+//! rejecting a hostile project identifier as an argument error.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

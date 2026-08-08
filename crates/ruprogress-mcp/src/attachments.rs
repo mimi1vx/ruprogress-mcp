@@ -1,11 +1,11 @@
-//! The local attachment store (phase 5b): a `{uuid}/{sanitised_basename}`
-//! on-disk layout (parent plan decision J6) behind an in-memory
+//! The local attachment store: a `{uuid}/{sanitised_basename}`
+//! on-disk layout behind an in-memory
 //! `HashMap<Uuid, StoredFile>`, plus a background sweeper.
 //!
-//! No MCP tool calls into this module yet — `get_redmine_attachment` (5c)
+//! No MCP tool calls into this module yet — `get_redmine_attachment`
 //! streams a download into [`AttachmentStore::reserve`]/[`AttachmentStore::commit`],
-//! and `upload_file`/`cleanup_attachment_files` (5e) are the other consumers.
-//! Disk-writing lives here and nowhere in `redmine-client` (decision J5):
+//! and `upload_file`/`cleanup_attachment_files` are the other consumers.
+//! Disk-writing lives here and nowhere in `redmine-client`:
 //! that crate's `download_attachment` returns a byte stream and nothing else.
 
 use std::collections::HashMap;
@@ -31,17 +31,17 @@ pub struct StoredFile {
     pub attachment_id: u64,
     /// The sanitised basename actually written to disk — see
     /// [`sanitize_basename`]. Load-bearing for stdio clients that hand
-    /// `file_path` to another local tool dispatching on the extension (J6).
+    /// `file_path` to another local tool dispatching on the extension.
     pub filename: String,
     pub content_type: Option<String>,
     pub size: u64,
     pub path: PathBuf,
     /// Wall-clock expiry, for API responses (`get_redmine_attachment`'s
-    /// `expires_at`, 5c).
+    /// `expires_at`).
     pub expires_at: chrono::DateTime<chrono::Utc>,
     /// Monotonic clock captured at `commit` time, checked by every
-    /// [`AttachmentStore::get`] independently of the sweeper's interval
-    /// (decision K2): the sweeper reclaims disk space between lookups, but
+    /// [`AttachmentStore::get`] independently of the sweeper's interval:
+    /// the sweeper reclaims disk space between lookups, but
     /// must not be the thing standing between a caller and an accurate
     /// "expired" answer.
     created_at: Instant,
@@ -49,7 +49,7 @@ pub struct StoredFile {
 
 /// A reserved-but-not-yet-registered download slot: the UUID directory has
 /// been created and the sanitised destination path chosen, but nothing has
-/// been written yet. The caller (5c) streams bytes to `path`, then calls
+/// been written yet. The caller streams bytes to `path`, then calls
 /// [`AttachmentStore::commit`] on success or [`AttachmentStore::abort`] on
 /// failure or a mid-stream cap trip.
 #[derive(Debug)]
@@ -59,7 +59,7 @@ pub struct Reservation {
     pub path: PathBuf,
 }
 
-/// Result of a sweep pass, used by the background sweeper and (in 5e) by
+/// Result of a sweep pass, used by the background sweeper and by
 /// `cleanup_attachment_files`'s `{cleaned_files, cleaned_bytes, cleaned_mb}`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepResult {
@@ -69,7 +69,7 @@ pub struct SweepResult {
 
 /// Keeps only the last [`Component::Normal`] of `name` (stripping any
 /// `RootDir`/`Prefix`/`CurDir`/`ParentDir` component the *host* platform's
-/// separator rules would recognise — decision K8), then strips control
+/// separator rules would recognise), then strips control
 /// characters and caps the length. A name that sanitises to nothing becomes
 /// literally `"attachment"`.
 ///
@@ -96,7 +96,7 @@ fn sanitize_basename(name: &str) -> String {
 }
 
 /// Sets a directory to `0700` on Unix. A no-op (plus a one-time `WARN` from
-/// the caller) on other platforms — see [`AttachmentConfig`] / decision J4.
+/// the caller) on other platforms — see [`AttachmentConfig`].
 #[cfg(unix)]
 fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -133,7 +133,7 @@ async fn dir_size(path: &Path) -> u64 {
 }
 
 /// The local attachment store: on-disk files plus the in-memory index that
-/// is the source of truth for serving them (J6).
+/// is the source of truth for serving them.
 #[derive(Debug)]
 pub struct AttachmentStore {
     dir: PathBuf,
@@ -145,7 +145,7 @@ pub struct AttachmentStore {
 
 impl AttachmentStore {
     /// Creates `ATTACHMENTS_DIR` (`0700` on Unix; a `WARN` on other
-    /// platforms, since permissions there depend on inherited ACLs — J4).
+    /// platforms, since permissions there depend on inherited ACLs).
     ///
     /// # Errors
     ///
@@ -185,7 +185,7 @@ impl AttachmentStore {
     }
 
     /// Whether `additional_bytes` more would still fit under
-    /// `ATTACHMENT_STORE_MAX_BYTES` (J11). Callers (5c) should sweep expired
+    /// `ATTACHMENT_STORE_MAX_BYTES`. Callers should sweep expired
     /// entries first if this returns `false`, then re-check before refusing
     /// with `STORE_FULL`.
     pub async fn has_room_for(&self, additional_bytes: u64) -> bool {
@@ -259,7 +259,7 @@ impl AttachmentStore {
     }
 
     /// Looks up a stored file by UUID. `None` for an unknown UUID *and* for
-    /// one whose TTL has passed (K2) — the latter case removes the entry
+    /// one whose TTL has passed — the latter case removes the entry
     /// (map and disk) immediately rather than waiting for the sweeper.
     pub async fn get(&self, id: Uuid) -> Option<StoredFile> {
         let mut entries = self.entries.lock().await;
@@ -280,7 +280,7 @@ impl AttachmentStore {
     }
 
     /// Walks `ATTACHMENTS_DIR` directly and removes every subdirectory whose
-    /// mtime is at least `expires_after` old (decision K1): this is the one
+    /// mtime is at least `expires_after` old: this is the one
     /// mechanism that reclaims disk space both during normal operation and
     /// for a predecessor process's orphans after a restart, since the
     /// in-memory map starts empty either way.
@@ -554,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_removes_a_stale_orphan_directory_with_an_empty_map() {
-        // Simulates a restarted process (J6): the directory predates this
+        // Simulates a restarted process: the directory predates this
         // `AttachmentStore` entirely, so the in-memory map has never heard
         // of it, yet the sweep must still reclaim it via mtime.
         let dir = temp_dir("orphan-sweep");

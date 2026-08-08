@@ -1,5 +1,5 @@
-//! e2e: the Gantt tool family (4f) — `get_gantt_chart`'s happy path,
-//! `include_closed`/date-filter query params, `limit` clamping (J5), and
+//! e2e: the Gantt tool family — `get_gantt_chart`'s happy path,
+//! `include_closed`/date-filter query params, `limit` clamping, and
 //! the dominant error path.
 #![allow(
     clippy::unwrap_used,

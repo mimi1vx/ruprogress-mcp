@@ -47,8 +47,7 @@ pub(crate) struct VersionEnvelope {
 /// `@project.shared_versions.to_a` in full) and always equals the returned
 /// array's length, so there is nothing to reconcile it against. This is
 /// neither a [`super::Collection`] (no `offset`/`limit`) nor a
-/// [`super::BareCollection`] (does carry `total_count`) — see
-/// `plans/phase-4c-projects.md` decision F1. Models are never
+/// [`super::BareCollection`] (does carry `total_count`). Models are never
 /// `deny_unknown_fields`, so the extra field is silently ignored rather than
 /// needing to be named here.
 #[derive(Debug, Deserialize)]

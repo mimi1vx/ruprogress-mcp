@@ -145,8 +145,6 @@ async fn update_issue_dominant_error_422() {
     }
 }
 
-// --- 4b-write ---
-
 #[tokio::test]
 async fn delete_issue_succeeds_on_204() {
     let (server, client) = support::mock_redmine().await;
