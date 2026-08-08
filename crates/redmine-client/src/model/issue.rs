@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::attachment::Attachment;
 use super::journal::Journal;
 use super::relation::IssueRelation;
+use super::upload::UploadRef;
 use super::{
     Collection, CustomField, IdName, IdOnly, permissive_datetime, permissive_datetime_opt,
 };
@@ -85,7 +86,7 @@ pub struct Issue {
     pub custom_fields: Option<Vec<CustomField>>,
     /// Journal entries (notes and field-change history). `None` when
     /// `include=journals` was not requested; `Some(vec![])` when requested
-    /// and the issue has none. Same convention as `Project.trackers` (4a).
+    /// and the issue has none. Same convention as `Project.trackers`.
     #[serde(default)]
     pub journals: Option<Vec<Journal>>,
     /// File attachments. `None` = not requested, `Some(vec![])` = none.
@@ -109,8 +110,7 @@ pub struct Issue {
 
 /// One level of `Issue.children`. Redmine's own `render_api_issue_children`
 /// nests arbitrarily deep; this client stops at two levels total (this type
-/// plus [`IssueChildLeaf`]) — see `plans/phase-4b-issues.md` decision G4. A
-/// grandchild beyond that is simply absent from the JSON, not truncated with
+/// plus [`IssueChildLeaf`]). A grandchild beyond that is simply absent from the JSON, not truncated with
 /// a signal: a caller who needs the full tree uses `list_subtasks`
 /// recursively, one level at a time.
 #[non_exhaustive]
@@ -130,7 +130,7 @@ pub struct IssueChild {
 }
 
 /// The deepest level of nesting under `Issue.children` this client models
-/// (see [`IssueChild`] and decision G4). Carries no further `children`
+/// (see [`IssueChild`]). Carries no further `children`
 /// field at all, by design.
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
@@ -193,6 +193,11 @@ pub struct IssueCreate {
     /// Whether the issue is private.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_private: Option<bool>,
+    /// Files to attach as part of this same request, via upload tokens
+    /// already obtained from `POST /uploads.json`. Empty by
+    /// default, in which case the key is omitted entirely.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uploads: Vec<UploadRef>,
 }
 
 impl IssueCreate {
@@ -216,6 +221,7 @@ impl IssueCreate {
             done_ratio: None,
             estimated_hours: None,
             is_private: None,
+            uploads: Vec::new(),
         }
     }
 }
@@ -225,8 +231,7 @@ impl IssueCreate {
 /// There is no supported way to *clear* `assigned_to_id`/`category_id`/
 /// `fixed_version_id`/`parent_issue_id` back to unset through this type —
 /// Redmine accepts an empty string for that over the wire, but this client
-/// only ever sends a present value or omits the field entirely (see
-/// `plans/phase-4b-issues.md` 4b-write decisions).
+/// only ever sends a present value or omits the field entirely.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IssueUpdate {
     /// New subject, if changing it.
@@ -278,6 +283,11 @@ pub struct IssueUpdate {
     /// Redmine when `notes` is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_notes: Option<bool>,
+    /// Files to attach as part of this same request, via upload tokens
+    /// already obtained from `POST /uploads.json`. Empty by
+    /// default, in which case the key is omitted entirely.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uploads: Vec<UploadRef>,
 }
 
 /// `include=` values accepted by the issue endpoints.
@@ -505,6 +515,39 @@ mod tests {
             .unwrap();
         assert_eq!(obj["subject"], "New issue");
         assert!(!obj.contains_key("tracker_id"));
+        assert!(!obj.contains_key("uploads"));
+    }
+
+    #[test]
+    fn issue_create_serializes_uploads_when_set() {
+        let mut create = IssueCreate::new(
+            ProjectIdent::Identifier("demo".parse().unwrap()),
+            "New issue",
+        );
+        create.uploads = vec![UploadRef {
+            token: "42.abcdef0123456789".to_string(),
+            description: Some("a report".to_string()),
+        }];
+        let value = serde_json::to_value(IssueCreateEnvelope { issue: &create }).unwrap();
+        let uploads = value
+            .get("issue")
+            .and_then(|issue| issue.get("uploads"))
+            .unwrap();
+        assert_eq!(
+            *uploads,
+            serde_json::json!([{"token": "42.abcdef0123456789", "description": "a report"}])
+        );
+    }
+
+    #[test]
+    fn issue_update_omits_uploads_when_empty() {
+        let patch = IssueUpdate::default();
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        let obj = value
+            .get("issue")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert!(!obj.contains_key("uploads"));
     }
 
     #[test]

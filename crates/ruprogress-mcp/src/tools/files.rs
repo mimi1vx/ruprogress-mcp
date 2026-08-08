@@ -28,11 +28,10 @@ use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::issues::{IdNameOut, id_name_out};
-use crate::tools::output::{self, ErrorCode, err};
+use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, err};
 
-/// `upload_file`'s own per-file cap for the `file_path` source (decision N5
-/// in `plans/phase-5e-upload-and-cleanup.md`): independent of
-/// `ATTACHMENT_MAX_DOWNLOAD_BYTES`, which bounds the opposite direction
+/// `upload_file`'s own per-file cap for the `file_path` source: independent
+/// of `ATTACHMENT_MAX_DOWNLOAD_BYTES`, which bounds the opposite direction
 /// (Redmine → local disk). Matches the vendored reference contract's
 /// documented 50 MiB limit; not configurable, since it is a fixed property
 /// of this server's `upload_file` implementation, not a deployment choice.
@@ -101,15 +100,18 @@ fn local_storage_error(context: &str) -> CallToolResult {
     )
 }
 
-fn source_required() -> CallToolResult {
+/// `context` names whichever field this arity check is guarding — e.g.
+/// `"upload_file"` or `"uploads[2]"` (issue uploads reuse this too) — so the
+/// message reads correctly regardless of caller.
+pub(crate) fn source_required(context: &str) -> CallToolResult {
     err(
         ErrorCode::SourceRequired,
-        "upload_file requires exactly one of content_base64 or file_path",
+        format!("{context} requires exactly one of content_base64 or file_path"),
         Some("set exactly one source field and retry"),
     )
 }
 
-fn unsupported_source() -> CallToolResult {
+pub(crate) fn unsupported_source() -> CallToolResult {
     err(
         ErrorCode::UnsupportedSource,
         "source_url is not supported by this server; use content_base64 or file_path instead",
@@ -129,11 +131,11 @@ fn path_not_allowed() -> CallToolResult {
     )
 }
 
-fn upload_file_path_too_large(actual: u64) -> CallToolResult {
+fn upload_path_too_large(actual: u64) -> CallToolResult {
     err(
         ErrorCode::FileTooLarge,
         format!(
-            "the file is {actual} bytes, larger than upload_file's {UPLOAD_FILE_MAX_BYTES}-byte limit"
+            "the file is {actual} bytes, larger than the {UPLOAD_FILE_MAX_BYTES}-byte per-file upload limit"
         ),
         Some(
             "this server cannot upload a file this large; split the content or upload it to Redmine some other way",
@@ -151,13 +153,36 @@ fn upload_rejected_as_too_large() -> CallToolResult {
     )
 }
 
-/// Validates a `file_path` upload source per decision N4
-/// (`plans/phase-5e-upload-and-cleanup.md`): reject non-absolute paths,
-/// canonicalise, prefix-check against `roots` plus `store_dir` (N3), stat
+/// Mints one upload token via `POST /uploads.json`, remapping a 413/422 from
+/// *this specific step* to `FILE_TOO_LARGE` — a size condition, not a
+/// validation one; Redmine's own `attachment_max_size`, not any later
+/// attach step's token/field validation. Shared by `upload_file`'s
+/// Files-module flow and `create_redmine_issue`/`update_redmine_issue`'s
+/// issue-native `uploads[]` — both mint tokens the same way, only
+/// what they do with the token afterwards differs.
+pub(crate) async fn mint_upload_token(
+    scoped: &redmine_client::Scoped<'_>,
+    body: Bytes,
+    filename: Option<&str>,
+) -> Result<redmine_client::model::upload::Upload, CallToolResult> {
+    match scoped.create_upload(body, filename, None).await {
+        Ok(u) => Ok(u),
+        Err(redmine_client::Error::Api { status, .. })
+            if status == http::StatusCode::PAYLOAD_TOO_LARGE
+                || status == http::StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            Err(upload_rejected_as_too_large())
+        }
+        Err(e) => Err(to_tool_error(e)),
+    }
+}
+
+/// Validates a `file_path` upload source: reject non-absolute paths,
+/// canonicalise, prefix-check against `roots` plus `store_dir`, stat
 /// the canonical path to reject non-regular files *before* opening, `open`
 /// the canonicalised path, `fstat` the open handle, and on Unix require the
 /// fstat'd `(dev, ino)` to match a fresh stat of the canonical path —
-/// closing the canonicalise-then-open TOCTOU window (J7).
+/// closing the canonicalise-then-open TOCTOU window.
 ///
 /// The pre-open stat exists for more than defense in depth: `File::open` on
 /// a FIFO with no writer blocks the calling thread indefinitely (a device
@@ -174,7 +199,7 @@ fn upload_rejected_as_too_large() -> CallToolResult {
 /// not a regular file, a dev/ino mismatch — collapses to the same
 /// `PATH_NOT_ALLOWED` error. Distinguishing them would hand a caller an
 /// oracle for probing the local filesystem.
-async fn read_and_validate_upload_path(
+pub(crate) async fn read_and_validate_upload_path(
     roots: &[PathBuf],
     store_dir: &Path,
     raw: &str,
@@ -212,15 +237,16 @@ async fn read_and_validate_upload_path(
         return Err(path_not_allowed());
     }
     if pre_open_meta.len() > UPLOAD_FILE_MAX_BYTES {
-        return Err(upload_file_path_too_large(pre_open_meta.len()));
+        return Err(upload_path_too_large(pre_open_meta.len()));
     }
 
     let mut file = tokio::fs::File::open(&canonical)
         .await
         .map_err(|_| path_not_allowed())?;
     // `File::metadata` on Unix is an `fstat` of the already-open handle, not
-    // a fresh path lookup — the authoritative check J7 calls for; the stat
-    // above is only what makes it safe to reach this `open` at all.
+    // a fresh path lookup — the authoritative check is the `(dev, ino)`
+    // comparison below; the stat above is only what makes it safe to reach
+    // this `open` at all.
     let handle_meta = file.metadata().await.map_err(|_| path_not_allowed())?;
     if !handle_meta.is_file() {
         return Err(path_not_allowed());
@@ -236,7 +262,7 @@ async fn read_and_validate_upload_path(
     }
 
     if handle_meta.len() > UPLOAD_FILE_MAX_BYTES {
-        return Err(upload_file_path_too_large(handle_meta.len()));
+        return Err(upload_path_too_large(handle_meta.len()));
     }
 
     // Reads from the already-validated handle, not a fresh open of
@@ -370,8 +396,8 @@ pub(crate) struct FileEntryOut {
     pub(crate) filesize: u64,
     pub(crate) content_type: Option<String>,
     pub(crate) description: Option<String>,
-    /// Passed through verbatim — a mechanical download URL, not free text.
-    /// Not yet rewritten by `REDMINE_PUBLIC_URL` (that lands in 5f).
+    /// Passed through verbatim, modulo the `REDMINE_PUBLIC_URL` rewrite — a
+    /// mechanical download URL, not free text.
     pub(crate) content_url: String,
     pub(crate) digest: Option<String>,
     pub(crate) downloads: Option<u64>,
@@ -382,7 +408,11 @@ pub(crate) struct FileEntryOut {
     pub(crate) created_on: DateTime<Utc>,
 }
 
-fn file_entry_out(boundary: &Boundary, a: &Attachment) -> FileEntryOut {
+fn file_entry_out(
+    boundary: &Boundary,
+    rewrite: &ContentUrlRewrite<'_>,
+    a: &Attachment,
+) -> FileEntryOut {
     FileEntryOut {
         id: a.id,
         filename: a.filename.clone(),
@@ -392,7 +422,7 @@ fn file_entry_out(boundary: &Boundary, a: &Attachment) -> FileEntryOut {
             .description
             .as_deref()
             .map(|d| boundary.wrap("attachment.description", d)),
-        content_url: a.content_url.clone(),
+        content_url: rewrite.apply(&a.content_url),
         digest: a.digest.clone(),
         downloads: a.downloads,
         author: a
@@ -566,7 +596,11 @@ impl RedmineMcp {
         };
 
         let boundary = Boundary::new();
-        let files = files.iter().map(|a| file_entry_out(&boundary, a)).collect();
+        let rewrite = self.content_url_rewrite();
+        let files = files
+            .iter()
+            .map(|a| file_entry_out(&boundary, &rewrite, a))
+            .collect();
         Ok(output::ok(&ListFilesOutput { files }, self.output_caps()))
     }
 
@@ -656,7 +690,7 @@ impl RedmineMcp {
         .filter(|present| *present)
         .count();
         if sources_set != 1 {
-            return Ok(source_required());
+            return Ok(source_required("upload_file"));
         }
         if source_url.is_some() {
             return Ok(unsupported_source());
@@ -702,19 +736,13 @@ impl RedmineMcp {
         let project_ident = resolve_project_ref(project_id)?;
         let scoped = self.scoped(&ctx)?;
 
-        let upload = match scoped.create_upload(body, filename.as_deref(), None).await {
+        // A 413/422 from this specific step is a size condition, not a
+        // validation one — Redmine's own `attachment_max_size` setting, not
+        // `create_project_file`'s token/version_id validation (left to the
+        // generic mapping below).
+        let upload = match mint_upload_token(&scoped, body, filename.as_deref()).await {
             Ok(u) => u,
-            // N7: a 413/422 from this specific step is a size condition,
-            // not a validation one — Redmine's own `attachment_max_size`
-            // setting, not `create_project_file`'s token/version_id
-            // validation (left to the generic mapping below).
-            Err(redmine_client::Error::Api { status, .. })
-                if status == http::StatusCode::PAYLOAD_TOO_LARGE
-                    || status == http::StatusCode::UNPROCESSABLE_ENTITY =>
-            {
-                return Ok(upload_rejected_as_too_large());
-            }
-            Err(e) => return Ok(to_tool_error(e)),
+            Err(result) => return Ok(result),
         };
 
         let new_file = ProjectFileCreate {
@@ -734,8 +762,9 @@ impl RedmineMcp {
         };
 
         let boundary = Boundary::new();
+        let rewrite = self.content_url_rewrite();
         Ok(output::ok(
-            &file_entry_out(&boundary, &attachment),
+            &file_entry_out(&boundary, &rewrite, &attachment),
             self.output_caps(),
         ))
     }
@@ -743,7 +772,7 @@ impl RedmineMcp {
     /// Runs the same expiry sweep the background task performs
     /// ([`AttachmentStore::sweep_expired`]) on demand. Local-disk-only —
     /// never touches Redmine — so unlike every other write tool it is
-    /// **not** gated by `REDMINE_MCP_READ_ONLY` (J9); instead it is removed
+    /// **not** gated by `REDMINE_MCP_READ_ONLY`; instead it is removed
     /// from the router entirely unless `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`
     /// (see `RedmineMcp::new`).
     #[tool(

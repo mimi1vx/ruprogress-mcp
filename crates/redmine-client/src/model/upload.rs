@@ -49,6 +49,22 @@ pub(crate) struct ProjectFileCreateEnvelope<'a> {
     pub file: &'a ProjectFileCreate,
 }
 
+/// One already-uploaded (via [`Upload::token`]) file to attach directly
+/// within an issue create/update payload — Redmine's issue
+/// endpoints accept `uploads: [{token, ...}]` inline in the same request,
+/// unlike the Files module's separate `POST .../files.json` step
+/// ([`ProjectFileCreate`]). `filename`/`content_type` are not repeated here:
+/// they were already recorded at `POST /uploads.json` time via that call's
+/// own `filename`/`content_type` query parameters.
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadRef {
+    /// The token from [`Upload::token`].
+    pub token: String,
+    /// Free-text description shown on the attachment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -73,6 +89,29 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({"file": {"token": "42.abcdef0123456789"}})
+        );
+    }
+
+    #[test]
+    fn upload_ref_omits_unset_description() {
+        let r = UploadRef {
+            token: "42.abcdef0123456789".to_string(),
+            description: None,
+        };
+        let value = serde_json::to_value(&r).expect("should serialize");
+        assert_eq!(value, serde_json::json!({"token": "42.abcdef0123456789"}));
+    }
+
+    #[test]
+    fn upload_ref_includes_set_description() {
+        let r = UploadRef {
+            token: "42.abcdef0123456789".to_string(),
+            description: Some("Q1 report".to_string()),
+        };
+        let value = serde_json::to_value(&r).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({"token": "42.abcdef0123456789", "description": "Q1 report"})
         );
     }
 

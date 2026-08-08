@@ -101,19 +101,19 @@ These are read by the upstream reference server but not by
 
 The 8 attachment-related variables the parent reference server reads are now
 *validated and read* (see "Attachment store" below). `get_redmine_attachment`
-(phase 5c) reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
+reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
 `ATTACHMENT_STORE_MAX_BYTES`, `AUTO_CLEANUP_ENABLED`,
 `CLEANUP_INTERVAL_MINUTES`, and `ATTACHMENT_EXPIRES_MINUTES`;
-`upload_file`/`cleanup_attachment_files` (phase 5e) read
+`upload_file`/`cleanup_attachment_files` read
 `REDMINE_MCP_UPLOAD_FILE_ROOTS` and `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`
-respectively. `REDMINE_PUBLIC_URL` in particular parses and is stored but its
-`content_url`-rewriting behaviour is not applied until a later sub-phase (5f).
+respectively; `REDMINE_PUBLIC_URL` rewrites every `content_url`
+this server emits.
 
 ## Attachment store
 
 Local, on-disk staging for downloaded Redmine attachments. The store always
 exists (there is no way to disable it) and the directory is created at
-startup. `get_redmine_attachment` (phase 5c) is the first consumer: it
+startup. `get_redmine_attachment` is the first consumer: it
 streams a Redmine attachment's bytes into the store, enforcing the per-file
 and whole-store caps below against bytes actually received rather than any
 header or metadata field, then returns a `/files/{uuid}` URL (HTTP
@@ -129,7 +129,7 @@ transport) or an absolute `file_path` (stdio transport).
 | `ATTACHMENT_EXPIRES_MINUTES` | no | `60` | Positive integer. How long a stored file stays fetchable. Checked on every lookup (not just by the interval sweeper), so an expired file is refused immediately rather than up to `CLEANUP_INTERVAL_MINUTES` late. |
 | `REDMINE_MCP_UPLOAD_FILE_ROOTS` | no | `[]` | Comma-separated **absolute** directory paths `upload_file`'s `file_path` source may read from, in addition to `ATTACHMENTS_DIR` itself (always allowed). Empty means only `ATTACHMENTS_DIR` is allowed. |
 | `REDMINE_MCP_EXPOSE_ADMIN_TOOLS` | no | `false` | Registers `cleanup_attachment_files` when `true`; otherwise the tool does not appear in `tools/list` at all. |
-| `REDMINE_PUBLIC_URL` | no | — | Must be a valid `http`/`https` URL. Parsed and validated now; the `content_url`-rewriting behaviour it controls is not applied until a later sub-phase. |
+| `REDMINE_PUBLIC_URL` | no | — | Must be a valid `http`/`https` URL. Rewrites every `content_url` this server emits (`get_redmine_issue`'s/`create_redmine_issue`'s/`update_redmine_issue`'s `attachments[*]`, `list_files`/`upload_file`, wiki page attachments) whose scheme+host+port matches `REDMINE_URL`'s, preserving path, query, fragment, and any reverse-proxy sub-path baked into `REDMINE_PUBLIC_URL` itself. A `content_url` whose origin does not match is left untouched. |
 
 `GET /files/{uuid}` (HTTP transport only) serves a stored file:
 `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`,

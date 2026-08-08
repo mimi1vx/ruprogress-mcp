@@ -1,5 +1,4 @@
 //! Search & Wiki tools: `search_entire_redmine`, `manage_redmine_wiki_page`.
-//! See `plans/phase-4e-search-wiki.md`.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +18,7 @@ use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::issues::{AttachmentOut, IdNameOut, attachment_out, id_name_out};
-use crate::tools::output::{self, ErrorCode, Pagination};
+use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, Pagination};
 
 // --- search_entire_redmine ---
 
@@ -30,9 +29,9 @@ const SEARCH_ENTIRE_DEFAULT_LIMIT: u32 = 100;
 const EXCERPT_MAX_CHARS: usize = 200;
 
 /// Which resource type(s) `search_entire_redmine` restricts to, at the MCP
-/// boundary. A closed two-variant enum, not a permissive string list
-/// (decision I10): an unrecognized value is an argument-schema failure, not
-/// something to silently filter out.
+/// boundary. A closed two-variant enum, not a permissive string list: an
+/// unrecognized value is an argument-schema failure, not something to
+/// silently filter out.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SearchResourceParam {
@@ -74,8 +73,7 @@ fn clamp_search_entire_limit(limit: Option<u32>) -> u32 {
 
 /// Truncate `s` to at most [`EXCERPT_MAX_CHARS`] **characters**, not bytes —
 /// Redmine sends the full field (there is no server-side truncation to rely
-/// on despite the reference contract calling this an "excerpt"; see
-/// decision I8).
+/// on despite the reference contract calling this an "excerpt").
 fn truncate_excerpt(s: &str) -> String {
     if s.chars().count() <= EXCERPT_MAX_CHARS {
         s.to_string()
@@ -90,14 +88,14 @@ pub(crate) struct SearchEntireResultOut {
     /// The resource bucket this result belongs to (`"issues"` or
     /// `"wiki_pages"`) — Redmine's own raw per-result type
     /// (`"issue"`/`"wiki-page"`) re-labelled to match the `resources`
-    /// parameter's values, never passed through verbatim (decision I2).
+    /// parameter's values, never passed through verbatim.
     #[serde(rename = "type")]
     pub(crate) kind: &'static str,
     pub(crate) title: String,
     /// The first 200 characters of Redmine's match text. `None` when
     /// Redmine sent nothing for this hit. Never the full field: use
     /// `get_redmine_issue`/`manage_redmine_wiki_page(action="get")` for the
-    /// complete content (decision I8 — this tool does not hydrate).
+    /// complete content — this tool does not hydrate.
     pub(crate) excerpt: Option<String>,
 }
 
@@ -105,8 +103,8 @@ pub(crate) struct SearchEntireResultOut {
 pub(crate) struct SearchEntireRedmineOutput {
     pub(crate) results: Vec<SearchEntireResultOut>,
     /// Tally of `results` by bucket, computed over **this page only**.
-    /// Redmine's `search.json` exposes no cross-type total (decision I7);
-    /// this is not the same as a global count when paging with
+    /// Redmine's `search.json` exposes no cross-type total; this is not
+    /// the same as a global count when paging with
     /// `limit`/`offset`.
     pub(crate) results_by_type: BTreeMap<String, u64>,
     pub(crate) pagination: Pagination,
@@ -208,7 +206,11 @@ pub(crate) struct WikiPageOut {
     pub(crate) attachments: Option<Vec<AttachmentOut>>,
 }
 
-fn wiki_page_out(boundary: &Boundary, p: &WikiPage) -> WikiPageOut {
+fn wiki_page_out(
+    boundary: &Boundary,
+    rewrite: &ContentUrlRewrite<'_>,
+    p: &WikiPage,
+) -> WikiPageOut {
     WikiPageOut {
         title: p.title.clone(),
         text: p
@@ -228,10 +230,11 @@ fn wiki_page_out(boundary: &Boundary, p: &WikiPage) -> WikiPageOut {
         project_id: p.project.as_ref().map(|pr| pr.id),
         created_on: p.created_on,
         updated_on: p.updated_on,
-        attachments: p
-            .attachments
-            .as_ref()
-            .map(|atts| atts.iter().map(|a| attachment_out(boundary, a)).collect()),
+        attachments: p.attachments.as_ref().map(|atts| {
+            atts.iter()
+                .map(|a| attachment_out(boundary, rewrite, a))
+                .collect()
+        }),
     }
 }
 
@@ -245,8 +248,7 @@ pub(crate) struct ManageWikiPageOutput {
     /// Populated for `action = "delete"`.
     pub(crate) deleted_title: Option<String>,
     /// A human-readable note, currently only set on `delete` to explain
-    /// that child pages survive un-parented rather than being removed
-    /// (decision I6).
+    /// that child pages survive un-parented rather than being removed.
     pub(crate) message: Option<String>,
 }
 
@@ -374,6 +376,7 @@ impl RedmineMcp {
         let project_ident = resolve_project_ref(params.project_id.clone())?;
         let scoped = self.scoped(&ctx)?;
         let boundary = Boundary::new();
+        let rewrite = self.content_url_rewrite();
 
         match params.action {
             ManageWikiPageAction::List => {
@@ -406,7 +409,7 @@ impl RedmineMcp {
                     &ManageWikiPageOutput {
                         success: true,
                         pages: None,
-                        page: Some(wiki_page_out(&boundary, &page)),
+                        page: Some(wiki_page_out(&boundary, &rewrite, &page)),
                         deleted_title: None,
                         message: None,
                     },
@@ -440,7 +443,7 @@ impl RedmineMcp {
                     &ManageWikiPageOutput {
                         success: true,
                         pages: None,
-                        page: Some(wiki_page_out(&boundary, &page)),
+                        page: Some(wiki_page_out(&boundary, &rewrite, &page)),
                         deleted_title: None,
                         message: None,
                     },
@@ -527,7 +530,7 @@ impl RedmineMcp {
                     &ManageWikiPageOutput {
                         success: true,
                         pages: None,
-                        page: Some(wiki_page_out(&boundary, &renamed)),
+                        page: Some(wiki_page_out(&boundary, &rewrite, &renamed)),
                         deleted_title: None,
                         message: None,
                     },

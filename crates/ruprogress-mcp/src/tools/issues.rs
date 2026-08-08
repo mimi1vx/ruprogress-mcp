@@ -1,17 +1,19 @@
-//! Issue tools. Reads (4b-read): `get_redmine_issue`, `list_redmine_issues`,
+//! Issue tools. Reads: `get_redmine_issue`, `list_redmine_issues`,
 //! `search_redmine_issues`, `list_subtasks`, `get_private_notes`. Writes/
-//! mixed (4b-write): `create_redmine_issue`, `update_redmine_issue`,
+//! mixed: `create_redmine_issue`, `update_redmine_issue`,
 //! `delete_redmine_issue`, `copy_issue`, `manage_issue_relation`,
-//! `manage_issue_watcher`, `manage_issue_note`, `manage_issue_category` — see
-//! `plans/phase-4b-issues.md`.
+//! `manage_issue_watcher`, `manage_issue_note`, `manage_issue_category`.
 //!
 //! `JournalOut` deliberately omits `details` (the field-change history
 //! attached to a journal): no example in the reference contract renders it,
 //! and an unbounded diff of e.g. a `description` change could itself blow
-//! past the D9 byte cap. Revisit if a concrete need for it surfaces.
+//! past the response-size byte cap. Revisit if a concrete need for it surfaces.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
@@ -24,9 +26,10 @@ use redmine_client::model::journal::{Journal as ClientJournal, JournalUpdate};
 use redmine_client::model::relation::{IssueRelation as ClientIssueRelation, IssueRelationCreate};
 use redmine_client::model::search::{SearchQuery, SearchScope};
 use redmine_client::model::time_entry::TimeEntryQuery;
+use redmine_client::model::upload::UploadRef;
 use redmine_client::model::{CustomField, IdName};
 use redmine_client::{
-    IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
+    AttachmentId, IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -39,7 +42,8 @@ use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
-use crate::tools::output::{self, ErrorCode, Pagination};
+use crate::tools::files;
+use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, Pagination};
 
 // --- shared output shapes ---
 
@@ -61,11 +65,11 @@ pub(crate) struct IdOnlyOut {
     pub(crate) id: u64,
 }
 
-// --- shared `fields` selection (G5) ---
+// --- shared `fields` selection ---
 
 /// Field names the reference contract accepts for `list_redmine_issues` and
 /// `search_redmine_issues`'s `fields` parameter, minus `id`/`tracker` (always
-/// included, never filterable — see G5).
+/// included, never filterable).
 const OPTIONAL_ISSUE_FIELD_NAMES: &[&str] = &[
     "subject",
     "description",
@@ -120,11 +124,11 @@ impl IssueFieldSet {
     };
 }
 
-/// Resolve the `fields` parameter (G5): absent, `["*"]`, or `["all"]` means
+/// Resolve the `fields` parameter: absent, `["*"]`, or `["all"]` means
 /// every field; otherwise only the named ones (`id`/`tracker` are always
 /// included regardless and accepted-but-redundant in the list). An unknown
-/// name is an **argument** error, not a tool result (D5-adjacent: the model
-/// gave us a value it can fix without calling Redmine).
+/// name is an **argument** error, not a tool result: the model
+/// gave us a value it can fix without calling Redmine.
 fn resolve_issue_fields(fields: Option<&[String]>) -> Result<IssueFieldSet, McpError> {
     let Some(fields) = fields else {
         return Ok(IssueFieldSet::ALL);
@@ -235,8 +239,8 @@ fn clamp_issues_limit(limit: Option<u32>) -> u32 {
 pub(crate) struct IssuesOutput {
     pub(crate) issues: Vec<IssueSummaryOut>,
     /// Present only when `include_pagination_info=true` was passed — an
-    /// absent key, not a `null` value (D2's rationale: the field's very
-    /// presence is the caller-visible signal, matching the reference).
+    /// absent key, not a `null` value: the field's very
+    /// presence is the caller-visible signal, matching the reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pagination: Option<Pagination>,
 }
@@ -327,13 +331,18 @@ pub(crate) struct AttachmentOut {
     pub(crate) filesize: u64,
     pub(crate) content_type: Option<String>,
     pub(crate) description: Option<String>,
-    /// Passed through verbatim — a mechanical download URL, not free text.
+    /// Passed through verbatim (modulo the `REDMINE_PUBLIC_URL` rewrite) — a
+    /// mechanical download URL, not free text.
     pub(crate) content_url: String,
     pub(crate) author: Option<IdNameOut>,
     pub(crate) created_on: DateTime<Utc>,
 }
 
-pub(crate) fn attachment_out(boundary: &Boundary, a: &Attachment) -> AttachmentOut {
+pub(crate) fn attachment_out(
+    boundary: &Boundary,
+    rewrite: &ContentUrlRewrite<'_>,
+    a: &Attachment,
+) -> AttachmentOut {
     AttachmentOut {
         id: a.id,
         filename: boundary.wrap("attachment.filename", &a.filename),
@@ -343,7 +352,7 @@ pub(crate) fn attachment_out(boundary: &Boundary, a: &Attachment) -> AttachmentO
             .description
             .as_deref()
             .map(|d| boundary.wrap("attachment.description", d)),
-        content_url: a.content_url.clone(),
+        content_url: rewrite.apply(&a.content_url),
         author: a
             .author
             .as_ref()
@@ -484,7 +493,7 @@ pub(crate) struct IssueDetailOutput {
 
 // --- list_redmine_issues ---
 
-/// D5: `assigned_to_id` is an integer user id or the literal string `"me"`.
+/// `assigned_to_id` is an integer user id or the literal string `"me"`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum AssignedToRef {
@@ -551,7 +560,7 @@ pub(crate) struct ListRedmineIssuesParams {
 
 /// The reference contract's documented (singular) scope values. Translated
 /// to Redmine's real wire values inside `redmine_client::model::search`
-/// (G1) — `MyProject` becomes `scope=my_projects`, not the literal
+/// — `MyProject` becomes `scope=my_projects`, not the literal
 /// `my_project`.
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -625,7 +634,38 @@ pub(crate) struct PrivateNotesOutput {
     pub(crate) private_notes: Vec<PrivateNoteOut>,
 }
 
-// --- 4b-write: create_redmine_issue / update_redmine_issue ---
+// --- create_redmine_issue / update_redmine_issue ---
+
+/// One file to attach as part of `create_redmine_issue`/`update_redmine_issue`.
+/// Same source rules as `upload_file`'s own parameters
+/// (`tools/files.rs::UploadFileParams`): exactly one of `content_base64`/
+/// `file_path`/`source_url` — the latter always refused with
+/// `UNSUPPORTED_SOURCE`, deferred to a future release.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IssueUploadParams {
+    /// Name the attachment will have in Redmine. Required when using
+    /// `content_base64`; inferred from the path when using `file_path`.
+    #[serde(default)]
+    pub(crate) filename: Option<String>,
+    /// Raw file bytes, base64-encoded. Exactly one of `content_base64`/
+    /// `file_path` must be set.
+    #[serde(default)]
+    pub(crate) content_base64: Option<String>,
+    /// Absolute path to a file already on this server: inside
+    /// `ATTACHMENTS_DIR` or a directory listed in
+    /// `REDMINE_MCP_UPLOAD_FILE_ROOTS`. Limited to 50 MiB.
+    #[serde(default)]
+    pub(crate) file_path: Option<String>,
+    /// Not supported by this server. Present only so a caller who sends it
+    /// gets a precise `UNSUPPORTED_SOURCE` refusal instead of a schema
+    /// error; use `content_base64` or `file_path` instead.
+    #[serde(default)]
+    pub(crate) source_url: Option<String>,
+    /// Human-readable description shown on the attachment.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -673,6 +713,10 @@ pub(crate) struct CreateRedmineIssueParams {
     /// Whether the issue is private.
     #[serde(default)]
     pub(crate) is_private: Option<bool>,
+    /// Files to attach to the issue in this same request. Maximum 10 items;
+    /// each item follows the same source rules as `upload_file`.
+    #[serde(default)]
+    pub(crate) uploads: Option<Vec<IssueUploadParams>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -741,6 +785,10 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// notes private" permission; ignored if `notes` is not given.
     #[serde(default)]
     pub(crate) private_notes: Option<bool>,
+    /// Files to attach to the issue in this same request. Maximum 10 items;
+    /// each item follows the same source rules as `upload_file`.
+    #[serde(default)]
+    pub(crate) uploads: Option<Vec<IssueUploadParams>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -785,10 +833,10 @@ pub(crate) struct DeleteImpactOut {
     pub(crate) time_entries_count: u64,
 }
 
-/// A single schema covering both the refusal and success shapes (see
-/// `plans/phase-4b-issues.md` 4b-write decisions): the reference contract
-/// treats a delete refusal as a normal result the model should inspect and
-/// react to, not an error (`isError` stays `false` either way).
+/// A single schema covering both the refusal and success shapes: the
+/// reference contract treats a delete refusal as a normal result the model
+/// should inspect and react to, not an error (`isError` stays `false`
+/// either way).
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct DeleteRedmineIssueOutput {
     pub(crate) success: bool,
@@ -859,9 +907,8 @@ pub(crate) struct CopyIssueOutput {
     /// source had none).
     pub(crate) subtasks_copied: u64,
     /// `true` if the subtask copy stopped early because of this server's
-    /// bounded copy limit — never a silent cut (D9's spirit applied to a
-    /// mutating tool: what was copied is real and complete in itself, just
-    /// not the *whole* source subtree).
+    /// bounded copy limit — never a silent cut: what was copied is real and
+    /// complete in itself, just not the *whole* source subtree.
     pub(crate) subtasks_truncated: bool,
 }
 
@@ -1064,13 +1111,14 @@ pub(crate) struct ManageIssueCategoryOutput {
 }
 
 /// Build an [`IssueDetailOutput`] from a fetched [`Issue`], applying journal
-/// pagination (G2) when `journal_limit` is given. Shared by
+/// pagination when `journal_limit` is given. Shared by
 /// `get_redmine_issue`, `create_redmine_issue`, and `update_redmine_issue`
 /// (the latter two always pass `journal_limit: None` — Redmine's
 /// create/update responses never include journals in the first place, so
 /// `issue.journals` is `None` and the match's last arm applies).
 fn issue_detail_out(
     boundary: &Boundary,
+    rewrite: &ContentUrlRewrite<'_>,
     mut issue: Issue,
     journal_limit: Option<u32>,
     journal_offset: Option<u64>,
@@ -1149,10 +1197,11 @@ fn issue_detail_out(
         closed_on: issue.closed_on,
         journals,
         journal_pagination,
-        attachments: issue
-            .attachments
-            .as_ref()
-            .map(|atts| atts.iter().map(|a| attachment_out(boundary, a)).collect()),
+        attachments: issue.attachments.as_ref().map(|atts| {
+            atts.iter()
+                .map(|a| attachment_out(boundary, rewrite, a))
+                .collect()
+        }),
         watchers: issue.watchers.as_ref().map(|ws| {
             ws.iter()
                 .map(|w| id_name_out(boundary, "user.name", w))
@@ -1167,6 +1216,147 @@ fn issue_detail_out(
             .as_ref()
             .map(|cs| cs.iter().map(|c| issue_child_out(boundary, c)).collect()),
     }
+}
+
+/// A per-item `uploads[]` failure: either an argument-shape
+/// mistake the model must fix before the call means anything (`Protocol`,
+/// matching the same "filename required for `content_base64`" precedent as
+/// `upload_file`), or a condition that depends on server-side state — path
+/// validation, source arity — reported in-band (`InBand`), reusing
+/// `tools::files`'s exact
+/// `SOURCE_REQUIRED`/`UNSUPPORTED_SOURCE`/`PATH_NOT_ALLOWED`/`FILE_TOO_LARGE`
+/// helpers.
+enum IssueUploadOutcome {
+    Protocol(McpError),
+    InBand(CallToolResult),
+}
+
+/// Resolves one `uploads[]` item to its raw bytes and effective filename,
+/// touching no network (the first of two passes): a validation failure here
+/// — on any item — means zero `POST /uploads.json` requests are ever sent
+/// for this call, so a bad item never leaves earlier ones half-uploaded to
+/// Redmine.
+async fn resolve_issue_upload(
+    roots: &[PathBuf],
+    store_dir: &Path,
+    idx: usize,
+    item: IssueUploadParams,
+) -> Result<(Bytes, Option<String>, Option<String>), IssueUploadOutcome> {
+    let IssueUploadParams {
+        mut filename,
+        content_base64,
+        file_path,
+        source_url,
+        description,
+    } = item;
+
+    let sources_set = [
+        content_base64.is_some(),
+        file_path.is_some(),
+        source_url.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if sources_set != 1 {
+        return Err(IssueUploadOutcome::InBand(files::source_required(
+            &format!("uploads[{idx}]"),
+        )));
+    }
+    if source_url.is_some() {
+        return Err(IssueUploadOutcome::InBand(files::unsupported_source()));
+    }
+
+    let bytes = if let Some(b64) = content_base64 {
+        if filename.is_none() {
+            return Err(IssueUploadOutcome::Protocol(McpError::invalid_params(
+                format!("uploads[{idx}]: filename is required when using content_base64"),
+                None,
+            )));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| {
+                IssueUploadOutcome::Protocol(McpError::invalid_params(
+                    format!("uploads[{idx}]: content_base64 is not valid base64: {e}"),
+                    None,
+                ))
+            })?;
+        Bytes::from(decoded)
+    } else {
+        // `sources_set == 1` and `source_url`/`content_base64` are both
+        // excluded above, so `file_path` must be set.
+        let raw_path = file_path.unwrap_or_default();
+        let (contents, inferred) =
+            files::read_and_validate_upload_path(roots, store_dir, &raw_path)
+                .await
+                .map_err(IssueUploadOutcome::InBand)?;
+        if filename.is_none() {
+            filename = inferred;
+        }
+        contents
+    };
+
+    Ok((bytes, filename, description))
+}
+
+/// Two passes for `uploads[]`: resolve every item locally first (no
+/// network — a validation failure on item N means zero `POST /uploads.json`
+/// requests were sent for *any* item), then mint one upload token per
+/// resolved item, sequentially. Returns the `UploadRef`s to embed in the
+/// create/update payload and the minted attachment ids, in the same order,
+/// for the post-success metadata refetch. `uploads: None` and
+/// `uploads: Some(vec![])` both short-circuit to empty results with no
+/// network calls at all.
+async fn resolve_and_mint_issue_uploads(
+    scoped: &redmine_client::Scoped<'_>,
+    roots: &[PathBuf],
+    store_dir: &Path,
+    uploads: Option<Vec<IssueUploadParams>>,
+) -> Result<(Vec<UploadRef>, Vec<u64>), IssueUploadOutcome> {
+    let Some(uploads) = uploads else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if uploads.len() > 10 {
+        return Err(IssueUploadOutcome::Protocol(McpError::invalid_params(
+            "uploads accepts at most 10 items",
+            None,
+        )));
+    }
+
+    let mut resolved = Vec::with_capacity(uploads.len());
+    for (idx, item) in uploads.into_iter().enumerate() {
+        resolved.push(resolve_issue_upload(roots, store_dir, idx, item).await?);
+    }
+
+    let mut upload_refs = Vec::with_capacity(resolved.len());
+    let mut attachment_ids = Vec::with_capacity(resolved.len());
+    for (bytes, filename, description) in resolved {
+        let upload = files::mint_upload_token(scoped, bytes, filename.as_deref())
+            .await
+            .map_err(IssueUploadOutcome::InBand)?;
+        attachment_ids.push(upload.id);
+        upload_refs.push(UploadRef {
+            token: upload.token,
+            description,
+        });
+    }
+    Ok((upload_refs, attachment_ids))
+}
+
+/// Fetches full metadata for a batch of just-minted upload ids — each
+/// `Upload::id` from `resolve_and_mint_issue_uploads` is already the
+/// resulting attachment's id, so this is a plain `GET` per id, no search
+/// needed.
+async fn fetch_attachments(
+    scoped: &redmine_client::Scoped<'_>,
+    ids: &[u64],
+) -> redmine_client::Result<Vec<Attachment>> {
+    let mut attachments = Vec::with_capacity(ids.len());
+    for &id in ids {
+        attachments.push(scoped.get_attachment(AttachmentId(id)).await?);
+    }
+    Ok(attachments)
 }
 
 #[tool_router(router = issues_tool_router, vis = "pub(crate)")]
@@ -1211,8 +1401,10 @@ impl RedmineMcp {
         }
 
         let boundary = Boundary::new();
+        let rewrite = self.content_url_rewrite();
         let output = issue_detail_out(
             &boundary,
+            &rewrite,
             issue,
             params.journal_limit,
             params.journal_offset,
@@ -1280,7 +1472,7 @@ impl RedmineMcp {
     }
 
     /// `GET /search.json?issues=1`, then hydrated via
-    /// `GET /issues.json?issue_id=...&status_id=*` (G3).
+    /// `GET /issues.json?issue_id=...&status_id=*`.
     #[tool(
         description = "Search issues by free text, with pagination and native Search API filters (scope, open_issues). Use this for text-based search; use list_redmine_issues for filtering by exact field values (project_id, status_id, priority_id, etc). An empty list means nothing matched the search text.",
         input_schema = crate::tools::schema::input::<SearchRedmineIssuesParams>(),
@@ -1332,7 +1524,7 @@ impl RedmineMcp {
 
         let boundary = Boundary::new();
         // Restore search-result order: Redmine's `issue_id=` filter does not
-        // promise to preserve the order of the ids listed (G3).
+        // promise to preserve the order of the ids listed.
         let issues: Vec<IssueSummaryOut> = ids
             .iter()
             .filter_map(|id| by_id.get(&id.0))
@@ -1444,6 +1636,21 @@ impl RedmineMcp {
             return Err(McpError::invalid_params("subject must not be empty", None));
         }
         let project_id = resolve_project_ref(params.project_id)?;
+        let scoped = self.scoped(&ctx)?;
+
+        let store = self.attachments();
+        let (uploads, attachment_ids) = match resolve_and_mint_issue_uploads(
+            &scoped,
+            &self.inner.config.attachments.upload_file_roots,
+            store.dir(),
+            params.uploads,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(IssueUploadOutcome::Protocol(e)) => return Err(e),
+            Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
+        };
 
         let create = IssueCreate {
             project_id,
@@ -1461,16 +1668,23 @@ impl RedmineMcp {
             done_ratio: params.done_ratio,
             estimated_hours: params.estimated_hours,
             is_private: params.is_private,
+            uploads,
         };
 
-        let scoped = self.scoped(&ctx)?;
-        let issue = match scoped.create_issue(&create).await {
+        let mut issue = match scoped.create_issue(&create).await {
             Ok(issue) => issue,
             Err(e) => return Ok(to_tool_error(e)),
         };
+        if !attachment_ids.is_empty() {
+            match fetch_attachments(&scoped, &attachment_ids).await {
+                Ok(attachments) => issue.attachments = Some(attachments),
+                Err(e) => return Ok(to_tool_error(e)),
+            }
+        }
 
         let boundary = Boundary::new();
-        let issue_out = issue_detail_out(&boundary, issue, None, None);
+        let rewrite = self.content_url_rewrite();
+        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None);
         Ok(output::ok(
             &CreateRedmineIssueOutput {
                 success: true,
@@ -1519,13 +1733,31 @@ impl RedmineMcp {
             && params.done_ratio.is_none()
             && params.estimated_hours.is_none()
             && params.is_private.is_none()
-            && params.notes.is_none();
+            && params.notes.is_none()
+            // uploads alone (no other field, no notes) is a legitimate
+            // update, not a no-op.
+            && params.uploads.as_ref().is_none_or(Vec::is_empty);
         if nothing_to_change {
             return Err(McpError::invalid_params(
                 "at least one field to change, or notes, must be given",
                 None,
             ));
         }
+
+        let scoped = self.scoped(&ctx)?;
+        let store = self.attachments();
+        let (uploads, attachment_ids) = match resolve_and_mint_issue_uploads(
+            &scoped,
+            &self.inner.config.attachments.upload_file_roots,
+            store.dir(),
+            params.uploads,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(IssueUploadOutcome::Protocol(e)) => return Err(e),
+            Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
+        };
 
         let patch = IssueUpdate {
             subject: params.subject,
@@ -1544,16 +1776,23 @@ impl RedmineMcp {
             is_private: params.is_private,
             notes: params.notes,
             private_notes: params.private_notes,
+            uploads,
         };
 
-        let scoped = self.scoped(&ctx)?;
-        let issue = match scoped.update_issue(IssueId(params.issue_id), &patch).await {
+        let mut issue = match scoped.update_issue(IssueId(params.issue_id), &patch).await {
             Ok(issue) => issue,
             Err(e) => return Ok(to_tool_error(e)),
         };
+        if !attachment_ids.is_empty() {
+            match fetch_attachments(&scoped, &attachment_ids).await {
+                Ok(attachments) => issue.attachments = Some(attachments),
+                Err(e) => return Ok(to_tool_error(e)),
+            }
+        }
 
         let boundary = Boundary::new();
-        let issue_out = issue_detail_out(&boundary, issue, None, None);
+        let rewrite = self.content_url_rewrite();
+        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None);
         Ok(output::ok(
             &UpdateRedmineIssueOutput {
                 success: true,
@@ -1746,6 +1985,7 @@ impl RedmineMcp {
             done_ratio: source.done_ratio,
             estimated_hours: source.estimated_hours,
             is_private: source.is_private,
+            uploads: Vec::new(),
         };
 
         let created = match scoped.create_issue(&root_create).await {
@@ -1808,6 +2048,7 @@ impl RedmineMcp {
                         done_ratio: child.done_ratio,
                         estimated_hours: child.estimated_hours,
                         is_private: child.is_private,
+                        uploads: Vec::new(),
                     };
                     match scoped.create_issue(&child_create).await {
                         Ok(new_child) => {
@@ -1828,7 +2069,8 @@ impl RedmineMcp {
         }
 
         let boundary = Boundary::new();
-        let issue_out = issue_detail_out(&boundary, created, None, None);
+        let rewrite = self.content_url_rewrite();
+        let issue_out = issue_detail_out(&boundary, &rewrite, created, None, None);
         Ok(output::ok(
             &CopyIssueOutput {
                 success: true,

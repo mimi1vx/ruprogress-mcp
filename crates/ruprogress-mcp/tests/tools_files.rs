@@ -4,13 +4,13 @@
 //! branch), the `FILE_TOO_LARGE` pre-check and mid-stream enforcement,
 //! `STORE_FULL`, and the dominant `redmine_client::Error` passthrough.
 //! `list_files`: the Files-module shape, including `digest`/`downloads`/
-//! `version`. `delete_file`: the unconditional confirmation guard (M1/M2 in
-//! `plans/phase-5d-list-and-delete-file.md`) and the success shape.
+//! `version`. `delete_file`: the unconditional confirmation guard and the
+//! success shape.
 //! `upload_file`: the `content_base64` source (the `file_path` source's
 //! own path-validation suite lives in `tests/upload_paths.rs`), the source
-//! arity/`UNSUPPORTED_SOURCE` checks (N1), and the `create_upload`-only
-//! `FILE_TOO_LARGE` remap (N7). `cleanup_attachment_files`: admin-gated
-//! registration (N9) and the sweep-result shape.
+//! arity/`UNSUPPORTED_SOURCE` checks, and the `create_upload`-only
+//! `FILE_TOO_LARGE` remap. `cleanup_attachment_files`: admin-gated
+//! registration and the sweep-result shape.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -282,6 +282,30 @@ async fn list_files_returns_the_files_module_shape_including_version() {
             .as_str()
             .expect("version name should be a string")
             .contains("1.0")
+    );
+}
+
+#[tokio::test]
+async fn list_files_rewrites_content_url_when_redmine_public_url_is_set() {
+    let h = support::harness(&[("REDMINE_PUBLIC_URL", "https://public.example.com/redmine")]).await;
+    Mock::given(method("GET"))
+        .and(path("/projects/1/files.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"files": [
+            {
+                "id": 11, "filename": "plan.pdf", "filesize": 1024,
+                "content_url": format!("{}/attachments/download/11/plan.pdf", h.redmine.uri()),
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        ]})))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(&h, "list_files", json!({"project_id": 1})).await;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(
+        structured["files"][0]["content_url"],
+        "https://public.example.com/redmine/attachments/download/11/plan.pdf"
     );
 }
 
@@ -600,7 +624,7 @@ async fn cleanup_attachment_files_sweeps_an_expired_download() {
     let download = call(&h, json!({"attachment_id": 1})).await;
     assert_eq!(download.is_error, Some(false));
 
-    // `sweep_expired` reaps by directory mtime (K1); backdate it past the
+    // `sweep_expired` reaps by directory mtime; backdate it past the
     // 1-minute TTL instead of sleeping in the test.
     let dir = download.structured_content.expect("structured content")["file_path"]
         .as_str()

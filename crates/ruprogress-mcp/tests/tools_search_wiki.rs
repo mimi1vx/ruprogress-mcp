@@ -1,9 +1,9 @@
-//! e2e: the search & wiki tool family (4e) — `search_entire_redmine`,
+//! e2e: the search & wiki tool family — `search_entire_redmine`,
 //! `manage_redmine_wiki_page`. Happy path and dominant error path per tool,
 //! plus behaviours specific to this family: resource-flag selection and
-//! bucket re-labelling (I2), the `rename` PUT-then-GET confirmation dance
-//! and its silent-permission-drop failure mode (I3/I5), and the
-//! `redirect_existing_links` string-not-bool wire format (I4). Per-action
+//! bucket re-labelling, the `rename` PUT-then-GET confirmation dance
+//! and its silent-permission-drop failure mode, and the
+//! `redirect_existing_links` string-not-bool wire format. Per-action
 //! read-only gating is covered in `tests/readonly.rs` instead.
 #![allow(
     clippy::unwrap_used,
@@ -207,6 +207,36 @@ async fn manage_redmine_wiki_page_get_with_version_requests_the_version_path_seg
     assert_ne!(result.is_error, Some(true));
     let body = body_of(&result);
     assert_eq!(body["page"]["version"], 3);
+}
+
+#[tokio::test]
+async fn manage_redmine_wiki_page_get_rewrites_attachment_content_url_when_redmine_public_url_is_set()
+ {
+    let h = support::harness(&[("REDMINE_PUBLIC_URL", "https://public.example.com")]).await;
+    let mut page = wiki_page_json("Home", "old text", 3);
+    page["wiki_page"]["attachments"] = json!([{
+        "id": 5, "filename": "a.pdf", "filesize": 10,
+        "content_url": format!("{}/attachments/download/5/a.pdf", h.redmine.uri()),
+        "created_on": "2026-01-01T00:00:00Z"
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/projects/my-project/wiki/Home.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "manage_redmine_wiki_page",
+        json!({"action": "get", "project_id": "my-project", "wiki_page_title": "Home"}),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    let body = body_of(&result);
+    assert_eq!(
+        body["page"]["attachments"][0]["content_url"],
+        "https://public.example.com/attachments/download/5/a.pdf"
+    );
 }
 
 #[tokio::test]

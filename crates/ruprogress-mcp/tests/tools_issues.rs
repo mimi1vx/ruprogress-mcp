@@ -1,10 +1,10 @@
-//! e2e: the issue-read-tool family (4b-read) — `get_redmine_issue`,
+//! e2e: the issue-read-tool family — `get_redmine_issue`,
 //! `list_redmine_issues`, `search_redmine_issues`, `list_subtasks`,
 //! `get_private_notes`. Happy path and dominant error path per tool, plus
-//! the behaviours specific to this family: journal pagination (G2),
-//! `search_redmine_issues`'s two-call hydration and order restoration (G3),
-//! `list_subtasks`'s `status_id=*` (G6), and `get_private_notes`'s
-//! private/empty-notes filtering (G7).
+//! the behaviours specific to this family: journal pagination,
+//! `search_redmine_issues`'s two-call hydration and order restoration,
+//! `list_subtasks`'s `status_id=*`, and `get_private_notes`'s
+//! private/empty-notes filtering.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -99,6 +99,36 @@ async fn get_redmine_issue_happy_path_wraps_free_text_and_leaves_ids_alone() {
     );
     assert_eq!(body["category"]["id"], 5);
     assert_eq!(body["fixed_version"]["id"], 6);
+}
+
+#[tokio::test]
+async fn get_redmine_issue_rewrites_attachment_content_url_when_redmine_public_url_is_set() {
+    let h = support::harness(&[("REDMINE_PUBLIC_URL", "https://public.example.com")]).await;
+    let mut issue = base_issue(1);
+    issue["attachments"] = json!([{
+        "id": 5, "filename": "a.pdf", "filesize": 10,
+        "content_url": format!("{}/attachments/download/5/a.pdf", h.redmine.uri()),
+        "created_on": "2026-01-01T00:00:00Z"
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .and(query_param("include", "attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": issue})))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(
+        &call(
+            &h,
+            "get_redmine_issue",
+            json!({"issue_id": 1, "include_journals": false, "include_attachments": true}),
+        )
+        .await,
+    );
+    assert_eq!(
+        body["attachments"][0]["content_url"],
+        "https://public.example.com/attachments/download/5/a.pdf"
+    );
 }
 
 #[tokio::test]

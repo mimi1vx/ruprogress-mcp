@@ -106,7 +106,7 @@ impl RedmineMcp {
         }
     }
 
-    /// The response-size caps (D9) every tool applies to its own output via
+    /// The response-size caps every tool applies to its own output via
     /// `output::ok`.
     pub(crate) fn output_caps(&self) -> crate::tools::output::OutputCaps {
         crate::tools::output::OutputCaps {
@@ -114,9 +114,19 @@ impl RedmineMcp {
             max_bytes: self.inner.config.max_response_bytes,
         }
     }
+
+    /// The `REDMINE_PUBLIC_URL` rewrite every `content_url`-
+    /// emitting tool output applies via `attachment_out`/`file_entry_out`/
+    /// `wiki_page_out`.
+    pub(crate) fn content_url_rewrite(&self) -> crate::tools::output::ContentUrlRewrite<'_> {
+        crate::tools::output::ContentUrlRewrite::new(
+            &self.inner.config.redmine.url,
+            self.inner.config.attachments.public_url_rewrite.as_ref(),
+        )
+    }
 }
 
-/// Explains the prompt-injection delimiter scheme once per session (D3),
+/// Explains the prompt-injection delimiter scheme once per session,
 /// rather than repeating a preamble content block on every tool response.
 /// Every wrapped field uses a random nonce generated per response, so this
 /// text describes the *scheme* rather than quoting one.

@@ -1,4 +1,4 @@
-//! e2e: the issue write/mixed-action tool family (4b-write) —
+//! e2e: the issue write/mixed-action tool family —
 //! `create_redmine_issue`, `update_redmine_issue`, `delete_redmine_issue`,
 //! `copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
 //! `manage_issue_note`, `manage_issue_category`. Happy path and dominant
@@ -6,7 +6,7 @@
 //! `delete_redmine_issue`'s two-step confirmation and impact preview,
 //! `copy_issue`'s bounded recursive subtask copy, and
 //! `manage_issue_relation`/`manage_issue_category`'s per-action read-only
-//! gate (D8) — covered in `tests/readonly.rs` instead.
+//! gate — covered in `tests/readonly.rs` instead.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -42,6 +42,36 @@ async fn call(h: &support::Harness, name: &str, args: Value) -> rmcp::model::Cal
         .call_tool(request)
         .await
         .expect("call_tool should succeed")
+}
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+async fn mock_upload_token(server: &wiremock::MockServer, id: u64, token: &str) {
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "upload": {"id": id, "token": token}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mock_attachment_metadata(server: &wiremock::MockServer, id: u64, filename: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/attachments/{id}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachment": {
+                "id": id, "filename": filename, "filesize": 11,
+                "content_type": "text/plain",
+                "content_url": format!("{}/attachments/download/{id}/{filename}", server.uri()),
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(server)
+        .await;
 }
 
 fn issue_json(id: u64, subject: &str) -> Value {
@@ -81,6 +111,158 @@ async fn create_redmine_issue_happy_path() {
     let body = body_of(&result);
     assert_eq!(body["success"], true);
     assert_eq!(body["issue"]["id"], 42);
+}
+
+#[tokio::test]
+async fn create_redmine_issue_without_uploads_sends_a_byte_identical_body() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(body_json(json!({
+            "issue": {"project_id": "1", "subject": "New issue"}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue"}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_with_uploads_happy_path() {
+    let h = support::harness(&[]).await;
+    mock_upload_token(&h.redmine, 99, "99.token").await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(body_json(json!({
+            "issue": {
+                "project_id": "1",
+                "subject": "New issue",
+                "uploads": [{"token": "99.token"}]
+            }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .mount(&h.redmine)
+        .await;
+    mock_attachment_metadata(&h.redmine, 99, "notes.txt").await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({
+            "project_id": 1,
+            "subject": "New issue",
+            "uploads": [{"filename": "notes.txt", "content_base64": base64_of(b"hello world")}]
+        }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = body_of(&result);
+    assert_eq!(body["issue"]["attachments"][0]["id"], 99);
+    assert!(
+        body["issue"]["attachments"][0]["filename"]
+            .as_str()
+            .unwrap()
+            .contains("notes.txt")
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_uploads_with_invalid_arity_sends_no_upload_requests() {
+    let h = support::harness(&[]).await;
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({
+            "project_id": 1,
+            "subject": "New issue",
+            "uploads": [{
+                "content_base64": base64_of(b"x"),
+                "file_path": "/tmp/x",
+                "filename": "x.txt"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.unwrap()["code"],
+        "SOURCE_REQUIRED"
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine when upload validation fails: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_uploads_with_source_url_is_unsupported_source() {
+    let h = support::harness(&[]).await;
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({
+            "project_id": 1,
+            "subject": "New issue",
+            "uploads": [{"source_url": "https://example.com/a.pdf"}]
+        }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.unwrap()["code"],
+        "UNSUPPORTED_SOURCE"
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_uploads_content_base64_without_filename_is_a_protocol_error() {
+    let h = support::harness(&[]).await;
+    let mut request = CallToolRequestParams::new("create_redmine_issue".to_string());
+    request.arguments = json!({
+        "project_id": 1,
+        "subject": "New issue",
+        "uploads": [{"content_base64": base64_of(b"x")}]
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn create_redmine_issue_uploads_over_ten_items_is_a_protocol_error() {
+    let h = support::harness(&[]).await;
+    let uploads: Vec<Value> = (0..11)
+        .map(|i| json!({"content_base64": base64_of(b"x"), "filename": format!("f{i}.txt")}))
+        .collect();
+    let mut request = CallToolRequestParams::new("create_redmine_issue".to_string());
+    request.arguments = json!({
+        "project_id": 1,
+        "subject": "New issue",
+        "uploads": uploads
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -147,6 +329,73 @@ async fn update_redmine_issue_happy_path() {
     let body = body_of(&result);
     assert_eq!(body["success"], true);
     assert_eq!(body["issue"]["id"], 7);
+}
+
+#[tokio::test]
+async fn update_redmine_issue_without_uploads_sends_a_byte_identical_body() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({"issue": {"subject": "Updated"}})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Updated")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "subject": "Updated"}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_with_uploads_only_is_not_a_no_op() {
+    let h = support::harness(&[]).await;
+    mock_upload_token(&h.redmine, 55, "55.token").await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {"uploads": [{"token": "55.token"}]}
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Existing")))
+        .mount(&h.redmine)
+        .await;
+    mock_attachment_metadata(&h.redmine, 55, "report.pdf").await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({
+            "issue_id": 7,
+            "uploads": [{"filename": "report.pdf", "content_base64": base64_of(b"hello world")}]
+        }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = body_of(&result);
+    assert_eq!(body["issue"]["attachments"][0]["id"], 55);
 }
 
 #[tokio::test]

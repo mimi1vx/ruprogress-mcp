@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `create_redmine_issue`/`update_redmine_issue` accept an optional `uploads`
+  array (max 10 items) to attach files in the same request, via the same
+  `content_base64`/`file_path` sources as `upload_file`
+  (`source_url` always refused with `UNSUPPORTED_SOURCE`). Files are attached
+  through Redmine's issue-native `uploads: [{token, ...}]` shape, not the
+  Files-module two-step flow; the response's `issue.attachments` reflects the
+  newly attached files.
+- `REDMINE_PUBLIC_URL` now rewrites every `content_url` this server emits
+  (`get_redmine_issue`'s/`create_redmine_issue`'s/`update_redmine_issue`'s
+  `attachments[*]`, `list_files`/`upload_file`, wiki page attachments) whose
+  origin matches `REDMINE_URL`'s, preserving path, query, fragment, and any
+  reverse-proxy sub-path baked into `REDMINE_PUBLIC_URL` itself.
 - `upload_file`: uploads a file and attaches it to a project's Files module
   (`POST /uploads.json` then `POST /projects/{id}/files.json`). Accepts
   `content_base64` (requires `filename`) or `file_path` (an absolute path

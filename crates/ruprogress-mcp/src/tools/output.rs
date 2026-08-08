@@ -1,7 +1,7 @@
-//! The structured-output contract every tool returns (D1/D2/D4): a success
+//! The structured-output contract every tool returns: a success
 //! envelope built from `CallToolResult::structured`, an in-band error
 //! envelope for everything Redmine tells us, and the response-size caps
-//! (D9) applied to every list payload before it leaves the process.
+//! applied to every list payload before it leaves the process.
 //!
 //! `outputSchema` (declared per tool via `#[tool(output_schema = ...)]`)
 //! describes the **success** payload only. Error results carry
@@ -12,6 +12,7 @@ use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
+use url::Url;
 
 /// Pagination metadata attached to a list tool's response, computed from a
 /// [`redmine_client::Page`]. Present unconditionally until a tool exposes
@@ -62,7 +63,7 @@ impl Pagination {
 }
 
 /// Hard caps on a single tool response, enforced in [`ok`] above and beyond
-/// `redmine-client`'s own byte caps (D9). Configured via
+/// `redmine-client`'s own byte caps. Configured via
 /// `REDMINE_MCP_MAX_RESPONSE_ITEMS`/`REDMINE_MCP_MAX_RESPONSE_BYTES`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OutputCaps {
@@ -79,7 +80,7 @@ fn top_level_array(value: &mut Value) -> Option<&mut Vec<Value>> {
         .find_map(|v| v.as_array_mut())
 }
 
-/// Find the first top-level JSON array in an object response — by the D2
+/// Find the first top-level JSON array in an object response — by the
 /// envelope convention every list tool has exactly one — and truncate it to
 /// `caps.max_items`, then to whatever additionally fits in `caps.max_bytes`.
 /// Marks `pagination.truncated`/`pagination.hint` when either cap fires.
@@ -124,7 +125,7 @@ fn apply_caps(value: &mut Value, caps: OutputCaps) {
 }
 
 /// Wrap a successful tool payload in a `CallToolResult` with structured
-/// content, applying the response-size caps (D9).
+/// content, applying the response-size caps.
 ///
 /// Every output type in this module is a plain struct of
 /// primitives/strings/nested structs, so `T`'s `Serialize` implementation
@@ -140,12 +141,58 @@ pub(crate) fn ok<T: Serialize>(value: &T, caps: OutputCaps) -> CallToolResult {
     CallToolResult::structured(json)
 }
 
+/// Rewrites `content_url` values whose scheme+host+port matches
+/// `REDMINE_URL`'s to sit behind `REDMINE_PUBLIC_URL` instead, for
+/// a Redmine reachable internally at one address but fronted by a reverse
+/// proxy at another. Built once per tool call via
+/// `RedmineMcp::content_url_rewrite` and threaded alongside `&Boundary`
+/// through `attachment_out`/`file_entry_out`/`wiki_page_out`.
+pub(crate) struct ContentUrlRewrite<'a> {
+    redmine: &'a Url,
+    public: Option<&'a Url>,
+}
+
+impl<'a> ContentUrlRewrite<'a> {
+    pub(crate) const fn new(redmine: &'a Url, public: Option<&'a Url>) -> Self {
+        Self { redmine, public }
+    }
+
+    /// A `content_url` that fails to parse, or whose origin does not match
+    /// `REDMINE_URL`'s, is returned unchanged — this only ever narrows an
+    /// already-valid URL's authority, never invents one from untrusted
+    /// Redmine-authored data. A matching URL keeps `REDMINE_PUBLIC_URL`'s own
+    /// path as a prefix (so a reverse-proxy sub-path baked into it survives)
+    /// and keeps the original URL's query and fragment.
+    pub(crate) fn apply(&self, content_url: &str) -> String {
+        let Some(public) = self.public else {
+            return content_url.to_string();
+        };
+        let Ok(parsed) = Url::parse(content_url) else {
+            return content_url.to_string();
+        };
+        let origin_matches = parsed.scheme() == self.redmine.scheme()
+            && parsed.host_str() == self.redmine.host_str()
+            && parsed.port_or_known_default() == self.redmine.port_or_known_default();
+        if !origin_matches {
+            return content_url.to_string();
+        }
+
+        let mut rewritten = public.clone();
+        let mut path = public.path().trim_end_matches('/').to_string();
+        path.push_str(parsed.path());
+        rewritten.set_path(&path);
+        rewritten.set_query(parsed.query());
+        rewritten.set_fragment(parsed.fragment());
+        rewritten.to_string()
+    }
+}
+
 /// The closed set of machine-readable error codes every tool's in-band error
-/// envelope carries (D4). `#[non_exhaustive]`: sub-phases beyond 4b-write add
-/// `FEATURE_DISABLED` once a tool exists that can produce it.
+/// envelope carries. `#[non_exhaustive]`: future tools may add
+/// `FEATURE_DISABLED` once one exists that can produce it.
 ///
-/// `ReadOnly`/`ConfirmationRequired`/`ChildrenPresent` (added in 4b-write)
-/// are used slightly differently from the rest: `ReadOnly` goes through
+/// `ReadOnly`/`ConfirmationRequired`/`ChildrenPresent` are used slightly
+/// differently from the rest: `ReadOnly` goes through
 /// [`err`] like every other code (`isError: true` — the model asked for a
 /// write the server administrator has disabled, an argument-shaped mistake
 /// it should not retry). `ConfirmationRequired`/`ChildrenPresent` are
@@ -154,20 +201,19 @@ pub(crate) fn ok<T: Serialize>(value: &T, caps: OutputCaps) -> CallToolResult {
 /// carrying `{success: false, code, hint, impact}\` so the model can inspect
 /// the impact preview — see `tools/issues.rs::DeleteRedmineIssueOutput`.
 ///
-/// `FileTooLarge`/`StoreFull` (added in phase 5c, `tools/files.rs`) are
+/// `FileTooLarge`/`StoreFull` (`tools/files.rs`) are
 /// local-storage conditions with no `redmine_client::Error` equivalent: the
 /// former means a Redmine attachment (or the bytes actually streamed for
 /// one, regardless of what its metadata or a response header claimed) is
 /// bigger than `ATTACHMENT_MAX_DOWNLOAD_BYTES`; the latter means the whole
 /// local store is at `ATTACHMENT_STORE_MAX_BYTES` even after a sweep.
 ///
-/// `SourceRequired`/`UnsupportedSource`/`PathNotAllowed` (added in phase 5e,
-/// `upload_file`) are `content_base64`/`file_path`/`source_url` argument
+/// `SourceRequired`/`UnsupportedSource`/`PathNotAllowed` (`upload_file`) are
+/// `content_base64`/`file_path`/`source_url` argument
 /// conditions that depend on more than one field at once (so they cannot be
 /// caught by `deny_unknown_fields` alone) or on server-side path validation
-/// (J7) whose failure must never distinguish "outside the roots" from
-/// "does not exist" from "not a regular file" — see
-/// `plans/phase-5e-upload-and-cleanup.md` decisions N1/N4.
+/// whose failure must never distinguish "outside the roots" from
+/// "does not exist" from "not a regular file".
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -192,7 +238,7 @@ pub(crate) enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// `true` only for [`Self::RateLimited`] and [`Self::Unreachable`] (D4):
+    /// `true` only for [`Self::RateLimited`] and [`Self::Unreachable`]:
     /// every tool description must say that `retryable: false` means do not
     /// call again with the same arguments.
     pub(crate) const fn is_retryable(self) -> bool {
@@ -201,7 +247,7 @@ impl ErrorCode {
 }
 
 /// Build an in-band error result (`isError: true`): `{error, code, retryable,
-/// hint}`. Never a protocol-level `McpError` — see D4.
+/// hint}`. Never a protocol-level `McpError`.
 pub(crate) fn err(
     code: ErrorCode,
     message: impl Into<String>,
@@ -360,5 +406,60 @@ mod tests {
         apply_caps(&mut json, caps(200, 5));
         assert_eq!(json["widgets"].as_array().unwrap().len(), 0);
         assert_eq!(json["pagination"]["truncated"], true);
+    }
+
+    fn url(s: &str) -> Url {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn content_url_rewrite_is_a_no_op_when_public_is_unset() {
+        let redmine = url("http://redmine.internal:3000");
+        let rewrite = ContentUrlRewrite::new(&redmine, None);
+        assert_eq!(
+            rewrite.apply("http://redmine.internal:3000/attachments/download/1/a.pdf"),
+            "http://redmine.internal:3000/attachments/download/1/a.pdf"
+        );
+    }
+
+    #[test]
+    fn content_url_rewrite_swaps_a_matching_origin() {
+        let redmine = url("http://redmine.internal:3000");
+        let public = url("https://redmine.example.com");
+        let rewrite = ContentUrlRewrite::new(&redmine, Some(&public));
+        assert_eq!(
+            rewrite.apply("http://redmine.internal:3000/attachments/download/1/a.pdf?x=1#f"),
+            "https://redmine.example.com/attachments/download/1/a.pdf?x=1#f"
+        );
+    }
+
+    #[test]
+    fn content_url_rewrite_preserves_a_reverse_proxy_sub_path() {
+        let redmine = url("http://redmine.internal:3000");
+        let public = url("https://example.com/redmine");
+        let rewrite = ContentUrlRewrite::new(&redmine, Some(&public));
+        assert_eq!(
+            rewrite.apply("http://redmine.internal:3000/attachments/download/1/a.pdf"),
+            "https://example.com/redmine/attachments/download/1/a.pdf"
+        );
+    }
+
+    #[test]
+    fn content_url_rewrite_leaves_a_non_matching_origin_untouched() {
+        let redmine = url("http://redmine.internal:3000");
+        let public = url("https://redmine.example.com");
+        let rewrite = ContentUrlRewrite::new(&redmine, Some(&public));
+        assert_eq!(
+            rewrite.apply("http://some-other-host/attachments/download/1/a.pdf"),
+            "http://some-other-host/attachments/download/1/a.pdf"
+        );
+    }
+
+    #[test]
+    fn content_url_rewrite_leaves_unparseable_input_untouched() {
+        let redmine = url("http://redmine.internal:3000");
+        let public = url("https://redmine.example.com");
+        let rewrite = ContentUrlRewrite::new(&redmine, Some(&public));
+        assert_eq!(rewrite.apply("not a url"), "not a url");
     }
 }
