@@ -153,6 +153,13 @@ pub(crate) fn ok<T: Serialize>(value: &T, caps: OutputCaps) -> CallToolResult {
 /// reference contract treats a delete refusal as a normal, non-error result
 /// carrying `{success: false, code, hint, impact}\` so the model can inspect
 /// the impact preview — see `tools/issues.rs::DeleteRedmineIssueOutput`.
+///
+/// `FileTooLarge`/`StoreFull` (added in phase 5c, `tools/files.rs`) are
+/// local-storage conditions with no `redmine_client::Error` equivalent: the
+/// former means a Redmine attachment (or the bytes actually streamed for
+/// one, regardless of what its metadata or a response header claimed) is
+/// bigger than `ATTACHMENT_MAX_DOWNLOAD_BYTES`; the latter means the whole
+/// local store is at `ATTACHMENT_STORE_MAX_BYTES` even after a sweep.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -169,6 +176,8 @@ pub(crate) enum ErrorCode {
     ReadOnly,
     ConfirmationRequired,
     ChildrenPresent,
+    FileTooLarge,
+    StoreFull,
 }
 
 impl ErrorCode {
@@ -289,6 +298,8 @@ mod tests {
             ErrorCode::ReadOnly,
             ErrorCode::ConfirmationRequired,
             ErrorCode::ChildrenPresent,
+            ErrorCode::FileTooLarge,
+            ErrorCode::StoreFull,
         ] {
             assert!(!code.is_retryable());
         }

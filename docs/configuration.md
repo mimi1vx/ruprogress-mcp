@@ -100,17 +100,24 @@ These are read by the upstream reference server but not by
 `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
 
 The 8 attachment-related variables the parent reference server reads are now
-*validated* (see "Attachment store" below), but — other than the store
-existing and its background sweeper running — nothing consumes them yet: no
-tool reads or writes an attachment. `REDMINE_PUBLIC_URL` in particular parses
-and is stored but its `content_url`-rewriting behaviour is not applied until
-a later sub-phase.
+*validated* (see "Attachment store" below). `get_redmine_attachment` (phase
+5c) now reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
+`ATTACHMENT_STORE_MAX_BYTES`, `AUTO_CLEANUP_ENABLED`,
+`CLEANUP_INTERVAL_MINUTES`, and `ATTACHMENT_EXPIRES_MINUTES`; the remaining
+two (`REDMINE_MCP_UPLOAD_FILE_ROOTS`, `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`) are
+unread until `upload_file`/`cleanup_attachment_files` land (5e).
+`REDMINE_PUBLIC_URL` in particular parses and is stored but its
+`content_url`-rewriting behaviour is not applied until a later sub-phase.
 
 ## Attachment store
 
 Local, on-disk staging for downloaded Redmine attachments. The store always
 exists (there is no way to disable it) and the directory is created at
-startup; no tool uses it yet.
+startup. `get_redmine_attachment` (phase 5c) is the first consumer: it
+streams a Redmine attachment's bytes into the store, enforcing the per-file
+and whole-store caps below against bytes actually received rather than any
+header or metadata field, then returns a `/files/{uuid}` URL (HTTP
+transport) or an absolute `file_path` (stdio transport).
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|

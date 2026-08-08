@@ -1452,6 +1452,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "futures-util",
  "http",
  "rand 0.9.5",
  "redmine-client",

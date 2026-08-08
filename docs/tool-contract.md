@@ -24,10 +24,12 @@ Tools currently implemented (all 36 non-app core tools from
 `create_redmine_issue`, `update_redmine_issue`, `delete_redmine_issue`,
 `copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
-`manage_redmine_wiki_page`, `get_gantt_chart`. All remaining sections below
-(MCP Apps, File Operations, Checklist Tools, Products/Contacts/Documents
-plugin families) are recorded for reference as app-plugin tools out of
-Phase 4's scope (see the parent plan's "non-app core tools" framing).
+`manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`
+(`list_files`/`upload_file`/`delete_file`/`cleanup_attachment_files` remain
+unimplemented). All remaining sections below (MCP Apps, the rest of File
+Operations, Checklist Tools, Products/Contacts/Documents plugin families)
+are recorded for reference as app-plugin tools out of Phase 4's scope (see
+the parent plan's "non-app core tools" framing).
 
 ## Project Management
 

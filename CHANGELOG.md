@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A local attachment store (no tool uses it yet): `AttachmentStore` stages
-  downloaded Redmine attachments under `ATTACHMENTS_DIR` in per-UUID
+- `get_redmine_attachment`: downloads a Redmine attachment by id and stages
+  it in the local attachment store, returning a `/files/{uuid}` URL over
+  HTTP or an absolute `file_path` over stdio (`uri_type` tells you which).
+  The per-file byte cap (`ATTACHMENT_MAX_DOWNLOAD_BYTES`) is enforced against
+  bytes actually streamed, never a `Content-Length` header or Redmine's own
+  `filesize` metadata; a full store first sweeps expired entries, then
+  refuses with `STORE_FULL` rather than filling the disk.
+- A local attachment store (now used by `get_redmine_attachment`):
+  `AttachmentStore` stages downloaded Redmine attachments under
+  `ATTACHMENTS_DIR` in per-UUID
   directories with a sanitised basename, enforces a per-file
   (`ATTACHMENT_MAX_DOWNLOAD_BYTES`) and whole-store
   (`ATTACHMENT_STORE_MAX_BYTES`) byte cap, and expires entries after

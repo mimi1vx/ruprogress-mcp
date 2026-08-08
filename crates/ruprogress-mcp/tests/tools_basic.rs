@@ -53,6 +53,7 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "search_entire_redmine",
     "manage_redmine_wiki_page",
     "get_gantt_chart",
+    "get_redmine_attachment",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -147,6 +148,7 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "search_entire_redmine",
     "manage_redmine_wiki_page",
     "get_gantt_chart",
+    "get_redmine_attachment",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -564,6 +566,22 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
         })))
         .mount(&h.redmine)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachment": {
+                "id": 1, "filename": "report.pdf", "filesize": 5,
+                "content_url": format!("{}/attachments/download/1/report.pdf", h.redmine.uri()),
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/download/1/report.pdf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&h.redmine)
+        .await;
 
     let tools = h
         .client
@@ -597,6 +615,8 @@ async fn every_implemented_tool_call_returns_structured_content_matching_its_sch
             request.arguments = json!({"project_id": 1}).as_object().cloned();
         } else if issue_id_only_tools.contains(&tool.name.as_ref()) {
             request.arguments = json!({"issue_id": 1}).as_object().cloned();
+        } else if tool.name.as_ref() == "get_redmine_attachment" {
+            request.arguments = json!({"attachment_id": 1}).as_object().cloned();
         } else if ["search_redmine_issues", "search_entire_redmine"].contains(&tool.name.as_ref()) {
             request.arguments = json!({"query": "test"}).as_object().cloned();
         }

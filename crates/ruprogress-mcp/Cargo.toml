@@ -17,6 +17,7 @@ redmine-client = { path = "../redmine-client" }
 rmcp        = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio       = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "fs", "io-util"] }
 tokio-util  = { workspace = true, features = ["rt", "io"] }
+futures-util = { workspace = true }
 uuid        = { workspace = true, features = ["serde"] }
 axum        = { workspace = true }
 tower-http  = { workspace = true, features = ["cors", "trace", "timeout", "set-header"] }
