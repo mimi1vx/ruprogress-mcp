@@ -160,6 +160,14 @@ pub(crate) fn ok<T: Serialize>(value: &T, caps: OutputCaps) -> CallToolResult {
 /// one, regardless of what its metadata or a response header claimed) is
 /// bigger than `ATTACHMENT_MAX_DOWNLOAD_BYTES`; the latter means the whole
 /// local store is at `ATTACHMENT_STORE_MAX_BYTES` even after a sweep.
+///
+/// `SourceRequired`/`UnsupportedSource`/`PathNotAllowed` (added in phase 5e,
+/// `upload_file`) are `content_base64`/`file_path`/`source_url` argument
+/// conditions that depend on more than one field at once (so they cannot be
+/// caught by `deny_unknown_fields` alone) or on server-side path validation
+/// (J7) whose failure must never distinguish "outside the roots" from
+/// "does not exist" from "not a regular file" — see
+/// `plans/phase-5e-upload-and-cleanup.md` decisions N1/N4.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -178,6 +186,9 @@ pub(crate) enum ErrorCode {
     ChildrenPresent,
     FileTooLarge,
     StoreFull,
+    SourceRequired,
+    UnsupportedSource,
+    PathNotAllowed,
 }
 
 impl ErrorCode {
@@ -300,6 +311,9 @@ mod tests {
             ErrorCode::ChildrenPresent,
             ErrorCode::FileTooLarge,
             ErrorCode::StoreFull,
+            ErrorCode::SourceRequired,
+            ErrorCode::UnsupportedSource,
+            ErrorCode::PathNotAllowed,
         ] {
             assert!(!code.is_retryable());
         }

@@ -48,6 +48,9 @@ impl RedmineMcp {
                 router.remove_route(name);
             }
         }
+        if !config.attachments.expose_admin_tools {
+            router.remove_route("cleanup_attachment_files");
+        }
         if config.schema_dialect == SchemaDialect::Portable {
             for route in router.map.values_mut() {
                 route.attr.input_schema = Arc::new(schema::to_portable(&route.attr.input_schema));

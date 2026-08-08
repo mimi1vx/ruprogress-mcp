@@ -100,14 +100,14 @@ These are read by the upstream reference server but not by
 `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
 
 The 8 attachment-related variables the parent reference server reads are now
-*validated* (see "Attachment store" below). `get_redmine_attachment` (phase
-5c) now reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
+*validated and read* (see "Attachment store" below). `get_redmine_attachment`
+(phase 5c) reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
 `ATTACHMENT_STORE_MAX_BYTES`, `AUTO_CLEANUP_ENABLED`,
-`CLEANUP_INTERVAL_MINUTES`, and `ATTACHMENT_EXPIRES_MINUTES`; the remaining
-two (`REDMINE_MCP_UPLOAD_FILE_ROOTS`, `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`) are
-unread until `upload_file`/`cleanup_attachment_files` land (5e).
-`REDMINE_PUBLIC_URL` in particular parses and is stored but its
-`content_url`-rewriting behaviour is not applied until a later sub-phase.
+`CLEANUP_INTERVAL_MINUTES`, and `ATTACHMENT_EXPIRES_MINUTES`;
+`upload_file`/`cleanup_attachment_files` (phase 5e) read
+`REDMINE_MCP_UPLOAD_FILE_ROOTS` and `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`
+respectively. `REDMINE_PUBLIC_URL` in particular parses and is stored but its
+`content_url`-rewriting behaviour is not applied until a later sub-phase (5f).
 
 ## Attachment store
 
@@ -127,8 +127,8 @@ transport) or an absolute `file_path` (stdio transport).
 | `AUTO_CLEANUP_ENABLED` | no | `true` | Whether the background sweeper task runs at all. |
 | `CLEANUP_INTERVAL_MINUTES` | no | `15` | Positive integer. How often the sweeper runs. |
 | `ATTACHMENT_EXPIRES_MINUTES` | no | `60` | Positive integer. How long a stored file stays fetchable. Checked on every lookup (not just by the interval sweeper), so an expired file is refused immediately rather than up to `CLEANUP_INTERVAL_MINUTES` late. |
-| `REDMINE_MCP_UPLOAD_FILE_ROOTS` | no | `[]` | Comma-separated **absolute** directory paths. Unread until a later sub-phase adds `upload_file`'s `file_path` source; empty means every such upload will be refused then. |
-| `REDMINE_MCP_EXPOSE_ADMIN_TOOLS` | no | `false` | Unread until a later sub-phase registers `cleanup_attachment_files`. |
+| `REDMINE_MCP_UPLOAD_FILE_ROOTS` | no | `[]` | Comma-separated **absolute** directory paths `upload_file`'s `file_path` source may read from, in addition to `ATTACHMENTS_DIR` itself (always allowed). Empty means only `ATTACHMENTS_DIR` is allowed. |
+| `REDMINE_MCP_EXPOSE_ADMIN_TOOLS` | no | `false` | Registers `cleanup_attachment_files` when `true`; otherwise the tool does not appear in `tools/list` at all. |
 | `REDMINE_PUBLIC_URL` | no | — | Must be a valid `http`/`https` URL. Parsed and validated now; the `content_url`-rewriting behaviour it controls is not applied until a later sub-phase. |
 
 `GET /files/{uuid}` (HTTP transport only) serves a stored file:
@@ -136,6 +136,16 @@ transport) or an absolute `file_path` (stdio transport).
 `Cache-Control: no-store`, and a sanitised filename. `404` for an unknown or
 expired UUID; `403` for a `Host` header outside the same allowlist `/mcp`
 uses (see "`public_base`" above).
+
+`upload_file`'s two sources have two different, unrelated size ceilings:
+`content_base64` is bounded by `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` on the
+HTTP transport (the request body itself; the base64 encoding means roughly
+three-quarters of that byte count survives decoding); `file_path` has its own
+fixed 50 MiB limit, independent of `ATTACHMENT_MAX_DOWNLOAD_BYTES` (which
+bounds the opposite direction, a Redmine attachment downloading onto local
+disk). A `file_path` upload is refused with `PATH_NOT_ALLOWED` — never a path
+or existence detail — unless it resolves inside `ATTACHMENTS_DIR` or a
+`REDMINE_MCP_UPLOAD_FILE_ROOTS` entry.
 
 ## Exposing the server on a network
 

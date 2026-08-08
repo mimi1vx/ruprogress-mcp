@@ -41,6 +41,13 @@ pub mod write_tools {
     ///
     /// 5d adds `delete_file` (always mutates when called). `list_files` is
     /// not here: it is a read, matching `get_redmine_attachment` (5c).
+    ///
+    /// 5e adds `upload_file` (always mutates Redmine when called).
+    /// `cleanup_attachment_files` is deliberately **not** here: it mutates
+    /// only the local attachment store, never Redmine, so read-only mode
+    /// does not gate it (J9) — it is instead removed from the router
+    /// entirely unless `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true` (see
+    /// `server.rs`).
     pub const ALL: &[&str] = &[
         "manage_redmine_version",
         "manage_project_member",
@@ -53,6 +60,7 @@ pub mod write_tools {
         "manage_issue_watcher",
         "manage_issue_note",
         "delete_file",
+        "upload_file",
     ];
 
     /// Tools with a mix of read and write `action`s (D8): never removed from

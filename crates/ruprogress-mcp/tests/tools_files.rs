@@ -1,10 +1,16 @@
-//! e2e: `get_redmine_attachment`, `list_files`, `delete_file`.
+//! e2e: `get_redmine_attachment`, `list_files`, `delete_file`, `upload_file`,
+//! `cleanup_attachment_files`.
 //! `get_redmine_attachment`: happy path per transport (the `uri_type`
 //! branch), the `FILE_TOO_LARGE` pre-check and mid-stream enforcement,
 //! `STORE_FULL`, and the dominant `redmine_client::Error` passthrough.
 //! `list_files`: the Files-module shape, including `digest`/`downloads`/
 //! `version`. `delete_file`: the unconditional confirmation guard (M1/M2 in
 //! `plans/phase-5d-list-and-delete-file.md`) and the success shape.
+//! `upload_file`: the `content_base64` source (the `file_path` source's
+//! own path-validation suite lives in `tests/upload_paths.rs`), the source
+//! arity/`UNSUPPORTED_SOURCE` checks (N1), and the `create_upload`-only
+//! `FILE_TOO_LARGE` remap (N7). `cleanup_attachment_files`: admin-gated
+//! registration (N9) and the sweep-result shape.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -336,4 +342,293 @@ async fn delete_file_404_surfaces_as_not_found() {
         result.structured_content.expect("structured error")["code"],
         "NOT_FOUND"
     );
+}
+
+async fn mock_upload_flow(redmine: &wiremock::MockServer, id: u64, filename: &str) {
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "upload": {"id": id, "token": format!("{id}.token")}
+        })))
+        .mount(redmine)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/projects/1/files.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/attachments/{id}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachment": {
+                "id": id, "filename": filename, "filesize": 11,
+                "content_type": "text/plain",
+                "content_url": format!("{}/attachments/download/{id}/{filename}", redmine.uri()),
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(redmine)
+        .await;
+}
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[tokio::test]
+async fn upload_file_with_content_base64_happy_path() {
+    let h = support::harness(&[]).await;
+    mock_upload_flow(&h.redmine, 99, "notes.txt").await;
+
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({
+            "project_id": 1,
+            "filename": "notes.txt",
+            "content_base64": base64_of(b"hello world"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "{:?}",
+        result.structured_content
+    );
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(structured["id"], 99);
+    assert_eq!(structured["filename"], "notes.txt");
+}
+
+#[tokio::test]
+async fn upload_file_without_a_source_is_source_required() {
+    let h = support::harness(&[]).await;
+    let result = call_tool(&h, "upload_file", json!({"project_id": 1})).await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.expect("structured error")["code"],
+        "SOURCE_REQUIRED"
+    );
+}
+
+#[tokio::test]
+async fn upload_file_with_two_sources_is_source_required() {
+    let h = support::harness(&[]).await;
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({
+            "project_id": 1,
+            "content_base64": base64_of(b"x"),
+            "file_path": "/tmp/whatever.txt",
+        }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.expect("structured error")["code"],
+        "SOURCE_REQUIRED"
+    );
+}
+
+#[tokio::test]
+async fn upload_file_with_source_url_is_unsupported_source() {
+    let h = support::harness(&[]).await;
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({"project_id": 1, "source_url": "https://example.com/report.pdf"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "UNSUPPORTED_SOURCE");
+    let message = structured["error"].as_str().expect("error message");
+    assert!(message.contains("content_base64"));
+    assert!(message.contains("file_path"));
+}
+
+#[tokio::test]
+async fn upload_file_content_base64_without_filename_is_a_protocol_error() {
+    let h = support::harness(&[]).await;
+    let mut request = CallToolRequestParams::new("upload_file".to_string());
+    request.arguments = json!({"project_id": 1, "content_base64": base64_of(b"x")})
+        .as_object()
+        .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(
+        result.is_err(),
+        "a missing filename with content_base64 should be a protocol-level error, not an in-band one"
+    );
+}
+
+#[tokio::test]
+async fn upload_file_malformed_base64_is_a_protocol_error() {
+    let h = support::harness(&[]).await;
+    let mut request = CallToolRequestParams::new("upload_file".to_string());
+    request.arguments = json!({
+        "project_id": 1, "filename": "x.txt", "content_base64": "not valid base64!!"
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn upload_file_413_from_create_upload_maps_to_file_too_large() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(413))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({"project_id": 1, "filename": "big.bin", "content_base64": base64_of(b"x")}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "FILE_TOO_LARGE");
+}
+
+#[tokio::test]
+async fn upload_file_422_from_create_upload_also_maps_to_file_too_large() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "errors": ["File is too big"]
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({"project_id": 1, "filename": "big.bin", "content_base64": base64_of(b"x")}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "FILE_TOO_LARGE");
+}
+
+#[tokio::test]
+async fn upload_file_422_from_create_project_file_is_validation_failed_not_file_too_large() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "upload": {"id": 1, "token": "1.token"}
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/projects/1/files.json"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "errors": ["Version does not exist"]
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({
+            "project_id": 1, "filename": "x.txt", "content_base64": base64_of(b"x"),
+            "version_id": 999
+        }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "VALIDATION_FAILED");
+}
+
+#[tokio::test]
+async fn upload_file_is_blocked_in_read_only_mode() {
+    let h = support::harness(&[("REDMINE_MCP_READ_ONLY", "true")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    assert!(!tools.tools.iter().any(|t| t.name == "upload_file"));
+}
+
+#[tokio::test]
+async fn cleanup_attachment_files_is_not_registered_by_default() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    assert!(
+        !tools
+            .tools
+            .iter()
+            .any(|t| t.name == "cleanup_attachment_files")
+    );
+}
+
+#[tokio::test]
+async fn cleanup_attachment_files_reports_zero_when_nothing_is_expired() {
+    let h = support::harness(&[("REDMINE_MCP_EXPOSE_ADMIN_TOOLS", "true")]).await;
+    let result = call_tool(&h, "cleanup_attachment_files", json!({})).await;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(structured["cleaned_files"], 0);
+    assert_eq!(structured["cleaned_bytes"], 0);
+    assert_eq!(structured["cleaned_mb"], 0.0);
+}
+
+#[tokio::test]
+async fn cleanup_attachment_files_sweeps_an_expired_download() {
+    let h = support::harness(&[
+        ("REDMINE_MCP_EXPOSE_ADMIN_TOOLS", "true"),
+        ("ATTACHMENT_EXPIRES_MINUTES", "1"),
+    ])
+    .await;
+    mock_attachment(&h.redmine, 1, "old.bin", 5, b"hello").await;
+    let download = call(&h, json!({"attachment_id": 1})).await;
+    assert_eq!(download.is_error, Some(false));
+
+    // `sweep_expired` reaps by directory mtime (K1); backdate it past the
+    // 1-minute TTL instead of sleeping in the test.
+    let dir = download.structured_content.expect("structured content")["file_path"]
+        .as_str()
+        .expect("file_path should be a string")
+        .to_string();
+    let entry_dir = std::path::Path::new(&dir)
+        .parent()
+        .expect("staged file has a parent uuid directory");
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_mins(2);
+    std::fs::File::open(entry_dir)
+        .expect("open the uuid directory")
+        .set_modified(stale)
+        .expect("backdate the uuid directory's mtime");
+
+    let result = call_tool(&h, "cleanup_attachment_files", json!({})).await;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(structured["cleaned_files"], 1);
+    assert_eq!(structured["cleaned_bytes"], 5);
+}
+
+#[tokio::test]
+async fn cleanup_attachment_files_still_works_in_read_only_mode() {
+    let h = support::harness(&[
+        ("REDMINE_MCP_EXPOSE_ADMIN_TOOLS", "true"),
+        ("REDMINE_MCP_READ_ONLY", "true"),
+    ])
+    .await;
+    let result = call_tool(&h, "cleanup_attachment_files", json!({})).await;
+    assert_eq!(result.is_error, Some(false));
 }

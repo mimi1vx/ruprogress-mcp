@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `upload_file`: uploads a file and attaches it to a project's Files module
+  (`POST /uploads.json` then `POST /projects/{id}/files.json`). Accepts
+  `content_base64` (requires `filename`) or `file_path` (an absolute path
+  inside `ATTACHMENTS_DIR` or a `REDMINE_MCP_UPLOAD_FILE_ROOTS` entry, capped
+  at 50 MiB and validated against symlink/FIFO/device traversal before it is
+  ever opened); `source_url` is recognised but always refused with
+  `UNSUPPORTED_SOURCE`. Write tool, blocked in read-only mode.
+- `cleanup_attachment_files`: runs the local attachment store's expiry sweep
+  on demand and reports `{cleaned_files, cleaned_bytes, cleaned_mb}`. Mutates
+  only local disk, never Redmine, so it still works in read-only mode;
+  registered only when `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`.
+- `REDMINE_MCP_UPLOAD_FILE_ROOTS` and `REDMINE_MCP_EXPOSE_ADMIN_TOOLS` are now
+  read by `upload_file`/`cleanup_attachment_files` respectively (previously
+  validated but unread).
 - `list_files`: lists a project's Files-module entries (`GET
   /projects/{id}/files.json`) — not issue attachments, not DMSF.
 - `delete_file`: deletes an attachment by id (`DELETE /attachments/{id}.json`).
@@ -39,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/files/{uuid}` URLs correctly behind a TLS-terminating proxy.
 - `REDMINE_MCP_UPLOAD_FILE_ROOTS`, `REDMINE_MCP_EXPOSE_ADMIN_TOOLS`, and
   `REDMINE_PUBLIC_URL` are now validated (previously listed as "not yet
-  implemented"); none of them are consulted by any tool yet.
+  implemented"); `REDMINE_PUBLIC_URL`'s `content_url`-rewriting behaviour is
+  not applied yet.
 - Opt-in `REDMINE_MCP_SCHEMA_DIALECT=portable` for clients whose provider
   rejects `$ref`/`$defs` and nullable type arrays in function-calling
   declarations (Google Vertex/Gemini). Default `strict` is unchanged.

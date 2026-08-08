@@ -10,7 +10,8 @@ the upstream doc is authoritative; re-vendor when implementing more tools.
 
 Tools currently implemented (the 36 non-app core tools from
 `plans/phase-4-core-tools.md` plus phase 5's `get_redmine_attachment`,
-`list_files`, `delete_file`; kept in sync with `IMPLEMENTED_TOOLS` in
+`list_files`, `delete_file`, `upload_file`, and the admin-gated
+`cleanup_attachment_files`; kept in sync with `IMPLEMENTED_TOOLS` in
 `crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
 `get_mcp_server_info`, `get_current_user`, `list_redmine_projects`,
 `list_redmine_trackers`, `list_project_trackers`,
@@ -26,12 +27,14 @@ Tools currently implemented (the 36 non-app core tools from
 `copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
 `manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`,
-`list_files`, `delete_file`
-(`upload_file`/`cleanup_attachment_files` remain unimplemented). All
-remaining sections below (MCP Apps, the rest of File Operations, Checklist
-Tools, Products/Contacts/Documents plugin families) are recorded for
-reference as app-plugin tools out of Phase 4's scope (see the parent plan's
-"non-app core tools" framing).
+`list_files`, `delete_file`, `upload_file`, and (only with
+`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`. `
+upload_file` accepts `content_base64`/`file_path` only — `source_url` is
+recognised as a parameter but always refused with `UNSUPPORTED_SOURCE`,
+deferred to a future release. All remaining sections below (MCP Apps, the
+rest of File Operations, Checklist Tools, Products/Contacts/Documents
+plugin families) are recorded for reference as app-plugin tools out of
+Phase 4's scope (see the parent plan's "non-app core tools" framing).
 
 ## Project Management
 

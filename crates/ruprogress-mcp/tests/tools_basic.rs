@@ -56,6 +56,7 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "get_redmine_attachment",
     "list_files",
     "delete_file",
+    "upload_file",
 ];
 
 /// Every tool name in `docs/tool-contract.md` (vendored from the upstream
@@ -153,6 +154,7 @@ const TOOLS_WITH_PARAMETERS: &[&str] = &[
     "get_redmine_attachment",
     "list_files",
     "delete_file",
+    "upload_file",
 ];
 
 fn content_text(result: &rmcp::model::CallToolResult) -> String {
@@ -704,6 +706,11 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// still has headroom, and 4g needs no new tool (the `get_mcp_server_info`
 /// extension already landed as part of 4.0's retrofit) — this is the final
 /// tool the Phase 4 core-tools threshold needs to cover.
+///
+/// Revised at 5e (41 tools including `upload_file`'s multi-field input
+/// schema, 121 008 bytes observed): 120 000 no longer has headroom. 135 000
+/// leaves room for 5f (no new tool, `uploads[]` added to two existing input
+/// schemas) at a similar per-tool rate.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold() {
     let h = support::harness(&[]).await;
@@ -714,8 +721,8 @@ async fn tools_list_serialized_size_stays_under_the_phase_4_baseline_threshold()
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
-        bytes.len() < 120_000,
-        "tools/list is {} bytes for {} tools; over the Phase 4 baseline threshold of 120000",
+        bytes.len() < 135_000,
+        "tools/list is {} bytes for {} tools; over the 5e baseline threshold of 135000",
         bytes.len(),
         tools.tools.len()
     );

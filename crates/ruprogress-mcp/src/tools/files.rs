@@ -1,20 +1,24 @@
-//! File tools: `get_redmine_attachment`, `list_files`, `delete_file`.
-//! `upload_file`/`cleanup_attachment_files` land alongside them in this
-//! module later.
+//! File tools: `get_redmine_attachment`, `list_files`, `delete_file`,
+//! `upload_file`, `cleanup_attachment_files`.
 //!
-//! This is the first tool in the codebase that writes to the local
-//! filesystem — see `attachments.rs` for the store it writes into.
+//! This is the first tool module in the codebase that writes to the local
+//! filesystem — see `attachments.rs` for the store `get_redmine_attachment`
+//! writes into and `cleanup_attachment_files` sweeps.
 
+use base64::Engine as _;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt as _;
 use redmine_client::AttachmentId;
 use redmine_client::model::attachment::Attachment;
+use redmine_client::model::upload::ProjectFileCreate;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::attachments::{AttachmentStore, Reservation, StoredFile};
@@ -25,6 +29,14 @@ use crate::server::RedmineMcp;
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::issues::{IdNameOut, id_name_out};
 use crate::tools::output::{self, ErrorCode, err};
+
+/// `upload_file`'s own per-file cap for the `file_path` source (decision N5
+/// in `plans/phase-5e-upload-and-cleanup.md`): independent of
+/// `ATTACHMENT_MAX_DOWNLOAD_BYTES`, which bounds the opposite direction
+/// (Redmine → local disk). Matches the vendored reference contract's
+/// documented 50 MiB limit; not configurable, since it is a fixed property
+/// of this server's `upload_file` implementation, not a deployment choice.
+const UPLOAD_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 // --- get_redmine_attachment ---
 
@@ -87,6 +99,158 @@ fn local_storage_error(context: &str) -> CallToolResult {
             "this is a server configuration problem the model cannot fix; report it to the operator",
         ),
     )
+}
+
+fn source_required() -> CallToolResult {
+    err(
+        ErrorCode::SourceRequired,
+        "upload_file requires exactly one of content_base64 or file_path",
+        Some("set exactly one source field and retry"),
+    )
+}
+
+fn unsupported_source() -> CallToolResult {
+    err(
+        ErrorCode::UnsupportedSource,
+        "source_url is not supported by this server; use content_base64 or file_path instead",
+        Some(
+            "fetch the URL's bytes yourself and pass them via content_base64, or stage the file locally and use file_path",
+        ),
+    )
+}
+
+fn path_not_allowed() -> CallToolResult {
+    err(
+        ErrorCode::PathNotAllowed,
+        "file_path is not inside ATTACHMENTS_DIR or a directory listed in REDMINE_MCP_UPLOAD_FILE_ROOTS, does not exist, or is not a regular file",
+        Some(
+            "use content_base64 instead, or ask the operator to add this location to REDMINE_MCP_UPLOAD_FILE_ROOTS",
+        ),
+    )
+}
+
+fn upload_file_path_too_large(actual: u64) -> CallToolResult {
+    err(
+        ErrorCode::FileTooLarge,
+        format!(
+            "the file is {actual} bytes, larger than upload_file's {UPLOAD_FILE_MAX_BYTES}-byte limit"
+        ),
+        Some(
+            "this server cannot upload a file this large; split the content or upload it to Redmine some other way",
+        ),
+    )
+}
+
+fn upload_rejected_as_too_large() -> CallToolResult {
+    err(
+        ErrorCode::FileTooLarge,
+        "Redmine rejected the upload as too large",
+        Some(
+            "the limit may be Redmine's own attachment_max_size setting, not this server's; ask the operator to check it",
+        ),
+    )
+}
+
+/// Validates a `file_path` upload source per decision N4
+/// (`plans/phase-5e-upload-and-cleanup.md`): reject non-absolute paths,
+/// canonicalise, prefix-check against `roots` plus `store_dir` (N3), stat
+/// the canonical path to reject non-regular files *before* opening, `open`
+/// the canonicalised path, `fstat` the open handle, and on Unix require the
+/// fstat'd `(dev, ino)` to match a fresh stat of the canonical path —
+/// closing the canonicalise-then-open TOCTOU window (J7).
+///
+/// The pre-open stat exists for more than defense in depth: `File::open` on
+/// a FIFO with no writer blocks the calling thread indefinitely (a device
+/// node can have similar surprises), so a hostile or merely misplaced
+/// special file inside an allowed root must be rejected by its type before
+/// this function ever calls `open`, not only after. A file swapped for a
+/// FIFO in the narrow window between this stat and the `open` below would
+/// still block — an accepted residual risk, since it requires write access
+/// to the exact canonical path of an operator-configured upload root at the
+/// exact moment of a request, not something a caller's `file_path` alone
+/// can trigger.
+///
+/// Every failure in this chain — non-absolute, outside every root, missing,
+/// not a regular file, a dev/ino mismatch — collapses to the same
+/// `PATH_NOT_ALLOWED` error. Distinguishing them would hand a caller an
+/// oracle for probing the local filesystem.
+async fn read_and_validate_upload_path(
+    roots: &[PathBuf],
+    store_dir: &Path,
+    raw: &str,
+) -> Result<(Bytes, Option<String>), CallToolResult> {
+    let requested = Path::new(raw);
+    if !requested.is_absolute() {
+        return Err(path_not_allowed());
+    }
+
+    let canonical = tokio::fs::canonicalize(requested)
+        .await
+        .map_err(|_| path_not_allowed())?;
+
+    let mut allowed = false;
+    for root in roots
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(store_dir))
+    {
+        if let Ok(canon_root) = tokio::fs::canonicalize(root).await
+            && canonical.starts_with(&canon_root)
+        {
+            allowed = true;
+            break;
+        }
+    }
+    if !allowed {
+        return Err(path_not_allowed());
+    }
+
+    let pre_open_meta = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| path_not_allowed())?;
+    if !pre_open_meta.is_file() {
+        return Err(path_not_allowed());
+    }
+    if pre_open_meta.len() > UPLOAD_FILE_MAX_BYTES {
+        return Err(upload_file_path_too_large(pre_open_meta.len()));
+    }
+
+    let mut file = tokio::fs::File::open(&canonical)
+        .await
+        .map_err(|_| path_not_allowed())?;
+    // `File::metadata` on Unix is an `fstat` of the already-open handle, not
+    // a fresh path lookup — the authoritative check J7 calls for; the stat
+    // above is only what makes it safe to reach this `open` at all.
+    let handle_meta = file.metadata().await.map_err(|_| path_not_allowed())?;
+    if !handle_meta.is_file() {
+        return Err(path_not_allowed());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let path_meta = std::fs::metadata(&canonical).map_err(|_| path_not_allowed())?;
+        if path_meta.dev() != handle_meta.dev() || path_meta.ino() != handle_meta.ino() {
+            return Err(path_not_allowed());
+        }
+    }
+
+    if handle_meta.len() > UPLOAD_FILE_MAX_BYTES {
+        return Err(upload_file_path_too_large(handle_meta.len()));
+    }
+
+    // Reads from the already-validated handle, not a fresh open of
+    // `canonical`: a second open-by-path here would reintroduce the exact
+    // TOCTOU window the fstat check above exists to close.
+    let mut contents = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut contents)
+        .await
+        .map_err(|_| local_storage_error("read the requested file_path"))?;
+    let inferred_filename = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(ToString::to_string);
+    Ok((Bytes::from(contents), inferred_filename))
 }
 
 /// Streams `attachment`'s content into `reservation.path` and commits it,
@@ -271,6 +435,46 @@ pub(crate) struct DeleteFileOutput {
     pub(crate) deleted_file_id: u64,
 }
 
+// --- upload_file ---
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UploadFileParams {
+    /// The project to attach the uploaded file to.
+    pub(crate) project_id: ProjectRef,
+    /// Name the file should have in Redmine. Required when using
+    /// `content_base64`; inferred from the path when using `file_path`.
+    pub(crate) filename: Option<String>,
+    /// Raw file bytes, base64-encoded. Exactly one of `content_base64`/
+    /// `file_path` must be set.
+    pub(crate) content_base64: Option<String>,
+    /// Absolute path to a file already on this server: inside
+    /// `ATTACHMENTS_DIR` or a directory listed in
+    /// `REDMINE_MCP_UPLOAD_FILE_ROOTS`. Limited to 50 MiB.
+    pub(crate) file_path: Option<String>,
+    /// Not supported by this server. Present only so a caller who sends it
+    /// gets a precise `UNSUPPORTED_SOURCE` refusal instead of a schema
+    /// error; use `content_base64` or `file_path` instead.
+    pub(crate) source_url: Option<String>,
+    /// Human-readable description shown in the Files module.
+    pub(crate) description: Option<String>,
+    /// Attach to this version instead of the project directly.
+    pub(crate) version_id: Option<u64>,
+}
+
+// --- cleanup_attachment_files ---
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names match the reference contract's documented {cleaned_files, cleaned_bytes, cleaned_mb} shape verbatim"
+)]
+pub(crate) struct CleanupAttachmentFilesOutput {
+    pub(crate) cleaned_files: u64,
+    pub(crate) cleaned_bytes: u64,
+    pub(crate) cleaned_mb: f64,
+}
+
 #[tool_router(router = files_tool_router, vis = "pub(crate)")]
 impl RedmineMcp {
     /// `GET /attachments/{id}.json` for metadata, then streams the file
@@ -406,6 +610,164 @@ impl RedmineMcp {
             &DeleteFileOutput {
                 success: true,
                 deleted_file_id: params.file_id,
+            },
+            self.output_caps(),
+        ))
+    }
+
+    /// The two-step attach flow: `POST /uploads.json` for a token (raw
+    /// bytes, `content_base64` decoded or `file_path` read locally per
+    /// [`read_and_validate_upload_path`]), then `POST
+    /// /projects/{id}/files.json` to attach it. Redmine answers the second
+    /// call `204 No Content`, so the id from the first call is re-fetched
+    /// via `GET /attachments/{id}.json` for the response.
+    #[tool(
+        description = "Upload a file and attach it to a project's Files module. Exactly one of content_base64 (requires filename) or file_path is required; source_url is not supported and returns UNSUPPORTED_SOURCE. file_path must be inside ATTACHMENTS_DIR or REDMINE_MCP_UPLOAD_FILE_ROOTS, capped at 50 MiB. Use this when attaching a file to a project. Write tool; blocked in read-only mode.",
+        input_schema = crate::tools::schema::input::<UploadFileParams>(),
+        output_schema = crate::tools::schema::output::<FileEntryOut>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+    )]
+    pub(crate) async fn upload_file(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UploadFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let UploadFileParams {
+            project_id,
+            mut filename,
+            content_base64,
+            file_path,
+            source_url,
+            description,
+            version_id,
+        } = params;
+
+        let sources_set = [
+            content_base64.is_some(),
+            file_path.is_some(),
+            source_url.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if sources_set != 1 {
+            return Ok(source_required());
+        }
+        if source_url.is_some() {
+            return Ok(unsupported_source());
+        }
+
+        let body: Bytes = if let Some(b64) = content_base64 {
+            if filename.is_none() {
+                return Err(McpError::invalid_params(
+                    "filename is required when using content_base64",
+                    None,
+                ));
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| {
+                    McpError::invalid_params(
+                        format!("content_base64 is not valid base64: {e}"),
+                        None,
+                    )
+                })?;
+            Bytes::from(decoded)
+        } else {
+            // `sources_set == 1` and `source_url`/`content_base64` are both
+            // excluded above, so `file_path` must be set.
+            let raw_path = file_path.unwrap_or_default();
+            let store = self.attachments();
+            let (contents, inferred) = match read_and_validate_upload_path(
+                &self.inner.config.attachments.upload_file_roots,
+                store.dir(),
+                &raw_path,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(result) => return Ok(result),
+            };
+            if filename.is_none() {
+                filename = inferred;
+            }
+            contents
+        };
+
+        let project_ident = resolve_project_ref(project_id)?;
+        let scoped = self.scoped(&ctx)?;
+
+        let upload = match scoped.create_upload(body, filename.as_deref(), None).await {
+            Ok(u) => u,
+            // N7: a 413/422 from this specific step is a size condition,
+            // not a validation one — Redmine's own `attachment_max_size`
+            // setting, not `create_project_file`'s token/version_id
+            // validation (left to the generic mapping below).
+            Err(redmine_client::Error::Api { status, .. })
+                if status == http::StatusCode::PAYLOAD_TOO_LARGE
+                    || status == http::StatusCode::UNPROCESSABLE_ENTITY =>
+            {
+                return Ok(upload_rejected_as_too_large());
+            }
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let new_file = ProjectFileCreate {
+            token: upload.token,
+            filename: None,
+            content_type: None,
+            description,
+            version_id,
+        };
+        if let Err(e) = scoped.create_project_file(&project_ident, &new_file).await {
+            return Ok(to_tool_error(e));
+        }
+
+        let attachment = match scoped.get_attachment(AttachmentId(upload.id)).await {
+            Ok(a) => a,
+            Err(e) => return Ok(to_tool_error(e)),
+        };
+
+        let boundary = Boundary::new();
+        Ok(output::ok(
+            &file_entry_out(&boundary, &attachment),
+            self.output_caps(),
+        ))
+    }
+
+    /// Runs the same expiry sweep the background task performs
+    /// ([`AttachmentStore::sweep_expired`]) on demand. Local-disk-only —
+    /// never touches Redmine — so unlike every other write tool it is
+    /// **not** gated by `REDMINE_MCP_READ_ONLY` (J9); instead it is removed
+    /// from the router entirely unless `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`
+    /// (see `RedmineMcp::new`).
+    #[tool(
+        description = "Immediately sweep expired files out of the local attachment store, the same cleanup the background sweeper performs on a timer, and report how much was reclaimed. Local-disk-only; never touches Redmine, so it still works in read-only mode. Use this to free disk space now instead of waiting for CLEANUP_INTERVAL_MINUTES. Admin tool, requires REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true.",
+        output_schema = crate::tools::schema::output::<CleanupAttachmentFilesOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+    )]
+    pub(crate) async fn cleanup_attachment_files(&self) -> Result<CallToolResult, McpError> {
+        let result = self.attachments().sweep_expired().await;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "an approximate MB figure for a human-readable summary; exact byte counts are in cleaned_bytes"
+        )]
+        let cleaned_mb = result.removed_bytes as f64 / (1024.0 * 1024.0);
+        Ok(output::ok(
+            &CleanupAttachmentFilesOutput {
+                cleaned_files: result.removed_files,
+                cleaned_bytes: result.removed_bytes,
+                cleaned_mb,
             },
             self.output_caps(),
         ))
