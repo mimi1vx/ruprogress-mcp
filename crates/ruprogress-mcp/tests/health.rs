@@ -159,6 +159,8 @@ async fn readyz_reports_not_probed_when_the_server_owns_no_credential() {
     let harness = support::http_harness(&[
         ("REDMINE_AUTH_MODE", "oauth"),
         ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
+        ("REDMINE_INTROSPECT_CLIENT_ID", "introspect-client"),
+        ("REDMINE_INTROSPECT_CLIENT_SECRET", "introspect-secret"),
     ])
     .await;
 

@@ -10,6 +10,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
 use crate::attachments::AttachmentStore;
+use crate::auth::oauth::TokenVerifier;
 use crate::config::{AuthMode, Config, SchemaDialect};
 use crate::readonly::write_tools;
 use crate::tools::schema;
@@ -25,6 +26,10 @@ pub(crate) struct ServerInner {
     pub(crate) client: RedmineClient,
     pub(crate) config: Config,
     pub(crate) attachments: Arc<AttachmentStore>,
+    /// `Some` only in `AuthMode::OAuth`, built once here so
+    /// `transport::http::router`'s middleware and `health`'s future
+    /// introspection probe share one verifier — and therefore one cache.
+    pub(crate) oauth_verifier: Option<Arc<TokenVerifier>>,
 }
 
 impl RedmineMcp {
@@ -56,14 +61,27 @@ impl RedmineMcp {
                 route.attr.input_schema = Arc::new(schema::to_portable(&route.attr.input_schema));
             }
         }
+        let oauth_verifier = match &config.auth {
+            AuthMode::OAuth(oauth) => Some(Arc::new(TokenVerifier::new(client.clone(), oauth))),
+            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
+        };
         Self {
             inner: Arc::new(ServerInner {
                 client,
                 config,
                 attachments,
+                oauth_verifier,
             }),
             tool_router: router,
         }
+    }
+
+    /// The `oauth`-mode token verifier, for `transport::http::router` to
+    /// mount its bearer-auth middleware with. `None` in every other auth
+    /// mode.
+    #[must_use]
+    pub(crate) fn verifier(&self) -> Option<Arc<TokenVerifier>> {
+        self.inner.oauth_verifier.clone()
     }
 
     /// The attachment store handle, for `transport::http::router` to hand to
@@ -82,10 +100,7 @@ impl RedmineMcp {
             AuthMode::LegacyPerUser { audit_identity, .. } => {
                 crate::auth::per_user::scoped(&self.inner.client, ctx, *audit_identity)
             }
-            AuthMode::OAuth(_) => Err(McpError::internal_error(
-                "oauth auth is not yet implemented",
-                None,
-            )),
+            AuthMode::OAuth(_) => crate::auth::oauth::scoped(&self.inner.client, ctx),
         }
     }
 

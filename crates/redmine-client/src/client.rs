@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::TryStreamExt as _;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -18,9 +19,9 @@ use crate::ids::{
     TimeEntryId, UserId, VersionId, WikiTitle,
 };
 use crate::model::{
-    BareCollection, Collection, attachment, custom_field, enumeration, issue, issue_category,
-    issue_status, journal, membership, project, query, relation, role, search, time_entry, tracker,
-    upload, user, version, wiki,
+    BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
+    issue_category, issue_status, journal, membership, project, query, relation, role, search,
+    time_entry, tracker, upload, user, version, wiki,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -477,6 +478,32 @@ impl Scoped<'_> {
         self.read_json(resp, "response").await
     }
 
+    /// Send `form` as `application/x-www-form-urlencoded`, returning the raw
+    /// response for the caller to decode (or discard). Not covered by the
+    /// retry policy for a different reason than the JSON POST helpers: it
+    /// exists only for the OAuth introspection/revocation endpoints, which
+    /// this crate's retry rule (idempotent verbs only) already excludes as a
+    /// `POST`.
+    async fn post_form<B: Serialize>(
+        &self,
+        path: &str,
+        form: &B,
+    ) -> crate::Result<reqwest::Response> {
+        let url = self.build_url(path, None)?;
+        let template = self.credential.apply(self.inner.http.post(url)).form(form);
+        self.send_with_retry(&http::Method::POST, &template).await
+    }
+
+    /// Like [`Self::post_form`], decoding the response body as JSON.
+    async fn post_form_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        form: &B,
+    ) -> crate::Result<T> {
+        let resp = self.post_form(path, form).await?;
+        self.read_json(resp, "response").await
+    }
+
     pub(crate) async fn put_json<B: Serialize>(&self, path: &str, body: &B) -> crate::Result<()> {
         let url = self.build_url(path, None)?;
         let template = self.credential.apply(self.inner.http.put(url)).json(body);
@@ -725,6 +752,70 @@ impl Scoped<'_> {
     pub async fn current_user(&self) -> crate::Result<user::User> {
         let env: user::UserEnvelope = self.get_json("my/account.json", &Query::default()).await?;
         Ok(env.user)
+    }
+
+    /// `POST /oauth/introspect` (RFC 7662). The scoping credential must be
+    /// `Credential::Basic { user: client_id, pass: client_secret }` for the
+    /// confidential OAuth client registered for token introspection — this
+    /// is one of the two methods on this type where the scoping credential
+    /// is not an end-user identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unauthorized`]/[`Error::Forbidden`] if the scoping
+    /// client credentials are rejected, [`Error::NotFound`] if the
+    /// introspection route is unmounted (Redmine's `allow_token_introspection`
+    /// defaults to `false`), or a transport/decode error otherwise. Never
+    /// itself an error for an inactive/expired/unknown token — that is
+    /// `Introspection::active`.
+    pub async fn introspect_token(
+        &self,
+        token: &SecretString,
+    ) -> crate::Result<introspection::Introspection> {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            token: &'a str,
+            token_type_hint: &'a str,
+        }
+        self.post_form_json(
+            "oauth/introspect",
+            &Form {
+                token: token.expose_secret(),
+                token_type_hint: "access_token",
+            },
+        )
+        .await
+    }
+
+    /// `POST /oauth/revoke` (RFC 7009). Same scoping-credential requirement
+    /// as [`Self::introspect_token`]. Per RFC 7009 a `200` is success whether
+    /// or not `token` was a token this client ever issued — revoking an
+    /// unknown token is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unauthorized`]/[`Error::Forbidden`] if the scoping
+    /// client credentials are rejected, or a transport error otherwise.
+    pub async fn revoke_token(
+        &self,
+        token: &SecretString,
+        hint: Option<&str>,
+    ) -> crate::Result<()> {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            token: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            token_type_hint: Option<&'a str>,
+        }
+        self.post_form(
+            "oauth/revoke",
+            &Form {
+                token: token.expose_secret(),
+                token_type_hint: hint,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     /// `GET /projects.json`.

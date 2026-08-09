@@ -37,6 +37,7 @@ dotenvy     = { workspace = true }
 secrecy     = { workspace = true }
 url         = { workspace = true }
 rand        = { workspace = true }
+sha2        = { workspace = true }
 
 [dev-dependencies]
 rmcp     = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }

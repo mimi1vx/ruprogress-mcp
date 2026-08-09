@@ -22,7 +22,11 @@ real process environment.
 | `REDMINE_API_KEY_FILE` | yes, in `legacy` mode (alternative) | — | Path to a file containing the key (Docker/K8s secret mount). Exactly one trailing newline is trimmed. Setting both this and `REDMINE_API_KEY` is a `Conflict`. |
 | `REDMINE_PER_USER_TRUST_PROXY` | yes, in `legacy-per-user` mode | — | Must be exactly `true`. Absent/false refuses to start (`Missing`) — this is the operator's explicit attestation that a TLS-terminating proxy sits in front and does not forward client `X-Forwarded-Proto`. `legacy-per-user` is additionally rejected outright on the `stdio` transport (`Conflict`): there is no per-request header to carry a credential over stdio. Startup logs a `WARN` naming this assumption every time the mode is enabled. See `docs/legacy-per-user-auth.md`. |
 | `REDMINE_PER_USER_AUDIT_IDENTITY` | no | `false` | In `legacy-per-user` mode, logs one line per tool call naming a per-process, non-reversible fingerprint of the inbound `X-Redmine-API-Key` (never the key or a resolved Redmine identity) — see `docs/legacy-per-user-auth.md`. |
-| `REDMINE_MCP_BASE_URL` | yes, in `oauth` mode | — | Public base URL of this MCP server. Full OAuth wiring is not implemented yet; only presence is validated here. |
+| `REDMINE_MCP_BASE_URL` | yes, in `oauth` mode | — | This server's own public base URL, embedded in the `WWW-Authenticate` challenge and OAuth discovery documents. Must be absolute `http`/`https` with no userinfo, query, or fragment. `http` on a non-loopback host logs a `WARN` rather than erroring. |
+| `REDMINE_INTROSPECT_CLIENT_ID` | yes, in `oauth` mode | — | The confidential OAuth client id used to authenticate RFC 7662 introspection requests to Redmine's Doorkeeper. |
+| `REDMINE_INTROSPECT_CLIENT_SECRET` | yes, in `oauth` mode | — | Mutually exclusive with `REDMINE_INTROSPECT_CLIENT_SECRET_FILE`. |
+| `REDMINE_INTROSPECT_CLIENT_SECRET_FILE` | yes, in `oauth` mode (alternative) | — | Path to a file containing the secret (Docker/K8s secret mount). Setting both this and `REDMINE_INTROSPECT_CLIENT_SECRET` is a `Conflict`. |
+| `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. Has no upstream counterpart — a `ruprogress-mcp` addition, see `docs/oauth-setup.md`. |
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
@@ -91,7 +95,6 @@ These are read by the upstream reference server but not by
 
 `REDMINE_USERNAME`, `REDMINE_PASSWORD`,
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
-`REDMINE_INTROSPECT_CLIENT_ID`, `REDMINE_INTROSPECT_CLIENT_SECRET`(`_FILE`),
 `REDMINE_OAUTH_SCOPE_ENFORCEMENT`, `REDMINE_OAUTH_DISCOVERY_AS`,
 `REDMINE_MCP_SCOPES`, `REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
 `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,

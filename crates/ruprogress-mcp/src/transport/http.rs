@@ -27,7 +27,8 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
-use crate::config::HttpConfig;
+use crate::auth::oauth;
+use crate::config::{AuthMode, HttpConfig};
 use crate::health::{self, HealthState};
 use crate::server::RedmineMcp;
 
@@ -62,6 +63,16 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 
     let attachments = server.attachments();
     let health_state = HealthState::new(server.clone(), cfg.health_ttl);
+    let oauth_state = server.verifier().map(|verifier| {
+        let AuthMode::OAuth(oauth_config) = &server.inner.config.auth else {
+            unreachable!("verifier() is Some only in AuthMode::OAuth");
+        };
+        let challenge = Arc::new(oauth::Challenge::build(
+            &oauth_config.base_url,
+            &cfg.mcp_path,
+        ));
+        (verifier, challenge)
+    });
     let mcp_service: StreamableHttpService<RedmineMcp, SessionManager> = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(SessionManager::default()),
@@ -90,12 +101,23 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
     // on a timer, and `TraceLayer` emits an ERROR for every 5xx — so a Redmine
     // outage would turn a `/readyz` poll into a flood. Suppressing only the
     // span (`Span::none()`) is not enough; the response events fire anyway.
-    let mcp_route = Router::new()
+    let mut mcp_route = Router::new()
         // `nest_service`, not `nest`: `nest` can drop the `Host` header hyper
         // synthesises from an HTTP/2 `:authority`, which is the input rmcp's
         // rebinding check reads.
-        .nest_service(&cfg.mcp_path, mcp_service)
-        .layer(TraceLayer::new_for_http());
+        .nest_service(&cfg.mcp_path, mcp_service);
+
+    // SECURITY: mounted on the MCP route only, and only in `oauth` mode.
+    // Every other route this router serves — `/livez`, `/readyz`, `/health`,
+    // `/files/{uuid}` (6a's L8 capability URL), and every future
+    // `/.well-known/*` discovery document — must stay reachable with no
+    // bearer token: RFC 9728 metadata has to be fetchable *before* a client
+    // has a token, and probes must not need a credential (O8).
+    if let Some(state) = oauth_state {
+        mcp_route = mcp_route.layer(middleware::from_fn_with_state(state, oauth::require_bearer));
+    }
+
+    let mcp_route = mcp_route.layer(TraceLayer::new_for_http());
 
     let mut router = Router::new()
         .merge(mcp_route)
