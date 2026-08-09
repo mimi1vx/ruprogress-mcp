@@ -115,5 +115,5 @@ traffic, for a log line).
 
 ## Out of scope
 
-`oauth` (6b) and `oauth-proxy` (6c) are separate, unimplemented modes; nothing
-here changes how they will work.
+`oauth` and `oauth-proxy` are separate modes; nothing here changes how they
+work.

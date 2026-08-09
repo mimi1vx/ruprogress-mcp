@@ -1,4 +1,4 @@
-//! End-to-end phase 6b2: RFC 9728/8414 discovery documents, `POST /revoke`,
+//! End-to-end tests for RFC 9728/8414 discovery documents, `POST /revoke`,
 //! and the introspection readiness probe — over the real HTTP router,
 //! against a wiremock Redmine that also stands in for Doorkeeper.
 #![allow(

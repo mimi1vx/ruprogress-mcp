@@ -6,7 +6,7 @@ use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::config::PluginFlags;
+use crate::config::{AuthMode, PluginFlags};
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::output;
@@ -29,6 +29,9 @@ pub(crate) struct ServerInfoOutput {
     pub(crate) transport: String,
     pub(crate) current_user: Option<CurrentUserSummary>,
     pub(crate) plugin_flags: PluginFlags,
+    /// `REDMINE_OAUTH_SCOPE_ENFORCEMENT`'s effective value; `null` outside
+    /// `oauth` mode, where the setting does not apply.
+    pub(crate) oauth_scope_enforcement: Option<bool>,
 }
 
 #[tool_router(router = meta_tool_router, vis = "pub(crate)")]
@@ -67,6 +70,10 @@ impl RedmineMcp {
             transport: self.inner.config.transport.label().to_string(),
             current_user,
             plugin_flags: self.inner.config.plugins,
+            oauth_scope_enforcement: match &self.inner.config.auth {
+                AuthMode::OAuth(oauth) => Some(oauth.scope_enforcement),
+                AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
+            },
         };
         Ok(output::ok(&output, self.output_caps()))
     }

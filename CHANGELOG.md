@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never a `401`. The validated token is forwarded to Redmine verbatim.
   Requires the new `REDMINE_INTROSPECT_CLIENT_ID`/
   `REDMINE_INTROSPECT_CLIENT_SECRET`(`_FILE`) variables; `oauth` on the stdio
-  transport is now a startup error, matching `legacy-per-user`. Per-tool scope
-  enforcement is not implemented yet — see `docs/oauth-setup.md`.
+  transport is now a startup error, matching `legacy-per-user`. See
+  `docs/oauth-setup.md`.
 - `oauth` mode now serves RFC 9728 protected-resource metadata at
   `/.well-known/oauth-protected-resource{mcp_path}` and RFC 8414
   authorization-server metadata (pointing at Redmine's real
@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting `not_probed`, gaining a `checks.introspection` field
   (`ok`/`misconfigured`/`unreachable`). All of the above are unauthenticated
   and unaffected by the bearer-auth middleware.
+- `oauth` mode now enforces per-tool scopes: `tools/list` shows only the
+  tools a bearer token's scopes permit (with `cache_scope: "private"` once
+  filtering is active, since the list is per-token), and `tools/call` on a
+  hidden tool is refused in-band with `INSUFFICIENT_SCOPE`, naming the
+  missing scope(s), before any Redmine request is made. The map
+  (`auth::scope::TOOL_SCOPES`) is verified against this server's own
+  `redmine-client` call sites, not transcribed from the reference; a token
+  carrying `admin` bypasses it entirely, and an unmapped tool is denied by
+  default. `update_redmine_issue` carries a notes-only carve-out
+  (`add_issue_notes` instead of `edit_issues` when only `notes`/
+  `private_notes` change) and requires `manage_subtasks` in addition when
+  reparenting. The new `REDMINE_OAUTH_SCOPE_ENFORCEMENT=off` restores the
+  prior unfiltered behaviour for tokens minted before scopes existed,
+  logging a startup `WARN`.
 - `REDMINE_AUTH_MODE=legacy-per-user` is now implemented: each HTTP request
   carries its own Redmine credential in `X-Redmine-API-Key` instead of the
   server holding one shared key. No ambient fallback and no cross-request

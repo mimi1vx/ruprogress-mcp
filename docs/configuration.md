@@ -28,7 +28,8 @@ real process environment.
 | `REDMINE_INTROSPECT_CLIENT_SECRET_FILE` | yes, in `oauth` mode (alternative) | — | Path to a file containing the secret (Docker/K8s secret mount). Setting both this and `REDMINE_INTROSPECT_CLIENT_SECRET` is a `Conflict`. |
 | `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. Has no upstream counterpart — a `ruprogress-mcp` addition, see `docs/oauth-setup.md`. |
 | `REDMINE_OAUTH_DISCOVERY_AS` | no, `oauth` mode only | `redmine` | `redmine` or `self`. `self` serves the RFC 8414 authorization-server document at the root well-known path with `issuer = REDMINE_MCP_BASE_URL` (and 404s the suffixed path) instead of the default — see `docs/oauth-setup.md`. |
-| `REDMINE_MCP_SCOPES` | no, `oauth` mode only | the full advertised set | Whitespace-separated subset of the scopes this server advertises in its OAuth discovery documents. Every entry must already be advertised in the current mode (respecting `REDMINE_MCP_READ_ONLY`/agile/tags gating); an out-of-set entry refuses to boot, listing the accepted set. Narrows advertisement only — scope *enforcement* is 6b3. |
+| `REDMINE_MCP_SCOPES` | no, `oauth` mode only | the full advertised set | Whitespace-separated subset of the scopes this server advertises in its OAuth discovery documents. Every entry must already be advertised in the current mode (respecting `REDMINE_MCP_READ_ONLY`/agile/tags gating); an out-of-set entry refuses to boot, listing the accepted set. Narrows advertisement; enforcement is `REDMINE_OAUTH_SCOPE_ENFORCEMENT` below. |
+| `REDMINE_OAUTH_SCOPE_ENFORCEMENT` | no, `oauth` mode only | `on` | `on` or `off`. `off` disables both `tools/list` filtering and `tools/call` scope denial, restoring unfiltered behaviour, and logs a startup `WARN` — intended only for tokens minted before the OAuth application advertised scopes. See `docs/oauth-setup.md`. |
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
@@ -97,7 +98,6 @@ These are read by the upstream reference server but not by
 
 `REDMINE_USERNAME`, `REDMINE_PASSWORD`,
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
-`REDMINE_OAUTH_SCOPE_ENFORCEMENT` (phase 6b3),
 `REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
 `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,
 `REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`),

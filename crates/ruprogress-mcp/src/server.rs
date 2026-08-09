@@ -5,12 +5,17 @@ use std::sync::Arc;
 
 use redmine_client::{RedmineClient, Scoped};
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities, ServerInfo,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
 use crate::attachments::AttachmentStore;
 use crate::auth::oauth::TokenVerifier;
+use crate::auth::scope;
 use crate::config::{AuthMode, Config, SchemaDialect};
 use crate::readonly::write_tools;
 use crate::tools::schema;
@@ -147,6 +152,14 @@ impl RedmineMcp {
             self.inner.config.attachments.public_url_rewrite.as_ref(),
         )
     }
+
+    /// `true` only in `oauth` mode with `REDMINE_OAUTH_SCOPE_ENFORCEMENT=on`
+    /// (the default) — the one condition under which `list_tools`/
+    /// `call_tool` below deviate from what `#[tool_handler]` would have
+    /// generated (S7).
+    fn scope_enforcement_active(&self) -> bool {
+        matches!(&self.inner.config.auth, AuthMode::OAuth(oauth) if oauth.scope_enforcement)
+    }
 }
 
 /// Explains the prompt-injection delimiter scheme once per session,
@@ -166,6 +179,88 @@ impl ServerHandler for RedmineMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(BOUNDARY_INSTRUCTIONS.to_string())
+    }
+
+    /// Hand-written so `#[tool_handler]` (which only generates a method
+    /// that does not already exist) skips its own version — see S7. Outside
+    /// `oauth` mode, or with scope enforcement off, this computes exactly
+    /// what `rmcp-macros-3.1.1`'s `tool_handler.rs` (`build_get_info`'s
+    /// sibling, the `list_tools` generator) would have; the one
+    /// behavioural difference (S8) is `cache_scope: Private` when filtering
+    /// is active, since a per-token list must never be cached publicly.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let all = self.tool_router.list_all();
+
+        if !self.scope_enforcement_active() {
+            return Ok(ListToolsResult {
+                result_type: Some(ResultType::COMPLETE),
+                tools: all,
+                meta: None,
+                next_cursor: None,
+                ttl_ms: supports_cache_hints.then_some(0),
+                cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+            });
+        }
+
+        let auth = crate::auth::oauth::auth_context(&context)?;
+        let tools = all
+            .into_iter()
+            .filter(|tool| scope::visible_for(&tool.name, &auth.scopes))
+            .collect();
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Private),
+        })
+    }
+
+    /// Hand-written for the same reason as `list_tools` above (S7). Outside
+    /// `oauth` mode, or with scope enforcement off, this delegates straight
+    /// to `self.tool_router.call`, exactly like the macro-generated
+    /// version. Active, it resolves the call's scope requirement (S1–S5)
+    /// and returns the S6 in-band `INSUFFICIENT_SCOPE` envelope on denial —
+    /// never an `McpError`, and never before checking `admin` (S2).
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        if self.scope_enforcement_active() {
+            let auth = crate::auth::oauth::auth_context(&context)?;
+            if !scope::is_admin(&auth.scopes) {
+                match scope::required_for_call(&request.name, request.arguments.as_ref()) {
+                    scope::Requirement::Unchecked => {}
+                    scope::Requirement::Scopes(required) => {
+                        let missing = scope::missing(required, &auth.scopes);
+                        if !missing.is_empty() {
+                            return Ok(
+                                scope::insufficient_scope_result(&request.name, &missing).into()
+                            );
+                        }
+                    }
+                    scope::Requirement::Unmapped => {
+                        tracing::error!(
+                            tool = %request.name,
+                            "tool has no TOOL_SCOPES entry; denying by default"
+                        );
+                        return Ok(scope::insufficient_scope_result(&request.name, &[]).into());
+                    }
+                }
+            }
+        }
+
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }
 

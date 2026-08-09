@@ -214,6 +214,10 @@ impl<'a> ContentUrlRewrite<'a> {
 /// caught by `deny_unknown_fields` alone) or on server-side path validation
 /// whose failure must never distinguish "outside the roots" from
 /// "does not exist" from "not a regular file".
+///
+/// `InsufficientScope` (`auth::scope`, `oauth` mode only) is the in-band
+/// denial for a `tools/call` whose bearer token lacks a required scope,
+/// naming the missing scope(s) in the error message.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -235,6 +239,7 @@ pub(crate) enum ErrorCode {
     SourceRequired,
     UnsupportedSource,
     PathNotAllowed,
+    InsufficientScope,
 }
 
 impl ErrorCode {
@@ -360,6 +365,7 @@ mod tests {
             ErrorCode::SourceRequired,
             ErrorCode::UnsupportedSource,
             ErrorCode::PathNotAllowed,
+            ErrorCode::InsufficientScope,
         ] {
             assert!(!code.is_retryable());
         }

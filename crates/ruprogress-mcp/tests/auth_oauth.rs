@@ -33,6 +33,24 @@ fn oauth_env(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'sta
     env
 }
 
+/// Like [`mock_introspect`] but with a `scope` field, for the
+/// scope-enforcement tests. `scope` is RFC 7662's space-delimited string;
+/// pass `""` for a token with no scopes at all.
+async fn mock_introspect_scoped(redmine: &wiremock::MockServer, token: &str, scope: &str) {
+    mock_introspect(
+        redmine,
+        token,
+        serde_json::json!({
+            "active": true,
+            "sub": "5",
+            "username": "alice",
+            "scope": scope,
+        }),
+        None,
+    )
+    .await;
+}
+
 async fn mock_introspect(
     redmine: &wiremock::MockServer,
     token: &str,
@@ -132,6 +150,301 @@ async fn connect_with_token(
     ().serve(transport)
         .await
         .expect("client with a valid bearer token should connect")
+}
+
+/// `tools/call` `tool` with `args`, over a fresh connection authenticated as
+/// `token`. Used by the scope-enforcement tests below.
+async fn call_with_token(
+    harness: &support::HttpHarness,
+    token: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> rmcp::model::CallToolResult {
+    let client = connect_with_token(harness, token).await;
+    let mut request = CallToolRequestParams::new(tool.to_string());
+    request.arguments = args.as_object().cloned();
+    let result = client
+        .call_tool(request)
+        .await
+        .expect("call_tool should succeed at the protocol level (an in-band error is Ok)");
+    client.cancel().await.ok();
+    result
+}
+
+/// `tools/list`'s tool names, over a fresh connection authenticated as
+/// `token`.
+async fn list_tool_names(harness: &support::HttpHarness, token: &str) -> Vec<String> {
+    let client = connect_with_token(harness, token).await;
+    let tools = client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let names = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    client.cancel().await.ok();
+    names
+}
+
+#[tokio::test]
+async fn a_view_issues_only_token_sees_and_can_only_call_that_scopes_tools() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    const TOKEN: &str = "view-issues-only-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "view_issues").await;
+
+    let names = list_tool_names(&harness, TOKEN).await;
+    assert!(names.iter().any(|n| n == "list_redmine_issues"));
+    assert!(!names.iter().any(|n| n == "create_redmine_issue"));
+
+    // Any hit at all means the scope check let a request through before it
+    // should have.
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&harness.redmine)
+        .await;
+
+    let denied = call_with_token(
+        &harness,
+        TOKEN,
+        "create_redmine_issue",
+        serde_json::json!({"project_id": 1, "subject": "x"}),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    let structured = denied.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "INSUFFICIENT_SCOPE");
+    assert!(structured["error"].as_str().unwrap().contains("add_issues"));
+}
+
+#[tokio::test]
+async fn an_admin_token_sees_and_can_call_every_tool() {
+    let harness =
+        support::http_harness(&oauth_env(&[("REDMINE_MCP_EXPOSE_ADMIN_TOOLS", "true")])).await;
+    const TOKEN: &str = "admin-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "admin").await;
+
+    let names = list_tool_names(&harness, TOKEN).await;
+    assert_eq!(names.len(), 42, "expected every registered tool: {names:?}");
+
+    // A write tool with a non-trivial scope requirement (add_issues):
+    // admin bypasses TOOL_SCOPES entirely, not just the visibility check.
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(sample_issue_body(1)))
+        .mount(&harness.redmine)
+        .await;
+    let result = call_with_token(
+        &harness,
+        TOKEN,
+        "create_redmine_issue",
+        serde_json::json!({"project_id": 1, "subject": "x"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false));
+}
+
+#[tokio::test]
+async fn an_empty_scope_token_sees_and_calls_only_unscoped_tools() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    const TOKEN: &str = "empty-scope-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "").await;
+    mock_current_user_for(&harness.redmine, TOKEN, 5, "alice", None).await;
+
+    let names = list_tool_names(&harness, TOKEN).await;
+    assert!(names.iter().any(|n| n == "get_current_user"));
+    assert!(!names.iter().any(|n| n == "list_redmine_projects"));
+
+    let result = call_with_token(&harness, TOKEN, "get_current_user", serde_json::json!({})).await;
+    assert_eq!(result.is_error, Some(false));
+}
+
+#[tokio::test]
+async fn manage_issue_relation_enforces_scope_per_action() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    const TOKEN: &str = "view-issues-relation-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "view_issues").await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1/relations.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"relations": []})),
+        )
+        .mount(&harness.redmine)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/issues/1/relations.json"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&harness.redmine)
+        .await;
+
+    let list_result = call_with_token(
+        &harness,
+        TOKEN,
+        "manage_issue_relation",
+        serde_json::json!({"action": "list", "issue_id": 1}),
+    )
+    .await;
+    assert_eq!(list_result.is_error, Some(false));
+
+    let create_result = call_with_token(
+        &harness,
+        TOKEN,
+        "manage_issue_relation",
+        serde_json::json!({"action": "create", "issue_id": 1, "issue_to_id": 2}),
+    )
+    .await;
+    assert_eq!(create_result.is_error, Some(true));
+    assert_eq!(
+        create_result.structured_content.unwrap()["code"],
+        "INSUFFICIENT_SCOPE"
+    );
+}
+
+fn sample_issue_body(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "issue": {
+            "id": id, "project": {"id": 1, "name": "P"}, "tracker": {"id": 1, "name": "Bug"},
+            "status": {"id": 1, "name": "New"}, "priority": {"id": 1, "name": "Normal"},
+            "author": {"id": 1, "name": "A"}, "subject": "s",
+            "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z"
+        }
+    })
+}
+
+#[tokio::test]
+async fn update_redmine_issue_notes_only_carve_out_end_to_end() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    const TOKEN: &str = "add-issue-notes-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "add_issue_notes").await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sample_issue_body(7)))
+        .mount(&harness.redmine)
+        .await;
+
+    let notes_only = call_with_token(
+        &harness,
+        TOKEN,
+        "update_redmine_issue",
+        serde_json::json!({"issue_id": 7, "notes": "a comment"}),
+    )
+    .await;
+    assert_eq!(notes_only.is_error, Some(false));
+
+    let notes_plus_field = call_with_token(
+        &harness,
+        TOKEN,
+        "update_redmine_issue",
+        serde_json::json!({"issue_id": 7, "notes": "a comment", "subject": "new subject"}),
+    )
+    .await;
+    assert_eq!(notes_plus_field.is_error, Some(true));
+    assert_eq!(
+        notes_plus_field.structured_content.unwrap()["code"],
+        "INSUFFICIENT_SCOPE"
+    );
+
+    let notes_plus_upload = call_with_token(
+        &harness,
+        TOKEN,
+        "update_redmine_issue",
+        serde_json::json!({"issue_id": 7, "notes": "a comment", "uploads": []}),
+    )
+    .await;
+    assert_eq!(notes_plus_upload.is_error, Some(true));
+    assert_eq!(
+        notes_plus_upload.structured_content.unwrap()["code"],
+        "INSUFFICIENT_SCOPE"
+    );
+}
+
+#[tokio::test]
+async fn scope_enforcement_off_restores_unfiltered_visibility_and_calls() {
+    let harness =
+        support::http_harness(&oauth_env(&[("REDMINE_OAUTH_SCOPE_ENFORCEMENT", "off")])).await;
+    const TOKEN: &str = "low-scope-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "view_issues").await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(sample_issue_body(1)))
+        .mount(&harness.redmine)
+        .await;
+
+    let names = list_tool_names(&harness, TOKEN).await;
+    assert!(names.iter().any(|n| n == "create_redmine_issue"));
+
+    let result = call_with_token(
+        &harness,
+        TOKEN,
+        "create_redmine_issue",
+        serde_json::json!({"project_id": 1, "subject": "x"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false));
+}
+
+/// A raw `tools/list` call carrying SEP-1319 `_meta` naming protocol version
+/// `2026-07-28` — the version [`rmcp::model::CacheScope`] hints require
+/// (S8). Built by hand rather than through `rmcp`'s client SDK: the SDK
+/// only attaches this `_meta` automatically on connections established via
+/// `serve_directly` (an already-known-peer shortcut this server's stateless
+/// HTTP transport never uses), not after a normal `initialize` round trip.
+async fn raw_tools_list_at_protocol_version_2026(
+    harness: &support::HttpHarness,
+    token: &str,
+) -> serde_json::Value {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        }
+    });
+    raw_client()
+        .post(harness.mcp_url())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/list")
+        .header("authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request should complete")
+        .json()
+        .await
+        .expect("json body")
+}
+
+#[tokio::test]
+async fn filtered_tools_list_reports_a_private_cache_scope() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    const TOKEN: &str = "cache-scope-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "view_issues").await;
+
+    let response = raw_tools_list_at_protocol_version_2026(&harness, TOKEN).await;
+    assert_eq!(response["result"]["cacheScope"], "private");
+}
+
+#[tokio::test]
+async fn unfiltered_tools_list_reports_a_public_cache_scope() {
+    // Legacy mode: `scope_enforcement_active()` is always false outside
+    // `oauth`, so `list_tools` takes the unfiltered path — same as the
+    // macro-generated version — and keeps `CacheScope::Public`. No bearer
+    // token is needed (or checked) outside `oauth` mode; the header is
+    // harmless to send anyway.
+    let harness = support::http_harness(&[]).await;
+    let response = raw_tools_list_at_protocol_version_2026(&harness, "unused").await;
+    assert_eq!(response["result"]["cacheScope"], "public");
 }
 
 #[tokio::test]

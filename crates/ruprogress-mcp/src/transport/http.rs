@@ -119,7 +119,7 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 
     // SECURITY: mounted on the MCP route only, and only in `oauth` mode.
     // Every other route this router serves — `/livez`, `/readyz`, `/health`,
-    // `/files/{uuid}` (6a's L8 capability URL), and every future
+    // `/files/{uuid}` (an unguessable, TTL-bounded capability URL), and every future
     // `/.well-known/*` discovery document — must stay reachable with no
     // bearer token: RFC 9728 metadata has to be fetchable *before* a client
     // has a token, and probes must not need a credential (O8).
@@ -213,7 +213,7 @@ struct RevokeState {
 /// this handler, and everything else in the request body is dropped.
 ///
 /// Only ever mounted in `AuthMode::OAuth` — see `router`. A candidate for
-/// the Phase 9 rate limiter: an unauthenticated route that makes one
+/// a future rate limiter: an unauthenticated route that makes one
 /// upstream request per call.
 fn revoke_route(client: RedmineClient, verifier: Arc<TokenVerifier>) -> Router {
     Router::new()

@@ -36,6 +36,11 @@ rest of File Operations, Checklist Tools, Products/Contacts/Documents
 plugin families) are recorded for reference as app-plugin tools that are
 out of scope for this implementation.
 
+In `REDMINE_AUTH_MODE=oauth`, which of these tools a given bearer token can
+see and call is governed by `TOOL_SCOPES` in
+`crates/ruprogress-mcp/src/auth/scope.rs` — every tool implemented above must
+have an entry there; see `docs/oauth-setup.md`'s "Scope enforcement" section.
+
 ## Project Management
 
 ### `list_redmine_projects`

@@ -1,9 +1,6 @@
 //! `AuthMode::OAuth`: bearer-token extraction, RFC 7662 introspection with a
 //! digest-keyed cache, and the axum middleware that issues the `401`/`503`
 //! challenge before any MCP request reaches [`crate::server::RedmineMcp::scoped`].
-//!
-//! See `plans/phase-6b1-bearer-introspection.md` decisions O1–O2, O4, O7,
-//! B6–B10.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -342,34 +339,44 @@ impl TokenVerifier {
     }
 }
 
-/// The `AuthMode::OAuth` arm of `RedmineMcp::scoped` (O2). Reads the
-/// `AuthContext` the middleware inserted into `Parts.extensions` — mirroring
-/// how `auth::per_user::credential` reads inbound headers from the same
-/// `Parts` — and fails closed (an internal error, never a fallback) if it is
-/// absent, which can only happen if a future refactor mounts the MCP route
-/// without [`layer`].
+/// Reads the `AuthContext` the bearer-auth middleware inserted into
+/// `Parts.extensions` — mirroring how `auth::per_user::credential` reads
+/// inbound headers from the same `Parts` — and fails closed (an internal
+/// error, never a fallback) if it is absent, which can only happen if a
+/// future refactor mounts the MCP route without [`layer`]. Shared by
+/// [`scoped`] (O2) and `server.rs`'s hand-written `list_tools`/`call_tool`,
+/// which need the token's scopes rather than a `Scoped` credential.
 ///
 /// # Errors
 ///
 /// Returns an [`McpError`] if the request did not arrive over HTTP, or if
 /// the bearer-auth middleware did not run for it.
-pub(crate) fn scoped<'c>(
-    client: &'c RedmineClient,
-    ctx: &RequestContext<RoleServer>,
-) -> Result<redmine_client::Scoped<'c>, McpError> {
+pub(crate) fn auth_context(ctx: &RequestContext<RoleServer>) -> Result<&AuthContext, McpError> {
     let parts = ctx.extensions.get::<Parts>().ok_or_else(|| {
         McpError::internal_error(
             "oauth auth mode requires the HTTP transport (no request headers available)",
             None,
         )
     })?;
-    let auth = parts.extensions.get::<AuthContext>().ok_or_else(|| {
+    parts.extensions.get::<AuthContext>().ok_or_else(|| {
         McpError::internal_error(
             "oauth auth mode requires the bearer-auth middleware, which did not run for this \
              request",
             None,
         )
-    })?;
+    })
+}
+
+/// The `AuthMode::OAuth` arm of `RedmineMcp::scoped` (O2).
+///
+/// # Errors
+///
+/// See [`auth_context`].
+pub(crate) fn scoped<'c>(
+    client: &'c RedmineClient,
+    ctx: &RequestContext<RoleServer>,
+) -> Result<redmine_client::Scoped<'c>, McpError> {
+    let auth = auth_context(ctx)?;
     tracing::debug!(subject = ?auth.subject, "oauth request");
     Ok(client.as_user_owned(Credential::Bearer(auth.token.clone())))
 }
@@ -679,6 +686,7 @@ mod tests {
             token_cache_ttl: Duration::from_mins(1),
             discovery_as: crate::config::DiscoveryAs::Redmine,
             scopes: Vec::new(),
+            scope_enforcement: true,
         };
         let verifier = TokenVerifier::new(client, &oauth);
         let rendered = format!("{verifier:?}");

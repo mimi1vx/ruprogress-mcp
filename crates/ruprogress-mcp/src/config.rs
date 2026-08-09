@@ -100,6 +100,11 @@ pub struct OAuthConfig {
     /// current mode's [`crate::oauth::scopes::advertised`] set, optionally
     /// narrowed by `REDMINE_MCP_SCOPES`.
     pub scopes: Vec<&'static str>,
+    /// `REDMINE_OAUTH_SCOPE_ENFORCEMENT`: whether `tools/list` filtering and
+    /// per-call scope denial are active. Default `true`; `false` is
+    /// the documented migration escape hatch for tokens minted before the
+    /// OAuth application advertised scopes (O11).
+    pub scope_enforcement: bool,
 }
 
 /// `REDMINE_OAUTH_DISCOVERY_AS` (D3): which authorization server this
@@ -813,6 +818,29 @@ fn parse_token_cache_ttl(vars: &EnvMap) -> Result<Duration, ConfigError> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// `REDMINE_OAUTH_SCOPE_ENFORCEMENT`: `"on"` (default) or `"off"` (S9, O11).
+/// `off` is the documented migration escape hatch, so it logs a startup
+/// `WARN` naming the consequence rather than passing silently.
+fn parse_scope_enforcement(vars: &EnvMap) -> Result<bool, ConfigError> {
+    const VAR: &str = "REDMINE_OAUTH_SCOPE_ENFORCEMENT";
+    match optional(vars, VAR).as_deref() {
+        None | Some("on") => Ok(true),
+        Some("off") => {
+            tracing::warn!(
+                "REDMINE_OAUTH_SCOPE_ENFORCEMENT=off: every authenticated token can see and \
+                 call every tool, regardless of its OAuth scopes; this is intended only as a \
+                 migration path for tokens minted before scope enforcement existed"
+            );
+            Ok(false)
+        }
+        Some(other) => Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "one of \"on\", \"off\"",
+            because: format!("got {other:?}"),
+        }),
+    }
+}
+
 /// `REDMINE_OAUTH_DISCOVERY_AS`: `"redmine"` (default) or `"self"`.
 fn parse_discovery_as(vars: &EnvMap) -> Result<DiscoveryAs, ConfigError> {
     match optional(vars, "REDMINE_OAUTH_DISCOVERY_AS").as_deref() {
@@ -901,6 +929,7 @@ fn parse_auth(
             let full_scopes =
                 crate::oauth::scopes::advertised(read_only, plugins.agile, plugins.tags);
             let scopes = parse_scopes(vars, full_scopes)?;
+            let scope_enforcement = parse_scope_enforcement(vars)?;
             Ok(AuthMode::OAuth(OAuthConfig {
                 base_url,
                 introspect_client_id,
@@ -908,6 +937,7 @@ fn parse_auth(
                 token_cache_ttl,
                 discovery_as,
                 scopes,
+                scope_enforcement,
             }))
         }
         other => Err(ConfigError::Invalid {
@@ -1215,6 +1245,7 @@ impl Config {
                 "token_cache_ttl_seconds": cfg.token_cache_ttl.as_secs(),
                 "discovery_as": cfg.discovery_as.label(),
                 "scopes": cfg.scopes,
+                "scope_enforcement": cfg.scope_enforcement,
             })),
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         };
@@ -1696,6 +1727,84 @@ mod tests {
             panic!("expected oauth mode");
         };
         assert!(oauth.scopes.contains(&"edit_issues"));
+    }
+
+    #[test]
+    fn scope_enforcement_defaults_to_on() {
+        let config = Config::from_map(&valid_oauth(), TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert!(oauth.scope_enforcement);
+        assert_eq!(
+            config.redacted_summary()["oauth"]["scope_enforcement"],
+            true
+        );
+    }
+
+    #[test]
+    fn scope_enforcement_off_is_accepted_and_logs_a_warning() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_OAUTH_SCOPE_ENFORCEMENT".to_string(),
+            "off".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        drop(guard);
+
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert!(!oauth.scope_enforcement);
+        assert_eq!(
+            config.redacted_summary()["oauth"]["scope_enforcement"],
+            false
+        );
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("REDMINE_OAUTH_SCOPE_ENFORCEMENT=off"));
+    }
+
+    #[test]
+    fn scope_enforcement_unknown_value_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_OAUTH_SCOPE_ENFORCEMENT".to_string(),
+            "bogus".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_OAUTH_SCOPE_ENFORCEMENT",
+                ..
+            }
+        ));
     }
 
     #[test]

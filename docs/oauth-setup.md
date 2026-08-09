@@ -11,21 +11,68 @@ to what `ruprogress-mcp` actually implements today.
 
 ## Status
 
-**Live now (phases 6b1–6b2):** bearer extraction, RFC 7662 introspection with
+**Live now:** bearer extraction, RFC 7662 introspection with
 a digest-keyed cache, the `401 WWW-Authenticate: Bearer` / `503 Retry-After`
 challenge, forwarding the validated token to Redmine, RFC 9728/RFC 8414
-discovery documents, `POST /revoke`, and an introspection-backed `/readyz`
-probe.
+discovery documents, `POST /revoke`, an introspection-backed `/readyz` probe,
+and per-tool scope enforcement: `tools/list` shows only the tools a token's
+scopes permit, and `tools/call` on a hidden tool is refused in-band with
+`INSUFFICIENT_SCOPE`.
 
 **Not live yet:**
 
-- Per-tool scope enforcement (`REDMINE_OAUTH_SCOPE_ENFORCEMENT`) and
-  `tools/list` filtering — phase 6b3. Every token that introspects as active
-  and unexpired can call every tool today, regardless of its `scope`.
-  `REDMINE_MCP_SCOPES` (below) narrows what is *advertised*, not what is
-  *enforced*, until then.
 - `oauth-proxy` mode (this server acting as an authorization server with
   Dynamic Client Registration) — out of scope for v1.0 entirely.
+
+## Scope enforcement
+
+Every tool call is checked against a hand-maintained map from tool name to
+the Redmine permission(s) it needs — `crates/ruprogress-mcp/src/auth/scope.rs`
+(`TOOL_SCOPES`), the source of truth for both `tools/list` filtering and
+`tools/call` denial. Adding a new tool means adding its row to that map in
+the same change: an unmapped tool is denied by default and logged at
+`ERROR`, and a CI anti-drift test
+(`crates/ruprogress-mcp/tests/oauth_scopes.rs`) fails the build if a
+registered tool has no entry.
+
+Semantics:
+
+- A tool's requirement is either fixed, or depends on its `action` argument
+  (mirroring `manage_issue_relation`'s/`manage_redmine_wiki_page`'s existing
+  per-action shape). The token must hold **every** scope in the matching
+  requirement; an empty requirement means any authenticated token may call
+  the tool.
+- A token carrying the `admin` scope bypasses the map entirely, for both
+  visibility and calls — matching Redmine's own admin semantics.
+- `update_redmine_issue` has a notes-only carve-out: a call whose changed
+  fields are only `notes`/`private_notes`, with no `uploads`, needs
+  `add_issue_notes` instead of `edit_issues`; reparenting (`parent_issue_id`)
+  additionally needs `manage_subtasks`. A token holding either `edit_issues`
+  or `add_issue_notes` sees the tool in `tools/list`.
+- A `tools/call` denial returns the in-band envelope
+  `{error, code: "INSUFFICIENT_SCOPE", retryable: false, hint}`, naming the
+  missing scope(s) — never a protocol-level error, and never "tool not
+  found" even though the tool is hidden from `tools/list`.
+- Argument-conditional Redmine permissions that do not map to a distinct MCP
+  parameter shape (e.g. `tag_list` writes, agile-board fetches) are left to
+  Redmine's own enforcement: the call reaches Redmine and comes back as a
+  normal in-band `403`, exactly as it would through Redmine's own UI.
+
+`REDMINE_OAUTH_SCOPE_ENFORCEMENT=off` (default `on`) disables both
+`tools/list` filtering and `tools/call` denial, restoring unfiltered
+behaviour, and logs a startup `WARN`. This exists only for the documented
+migration case: tokens minted before the OAuth application advertised
+scopes introspect with an empty scope set and would otherwise be denied
+everything.
+
+```bash
+REDMINE_OAUTH_SCOPE_ENFORCEMENT=off
+```
+
+A client that caches `tools/list` across users despite the `cache_scope:
+"private"` hint this server sends once filtering is active will show the
+wrong list to the wrong user — this server cannot fix a client that ignores
+that hint.
 
 ## Step 1: Register an OAuth app for your users
 
