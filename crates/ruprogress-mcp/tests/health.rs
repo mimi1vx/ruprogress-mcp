@@ -154,22 +154,116 @@ async fn concurrent_readyz_requests_collapse_into_one_upstream_probe() {
     // one upstream call out.
 }
 
-#[tokio::test]
-async fn readyz_reports_not_probed_when_the_server_owns_no_credential() {
-    let harness = support::http_harness(&[
+fn oauth_env(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![
         ("REDMINE_AUTH_MODE", "oauth"),
         ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
         ("REDMINE_INTROSPECT_CLIENT_ID", "introspect-client"),
         ("REDMINE_INTROSPECT_CLIENT_SECRET", "introspect-secret"),
+    ];
+    env.extend_from_slice(extra);
+    env
+}
+
+async fn mock_introspect_status(redmine: &wiremock::MockServer, status: u16) {
+    wiremock::Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .respond_with(wiremock::ResponseTemplate::new(status))
+        .mount(redmine)
+        .await;
+}
+
+/// D7: a synthetic-token probe that gets `200 {"active": false}` back is
+/// `ok` — the token being inactive is expected and irrelevant; what matters
+/// is that introspection answered and accepted our client credentials.
+#[tokio::test]
+async fn readyz_in_oauth_mode_is_ok_when_introspection_answers() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": false
+            })),
+        )
+        .mount(&harness.redmine)
+        .await;
+
+    let response = get(&harness.url("/readyz")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["redmine"], "ok");
+    assert_eq!(body["checks"]["introspection"], "ok");
+}
+
+/// D7: introspection rejecting our own client credentials is `misconfigured`,
+/// not the caller's fault and not a silent pass.
+#[tokio::test]
+async fn readyz_in_oauth_mode_is_misconfigured_when_introspection_rejects_our_credentials() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    mock_introspect_status(&harness.redmine, 401).await;
+
+    let response = get(&harness.url("/readyz")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["redmine"], "misconfigured");
+    assert_eq!(body["checks"]["introspection"], "misconfigured");
+}
+
+/// D7: an unreachable/5xx introspection endpoint is `unreachable`.
+#[tokio::test]
+async fn readyz_in_oauth_mode_is_unreachable_when_introspection_errors() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    mock_introspect_status(&harness.redmine, 500).await;
+
+    let response = get(&harness.url("/readyz")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["redmine"], "unreachable");
+    assert_eq!(body["checks"]["introspection"], "unreachable");
+}
+
+/// D7: the probe bypasses `TokenVerifier`'s own token cache (it uses a
+/// synthetic token that would never be in it), but still honours the
+/// `/readyz`-level TTL cache — a second poll inside the window must not
+/// introspect again.
+#[tokio::test]
+async fn readyz_in_oauth_mode_honours_the_ttl_cache() {
+    let harness = support::http_harness(&oauth_env(&[])).await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": false
+            })),
+        )
+        .expect(1)
+        .mount(&harness.redmine)
+        .await;
+
+    let first = get(&harness.url("/readyz")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = get(&harness.url("/readyz")).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    // Dropping the harness verifies wiremock's `expect(1)`.
+}
+
+/// legacy-per-user still owns no credential to probe with at all, unlike
+/// oauth's now-testable introspection client — `not_probed` remains correct
+/// there.
+#[tokio::test]
+async fn readyz_reports_not_probed_for_legacy_per_user() {
+    let harness = support::http_harness(&[
+        ("REDMINE_AUTH_MODE", "legacy-per-user"),
+        ("REDMINE_PER_USER_TRUST_PROXY", "true"),
     ])
     .await;
 
     let response = get(&harness.url("/readyz")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "no server-owned credential is not a reason to leave the rotation"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["status"], "ready");
     assert_eq!(body["redmine"], "not_probed");

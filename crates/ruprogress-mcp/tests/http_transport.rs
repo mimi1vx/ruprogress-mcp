@@ -158,6 +158,32 @@ async fn read_only_mode_still_hides_write_tools_over_http() {
     client.cancel().await.ok();
 }
 
+#[tokio::test]
+async fn legacy_mode_exposes_no_oauth_discovery_or_revoke_routes() {
+    let harness = support::http_harness(&[]).await;
+    let client = reqwest::Client::new();
+    for route in [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server/mcp",
+        "/.well-known/oauth-authorization-server",
+    ] {
+        let response = client
+            .get(harness.url(route))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{route}");
+    }
+    let revoke = client
+        .post(harness.url("/revoke"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("token=whatever")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(revoke.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
 /// A shutdown signal must let a running tool call finish. This is the
 /// behaviour that breaks if rmcp's cancellation token is ever wired to the
 /// same signal as axum's graceful shutdown: rmcp aborts in-flight handlers,

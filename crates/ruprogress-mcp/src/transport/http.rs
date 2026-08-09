@@ -7,6 +7,7 @@
 //! them in a tower layer would only produce a second rejection path with a
 //! different status code and a different log line.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -15,9 +16,13 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use base64::Engine as _;
+use redmine_client::{Credential, RedmineClient};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use secrecy::SecretString;
+use serde_json::json;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
@@ -27,9 +32,10 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
-use crate::auth::oauth;
-use crate::config::{AuthMode, HttpConfig};
+use crate::auth::oauth::{self, TokenVerifier};
+use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig};
 use crate::health::{self, HealthState};
+use crate::oauth as oauth_docs;
 use crate::server::RedmineMcp;
 
 /// The session manager in use. Swapping this for
@@ -63,8 +69,12 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 
     let attachments = server.attachments();
     let health_state = HealthState::new(server.clone(), cfg.health_ttl);
-    let oauth_state = server.verifier().map(|verifier| {
-        let AuthMode::OAuth(oauth_config) = &server.inner.config.auth else {
+    // Read before `server` moves into `mcp_service` below.
+    let discovery = server
+        .verifier()
+        .map(|verifier| (server.inner.config.clone(), server.client(), verifier));
+    let oauth_state = discovery.clone().map(|(config, _, verifier)| {
+        let AuthMode::OAuth(oauth_config) = &config.auth else {
             unreachable!("verifier() is Some only in AuthMode::OAuth");
         };
         let challenge = Arc::new(oauth::Challenge::build(
@@ -124,6 +134,15 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         .merge(health_routes)
         .merge(files_route(attachments, cfg.allowed_hosts.clone()));
 
+    // Merged outside `mcp_route`, so the bearer-auth layer above never sees
+    // these: RFC 9728/8414 metadata and `/revoke` must be reachable with no
+    // token (O8, D6).
+    if let Some((config, client, verifier)) = discovery {
+        router = router
+            .merge(well_known_routes(config, &cfg.mcp_path))
+            .merge(revoke_route(client, verifier));
+    }
+
     if let Some(cors) = cors_layer(cfg) {
         router = router.layer(cors);
     }
@@ -132,6 +151,174 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         http::header::X_CONTENT_TYPE_OPTIONS,
         http::HeaderValue::from_static("nosniff"),
     ))
+}
+
+#[derive(Clone)]
+struct DiscoveryState(Arc<Config>);
+
+async fn protected_resource_doc(State(DiscoveryState(config)): State<DiscoveryState>) -> Response {
+    axum::Json(oauth_docs::metadata::protected_resource(&config)).into_response()
+}
+
+async fn authorization_server_doc(
+    State(DiscoveryState(config)): State<DiscoveryState>,
+) -> Response {
+    axum::Json(oauth_docs::metadata::authorization_server(&config)).into_response()
+}
+
+/// RFC 9728 protected-resource and RFC 8414 authorization-server metadata
+/// (D3, D6): unauthenticated, rendered per request rather than memoised
+/// (D8), and cached briefly at the edge so a client's own startup burst
+/// does not re-render them on every request.
+///
+/// Only ever mounted in `AuthMode::OAuth` — see `router`.
+fn well_known_routes(config: Config, mcp_path: &str) -> Router {
+    let AuthMode::OAuth(oauth_config) = &config.auth else {
+        unreachable!("well_known_routes is only ever mounted in AuthMode::OAuth");
+    };
+    let protected_resource_path = format!("/.well-known/oauth-protected-resource{mcp_path}");
+    // D3: the suffixed path serves the AS document in `redmine` mode; `self`
+    // mode moves it to the root well-known location instead, so the
+    // suffixed path 404s there (never registered) rather than serving a
+    // second document with a different issuer.
+    let as_path = match oauth_config.discovery_as {
+        DiscoveryAs::Redmine => format!("/.well-known/oauth-authorization-server{mcp_path}"),
+        DiscoveryAs::SelfHosted => "/.well-known/oauth-authorization-server".to_string(),
+    };
+    Router::new()
+        .route(&protected_resource_path, get(protected_resource_doc))
+        .route(&as_path, get(authorization_server_doc))
+        .layer(SetResponseHeaderLayer::overriding(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("public, max-age=300"),
+        ))
+        .with_state(DiscoveryState(Arc::new(config)))
+}
+
+/// Bytes cap for `POST /revoke`'s request body (D4): far above any real RFC
+/// 7009 form (`token`, `token_type_hint`, and client credentials), far below
+/// anything worth reading in full before rejecting.
+const MAX_REVOKE_BODY_BYTES: usize = 8 * 1024;
+
+#[derive(Clone)]
+struct RevokeState {
+    client: RedmineClient,
+    verifier: Arc<TokenVerifier>,
+}
+
+/// `POST /revoke` (RFC 7009, D4): a narrow proxy to Redmine's own
+/// `/oauth/revoke`. Unauthenticated at our edge — Redmine authenticates the
+/// client — but never a general-purpose forwarder: only `token`/
+/// `token_type_hint` and the caller's own client authentication ever leave
+/// this handler, and everything else in the request body is dropped.
+///
+/// Only ever mounted in `AuthMode::OAuth` — see `router`. A candidate for
+/// the Phase 9 rate limiter: an unauthenticated route that makes one
+/// upstream request per call.
+fn revoke_route(client: RedmineClient, verifier: Arc<TokenVerifier>) -> Router {
+    Router::new()
+        .route("/revoke", post(revoke))
+        .with_state(RevokeState { client, verifier })
+}
+
+fn content_type_is_form(request: &Request) -> bool {
+    request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
+/// The caller's own client authentication (D4): an `Authorization: Basic`
+/// header takes precedence; otherwise `client_id`/`client_secret` form
+/// fields. Never this server's own introspection credential — accepting
+/// that here would let any caller revoke any token by riding on our
+/// client's identity.
+fn client_credential(
+    auth_header: Option<&http::HeaderValue>,
+    fields: &HashMap<String, String>,
+) -> Option<Credential> {
+    if let Some(value) = auth_header {
+        let text = value.to_str().ok()?;
+        let encoded = text.strip_prefix("Basic ")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (user, pass) = decoded.split_once(':')?;
+        return Some(Credential::Basic {
+            user: user.to_string(),
+            pass: SecretString::from(pass.to_string()),
+        });
+    }
+    let client_id = fields.get("client_id")?;
+    let client_secret = fields.get("client_secret")?;
+    Some(Credential::Basic {
+        user: client_id.clone(),
+        pass: SecretString::from(client_secret.clone()),
+    })
+}
+
+async fn revoke(State(state): State<RevokeState>, request: Request) -> Response {
+    if !content_type_is_form(&request) {
+        return (
+            http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported media type: expected application/x-www-form-urlencoded",
+        )
+            .into_response();
+    }
+    let auth_header = request.headers().get(http::header::AUTHORIZATION).cloned();
+
+    let Ok(bytes) = axum::body::to_bytes(request.into_body(), MAX_REVOKE_BODY_BYTES).await else {
+        return (http::StatusCode::PAYLOAD_TOO_LARGE, "payload too large").into_response();
+    };
+
+    let fields: HashMap<String, String> = url::form_urlencoded::parse(&bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let Some(token) = fields.get("token").filter(|t| !t.is_empty()) else {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_request",
+                "error_description": "token is required",
+            })),
+        )
+            .into_response();
+    };
+    let token_type_hint = fields.get("token_type_hint").map(String::as_str);
+
+    let Some(credential) = client_credential(auth_header.as_ref(), &fields) else {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_client",
+                "error_description": "client authentication is required",
+            })),
+        )
+            .into_response();
+    };
+
+    let token = SecretString::from(token.clone());
+    let scoped = state.client.as_user_owned(credential);
+    match scoped.revoke_token(&token, token_type_hint).await {
+        Ok(()) => {
+            state.verifier.purge(&token);
+            http::StatusCode::OK.into_response()
+        }
+        Err(error) => {
+            let status = error.status().unwrap_or(http::StatusCode::BAD_GATEWAY);
+            tracing::warn!(%error, "revocation request rejected upstream");
+            (status, axum::Json(json!({ "error": "invalid_client" }))).into_response()
+        }
+    }
 }
 
 /// Exact-match CORS, or nothing at all when no origins are configured.

@@ -16,6 +16,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::auth::oauth::ProbeOutcome as IntrospectionOutcome;
+use crate::config::AuthMode;
 use crate::server::RedmineMcp;
 
 /// How long a single Redmine probe is allowed to take before `/readyz` calls
@@ -36,7 +38,54 @@ struct CachedProbe {
     /// For the `checked_at` field, which must report when the probe actually
     /// ran and not when the cache hit was served.
     checked_at: chrono::DateTime<chrono::Utc>,
-    readiness: Readiness,
+    result: ProbeResult,
+}
+
+/// What [`probe`] found, one variant per auth mode that owns a
+/// server-side credential worth probing (O9): `legacy`'s own Redmine
+/// credential, or `oauth`'s introspection client. `legacy-per-user` has
+/// neither, so it stays `Redmine(Readiness::NotProbed)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeResult {
+    Redmine(Readiness),
+    Introspection(IntrospectionOutcome),
+}
+
+impl ProbeResult {
+    fn is_ready(self) -> bool {
+        match self {
+            Self::Redmine(r) => r != Readiness::Down,
+            Self::Introspection(i) => i == IntrospectionOutcome::Ok,
+        }
+    }
+
+    fn status_code(self) -> StatusCode {
+        match self {
+            Self::Redmine(r) => r.status_code(),
+            Self::Introspection(IntrospectionOutcome::Ok) => StatusCode::OK,
+            Self::Introspection(
+                IntrospectionOutcome::Misconfigured | IntrospectionOutcome::Unreachable,
+            ) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// The `redmine` field's value: kept for both variants so the body's
+    /// shape (three keys, plus `checks` in oauth mode only) does not depend
+    /// on which probe ran.
+    fn redmine_label(self) -> &'static str {
+        match self {
+            Self::Redmine(r) => r.label(),
+            Self::Introspection(i) => introspection_label(i),
+        }
+    }
+}
+
+fn introspection_label(outcome: IntrospectionOutcome) -> &'static str {
+    match outcome {
+        IntrospectionOutcome::Ok => "ok",
+        IntrospectionOutcome::Misconfigured => "misconfigured",
+        IntrospectionOutcome::Unreachable => "unreachable",
+    }
 }
 
 impl std::fmt::Debug for HealthState {
@@ -99,22 +148,32 @@ pub(crate) async fn livez() -> Response {
     no_store(StatusCode::OK, json!({ "status": "alive" }))
 }
 
-/// Readiness, backed by a TTL-cached Redmine probe.
+/// Readiness, backed by a TTL-cached probe: Redmine's `current_user` in
+/// `legacy` mode, Doorkeeper introspection in `oauth` mode (O9), neither in
+/// `legacy-per-user`.
 pub(crate) async fn readyz(State(state): State<HealthState>) -> Response {
     let probe = probe_cached(&state).await;
-    let status = if probe.readiness == Readiness::Down {
-        "not_ready"
-    } else {
+    let status = if probe.result.is_ready() {
         "ready"
+    } else {
+        "not_ready"
     };
-    no_store(
-        probe.readiness.status_code(),
-        json!({
+    let body = match probe.result {
+        ProbeResult::Redmine(_) => json!({
             "status": status,
-            "redmine": probe.readiness.label(),
+            "redmine": probe.result.redmine_label(),
             "checked_at": probe.checked_at.to_rfc3339(),
         }),
-    )
+        // `checks.introspection` (D7) is additive: every other field keeps
+        // the same shape legacy mode already carries.
+        ProbeResult::Introspection(outcome) => json!({
+            "status": status,
+            "redmine": probe.result.redmine_label(),
+            "checks": { "introspection": introspection_label(outcome) },
+            "checked_at": probe.checked_at.to_rfc3339(),
+        }),
+    };
+    no_store(probe.result.status_code(), body)
 }
 
 async fn probe_cached(state: &HealthState) -> CachedProbe {
@@ -139,15 +198,34 @@ async fn probe_cached(state: &HealthState) -> CachedProbe {
 }
 
 async fn run_probe(state: &HealthState) -> CachedProbe {
-    let readiness = probe(state).await;
+    let result = probe(state).await;
     CachedProbe {
         at: Instant::now(),
         checked_at: chrono::Utc::now(),
-        readiness,
+        result,
     }
 }
 
-async fn probe(state: &HealthState) -> Readiness {
+async fn probe(state: &HealthState) -> ProbeResult {
+    if let AuthMode::OAuth(_) = &state.server.inner.config.auth {
+        return ProbeResult::Introspection(probe_introspection(state).await);
+    }
+    ProbeResult::Redmine(probe_redmine(state).await)
+}
+
+async fn probe_introspection(state: &HealthState) -> IntrospectionOutcome {
+    let Some(verifier) = state.server.verifier() else {
+        unreachable!("verifier() is Some in AuthMode::OAuth");
+    };
+    if let Ok(outcome) = tokio::time::timeout(PROBE_TIMEOUT, verifier.probe()).await {
+        outcome
+    } else {
+        tracing::debug!("readiness probe against introspection timed out");
+        IntrospectionOutcome::Unreachable
+    }
+}
+
+async fn probe_redmine(state: &HealthState) -> Readiness {
     let Some(scoped) = state.server.server_scoped() else {
         return Readiness::NotProbed;
     };

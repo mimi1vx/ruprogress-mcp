@@ -35,9 +35,9 @@ before changing `SERVER_HOST`.
 - Both stdio and streamable HTTP transports.
 - Four auth modes: `legacy` and `legacy-per-user` implemented (the latter
   documented in `docs/legacy-per-user-auth.md`); `oauth` implemented for
-  bearer-token introspection (documented in `docs/oauth-setup.md`; scope
-  enforcement and discovery documents are not live yet); `oauth-proxy` not
-  yet.
+  bearer-token introspection, discovery documents, and token revocation
+  (documented in `docs/oauth-setup.md`; per-tool scope enforcement is not
+  live yet); `oauth-proxy` not yet.
 - A reusable `redmine-client` crate, independent of MCP.
 
 See `docs/adr/` for the design decisions made along the way.

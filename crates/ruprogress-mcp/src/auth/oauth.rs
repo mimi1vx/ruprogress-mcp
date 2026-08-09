@@ -41,6 +41,27 @@ const CACHE_CAPACITY: usize = 1024;
 /// Doorkeeper token, far below anything worth forwarding.
 const MAX_TOKEN_LEN: usize = 4096;
 
+/// The synthetic token [`TokenVerifier::probe`] introspects (D7). Never a
+/// real credential — no real Doorkeeper token looks like this — so a
+/// healthy endpoint always answers `{"active": false}`.
+const PROBE_TOKEN: &str = "ruprogress-mcp-readiness-probe-token";
+
+/// Outcome of [`TokenVerifier::probe`], consumed by `health::readyz` in
+/// `oauth` mode (D7). Distinct from [`AuthError`]: there is no "invalid
+/// token" case, because the probe's synthetic token introspecting as
+/// inactive is itself the success case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// Introspection answered and accepted this server's client credentials.
+    Ok,
+    /// Introspection rejected this server's own client credentials, or the
+    /// route is unmounted.
+    Misconfigured,
+    /// Introspection could not be reached, or answered with a transport/5xx
+    /// failure.
+    Unreachable,
+}
+
 /// Validated per-request identity. Rides inside `http::request::Parts`,
 /// which rmcp moves whole into the JSON-RPC request's extensions — so this
 /// type's `Debug` must never print the token (B7).
@@ -165,18 +186,32 @@ impl TokenVerifier {
         result
     }
 
-    /// Remove a cached entry for `token`, if any. Unused until 6b2's
-    /// `POST /revoke` purges the entry it revokes.
-    #[allow(
-        dead_code,
-        reason = "consumed by 6b2's POST /revoke; wired here so the whole oauth/* surface lands in one review"
-    )]
+    /// Remove a cached entry for `token`, if any. Called by `POST /revoke`
+    /// (D5) after a successful upstream revocation, so a client that
+    /// revokes its own token stops being accepted here immediately rather
+    /// than for up to the cache TTL.
     pub(crate) fn purge(&self, token: &SecretString) {
         let digest = Self::digest(token.expose_secret());
         self.cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&digest);
+    }
+
+    /// Cache-bypassing readiness probe (D7), consumed by `health::readyz` in
+    /// `oauth` mode. Introspects a synthetic token that no real Doorkeeper
+    /// will ever recognise, so a healthy endpoint always answers `200
+    /// {"active": false}`; the outcome that matters is not `active` but
+    /// whether introspection was reachable and accepted our own client
+    /// credentials at all.
+    pub(crate) async fn probe(&self) -> ProbeOutcome {
+        match self.introspect(&SecretString::from(PROBE_TOKEN)).await {
+            Err(AuthError::Misconfigured) => ProbeOutcome::Misconfigured,
+            Err(AuthError::Unavailable) => ProbeOutcome::Unreachable,
+            // `introspect` never returns `InvalidToken`; `context_from` is
+            // the only place that does, and this probe never calls it.
+            Ok(_) | Err(AuthError::InvalidToken(_)) => ProbeOutcome::Ok,
+        }
     }
 
     async fn introspect(&self, token: &SecretString) -> Result<Introspection, AuthError> {
@@ -642,6 +677,8 @@ mod tests {
             introspect_client_id: "client-id".to_string(),
             introspect_client_secret: SecretString::from("client-secret"),
             token_cache_ttl: Duration::from_mins(1),
+            discovery_as: crate::config::DiscoveryAs::Redmine,
+            scopes: Vec::new(),
         };
         let verifier = TokenVerifier::new(client, &oauth);
         let rendered = format!("{verifier:?}");

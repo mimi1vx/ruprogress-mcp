@@ -91,6 +91,15 @@ impl RedmineMcp {
         Arc::clone(&self.inner.attachments)
     }
 
+    /// The underlying `RedmineClient`, for `transport::http::router` to hand
+    /// to the `POST /revoke` route: that route scopes each request to the
+    /// *caller's own* client authentication (D4), not this server's, so it
+    /// needs the client itself rather than a pre-scoped credential.
+    #[must_use]
+    pub(crate) fn client(&self) -> RedmineClient {
+        self.inner.client.clone()
+    }
+
     /// THE credential choke point. Every tool starts with this line: since
     /// `redmine-client` exposes the Redmine API only on `Scoped`, a tool
     /// physically cannot reach Redmine without going through here.

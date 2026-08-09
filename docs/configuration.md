@@ -27,6 +27,8 @@ real process environment.
 | `REDMINE_INTROSPECT_CLIENT_SECRET` | yes, in `oauth` mode | — | Mutually exclusive with `REDMINE_INTROSPECT_CLIENT_SECRET_FILE`. |
 | `REDMINE_INTROSPECT_CLIENT_SECRET_FILE` | yes, in `oauth` mode (alternative) | — | Path to a file containing the secret (Docker/K8s secret mount). Setting both this and `REDMINE_INTROSPECT_CLIENT_SECRET` is a `Conflict`. |
 | `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. Has no upstream counterpart — a `ruprogress-mcp` addition, see `docs/oauth-setup.md`. |
+| `REDMINE_OAUTH_DISCOVERY_AS` | no, `oauth` mode only | `redmine` | `redmine` or `self`. `self` serves the RFC 8414 authorization-server document at the root well-known path with `issuer = REDMINE_MCP_BASE_URL` (and 404s the suffixed path) instead of the default — see `docs/oauth-setup.md`. |
+| `REDMINE_MCP_SCOPES` | no, `oauth` mode only | the full advertised set | Whitespace-separated subset of the scopes this server advertises in its OAuth discovery documents. Every entry must already be advertised in the current mode (respecting `REDMINE_MCP_READ_ONLY`/agile/tags gating); an out-of-set entry refuses to boot, listing the accepted set. Narrows advertisement only — scope *enforcement* is 6b3. |
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
@@ -95,8 +97,8 @@ These are read by the upstream reference server but not by
 
 `REDMINE_USERNAME`, `REDMINE_PASSWORD`,
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
-`REDMINE_OAUTH_SCOPE_ENFORCEMENT`, `REDMINE_OAUTH_DISCOVERY_AS`,
-`REDMINE_MCP_SCOPES`, `REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
+`REDMINE_OAUTH_SCOPE_ENFORCEMENT` (phase 6b3),
+`REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
 `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,
 `REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`),
 `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS`,
@@ -227,7 +229,7 @@ Served on the HTTP transport only.
 | Path | Checks | Codes |
 |---|---|---|
 | `/livez` | The process, and nothing else. | Always `200` |
-| `/readyz` | A TTL-cached `GET /my/account.json` against Redmine. | `200` ready, `503` Redmine down |
+| `/readyz` | A TTL-cached probe: `GET /my/account.json` in `legacy` mode, RFC 7662 introspection with a synthetic token in `oauth` mode, none in `legacy-per-user`. | `200` ready, `503` not ready |
 | `/health` | Alias for `/readyz`, for parity with the reference server. | as `/readyz` |
 
 `/livez` deliberately never touches Redmine: wired to a Kubernetes
@@ -236,18 +238,34 @@ storm. Concurrent `/readyz` requests collapse into a single upstream probe —
 setting `HEALTH_INTROSPECTION_TTL_SECONDS=0` turns that off along with the
 cache, so concurrent probes each hit Redmine.
 
-The body is readiness facts only:
+The body is readiness facts only, `legacy`/`legacy-per-user`:
 
 ```json
 { "status": "ready", "redmine": "up", "checked_at": "2026-08-06T12:00:00.123456+00:00" }
 ```
 
 `checked_at` is when the probe actually ran, which on a cache hit is up to
-`HEALTH_INTROSPECTION_TTL_SECONDS` ago. `redmine` is `up`, `down`, or `not_probed`. `not_probed` (with a `200`) is
-returned in `legacy-per-user` and `oauth` modes, where the server owns no
-credential to probe with; reporting "down" there would take the instance out of
-rotation permanently. All three endpoints send `Cache-Control: no-store` and are
-excluded from request tracing.
+`HEALTH_INTROSPECTION_TTL_SECONDS` ago. `redmine` is `up`, `down`, or
+`not_probed`. `not_probed` (with a `200`) is returned in `legacy-per-user`
+mode, where the server owns no credential to probe with; reporting "down"
+there would take the instance out of rotation permanently.
+
+`oauth` mode probes introspection instead (bypassing the token cache — the
+probe uses a synthetic token no real Doorkeeper token matches) and gains a
+`checks` field:
+
+```json
+{ "status": "ready", "redmine": "ok", "checks": { "introspection": "ok" }, "checked_at": "..." }
+```
+
+`redmine`/`checks.introspection` (identical) is `ok` (`200 {"active": false}`
+— the inactive result is expected, what matters is that introspection
+answered), `misconfigured` (Doorkeeper rejected this server's own client
+credentials — `401`/`403`/`404`, `503` overall), or `unreachable` (transport
+error, `5xx`, or timeout — `503` overall).
+
+All three endpoints send `Cache-Control: no-store` and are excluded from
+request tracing.
 
 ## `--print-config`
 

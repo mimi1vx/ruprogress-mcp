@@ -93,6 +93,37 @@ pub struct OAuthConfig {
     /// introspection result is cached, capped further by the token's own
     /// `exp`. `0` disables caching.
     pub token_cache_ttl: Duration,
+    /// `REDMINE_OAUTH_DISCOVERY_AS`: where/how the RFC 8414
+    /// authorization-server metadata document is served.
+    pub discovery_as: DiscoveryAs,
+    /// The `scopes_supported` both discovery documents advertise: the
+    /// current mode's [`crate::oauth::scopes::advertised`] set, optionally
+    /// narrowed by `REDMINE_MCP_SCOPES`.
+    pub scopes: Vec<&'static str>,
+}
+
+/// `REDMINE_OAUTH_DISCOVERY_AS` (D3): which authorization server this
+/// deployment's RFC 8414 document names itself as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryAs {
+    /// Default: the document is served at
+    /// `/.well-known/oauth-authorization-server{mcp_path}` with
+    /// `issuer = REDMINE_URL`.
+    Redmine,
+    /// Opt-in, for clients (e.g. Cursor) that probe the canonical root
+    /// well-known location: the document is served at
+    /// `/.well-known/oauth-authorization-server` with
+    /// `issuer = REDMINE_MCP_BASE_URL`, and the suffixed path 404s.
+    SelfHosted,
+}
+
+impl DiscoveryAs {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Redmine => "redmine",
+            Self::SelfHosted => "self",
+        }
+    }
 }
 
 /// Zero-sized proof that `REDMINE_PER_USER_TRUST_PROXY=true` was set. Only
@@ -782,7 +813,38 @@ fn parse_token_cache_ttl(vars: &EnvMap) -> Result<Duration, ConfigError> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, ConfigError> {
+/// `REDMINE_OAUTH_DISCOVERY_AS`: `"redmine"` (default) or `"self"`.
+fn parse_discovery_as(vars: &EnvMap) -> Result<DiscoveryAs, ConfigError> {
+    match optional(vars, "REDMINE_OAUTH_DISCOVERY_AS").as_deref() {
+        None | Some("redmine") => Ok(DiscoveryAs::Redmine),
+        Some("self") => Ok(DiscoveryAs::SelfHosted),
+        Some(other) => Err(ConfigError::Invalid {
+            var: "REDMINE_OAUTH_DISCOVERY_AS",
+            expected: "one of \"redmine\", \"self\"",
+            because: format!("got {other:?}"),
+        }),
+    }
+}
+
+/// `REDMINE_MCP_SCOPES`: narrows `full` (D2). Unset or blank leaves `full`
+/// untouched, matching [`optional`]'s "set but empty" treatment.
+fn parse_scopes(vars: &EnvMap, full: Vec<&'static str>) -> Result<Vec<&'static str>, ConfigError> {
+    let Some(raw) = optional(vars, "REDMINE_MCP_SCOPES") else {
+        return Ok(full);
+    };
+    crate::oauth::scopes::narrow(&full, &raw).map_err(|because| ConfigError::Invalid {
+        var: "REDMINE_MCP_SCOPES",
+        expected: "a whitespace-separated subset of the scopes this server advertises",
+        because,
+    })
+}
+
+fn parse_auth(
+    vars: &EnvMap,
+    transport: TransportKind,
+    read_only: bool,
+    plugins: PluginFlags,
+) -> Result<AuthMode, ConfigError> {
     let mode = optional(vars, "REDMINE_AUTH_MODE").unwrap_or_else(|| "legacy".to_string());
     match mode.as_str() {
         "legacy" => {
@@ -835,11 +897,17 @@ fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, Confi
                 });
             }
             let token_cache_ttl = parse_token_cache_ttl(vars)?;
+            let discovery_as = parse_discovery_as(vars)?;
+            let full_scopes =
+                crate::oauth::scopes::advertised(read_only, plugins.agile, plugins.tags);
+            let scopes = parse_scopes(vars, full_scopes)?;
             Ok(AuthMode::OAuth(OAuthConfig {
                 base_url,
                 introspect_client_id,
                 introspect_client_secret,
                 token_cache_ttl,
+                discovery_as,
+                scopes,
             }))
         }
         other => Err(ConfigError::Invalid {
@@ -1031,7 +1099,11 @@ impl Config {
     /// missing, invalid, or conflicting.
     pub fn from_map(vars: &EnvMap, kind: TransportKind) -> Result<Self, ConfigError> {
         let redmine = parse_redmine(vars)?;
-        let auth = parse_auth(vars, kind)?;
+        // Parsed ahead of `auth`: the oauth arm's scope-catalogue gating
+        // (D2) needs both already resolved.
+        let read_only = optional_bool(vars, "REDMINE_MCP_READ_ONLY", false)?;
+        let plugins = parse_plugins(vars)?;
+        let auth = parse_auth(vars, kind, read_only, plugins)?;
         let transport = match kind {
             TransportKind::Stdio => TransportConfig::Stdio,
             TransportKind::Http => TransportConfig::Http(Box::new(parse_http(vars)?)),
@@ -1060,8 +1132,8 @@ impl Config {
             redmine,
             auth,
             transport,
-            read_only: optional_bool(vars, "REDMINE_MCP_READ_ONLY", false)?,
-            plugins: parse_plugins(vars)?,
+            read_only,
+            plugins,
             attachments: parse_attachments(vars)?,
             max_response_items: positive_usize(
                 vars,
@@ -1141,6 +1213,8 @@ impl Config {
                 "base_url": cfg.base_url.as_str(),
                 "introspect_client_id": cfg.introspect_client_id,
                 "token_cache_ttl_seconds": cfg.token_cache_ttl.as_secs(),
+                "discovery_as": cfg.discovery_as.label(),
+                "scopes": cfg.scopes,
             })),
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         };
@@ -1509,6 +1583,119 @@ mod tests {
         let summary = config.redacted_summary().to_string();
         assert!(!summary.contains(SECRET));
         assert!(summary.contains("introspect-client"));
+    }
+
+    #[test]
+    fn discovery_as_defaults_to_redmine() {
+        let config = Config::from_map(&valid_oauth(), TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert_eq!(oauth.discovery_as, DiscoveryAs::Redmine);
+        assert_eq!(
+            config.redacted_summary()["oauth"]["discovery_as"],
+            "redmine"
+        );
+    }
+
+    #[test]
+    fn discovery_as_self_is_accepted() {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_OAUTH_DISCOVERY_AS".to_string(), "self".to_string());
+        let config = Config::from_map(&vars, TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert_eq!(oauth.discovery_as, DiscoveryAs::SelfHosted);
+    }
+
+    #[test]
+    fn discovery_as_unknown_value_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_OAUTH_DISCOVERY_AS".to_string(),
+            "bogus".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_OAUTH_DISCOVERY_AS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_scopes_default_to_the_full_advertised_set() {
+        let config = Config::from_map(&valid_oauth(), TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert!(oauth.scopes.contains(&"view_project"));
+        assert!(oauth.scopes.contains(&"edit_issues"));
+        assert!(!oauth.scopes.contains(&"admin"));
+    }
+
+    #[test]
+    fn read_only_mode_narrows_the_default_oauth_scopes_to_read_scopes() {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "true".to_string());
+        let config = Config::from_map(&vars, TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert!(oauth.scopes.contains(&"view_project"));
+        assert!(!oauth.scopes.contains(&"edit_issues"));
+    }
+
+    #[test]
+    fn redmine_mcp_scopes_narrows_and_preserves_advertised_order() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_MCP_SCOPES".to_string(),
+            "edit_issues view_project".to_string(), // reversed vs. advertised order
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert_eq!(oauth.scopes, vec!["view_project", "edit_issues"]);
+    }
+
+    #[test]
+    fn redmine_mcp_scopes_rejects_an_out_of_set_scope_and_lists_the_accepted_set() {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_MCP_READ_ONLY".to_string(), "true".to_string());
+        vars.insert(
+            "REDMINE_MCP_SCOPES".to_string(),
+            "edit_issues".to_string(), // write-only scope, but read_only is set
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        let ConfigError::Invalid {
+            var: "REDMINE_MCP_SCOPES",
+            because,
+            ..
+        } = err
+        else {
+            panic!("expected an Invalid REDMINE_MCP_SCOPES error, got {err:?}");
+        };
+        assert!(because.contains("edit_issues"));
+        assert!(
+            because.contains("view_project"),
+            "should list the accepted set: {because}"
+        );
+    }
+
+    #[test]
+    fn redmine_mcp_scopes_blank_value_is_treated_as_unset() {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_MCP_SCOPES".to_string(), String::new());
+        let config = Config::from_map(&vars, TransportKind::Http).expect("valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert!(oauth.scopes.contains(&"edit_issues"));
     }
 
     #[test]

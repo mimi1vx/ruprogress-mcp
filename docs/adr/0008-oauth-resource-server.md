@@ -70,8 +70,8 @@ Two findings, verified against the vendored dependencies (`rmcp` 3.1.1,
   Redmine's own REST API. Documented in `docs/oauth-setup.md`.
 - **Cache staleness on revocation.** A token revoked at Redmine stays usable
   here for up to the cache's positive TTL (default 60s, capped further by the
-  token's own `exp`). Mitigated by the low default and, once phase 6b2 lands
-  `POST /revoke`, by that route purging the cache entry it revokes.
+  token's own `exp`). Mitigated by the low default and by `POST /revoke`
+  purging the cache entry it revokes.
 - **A new dependency, `sha2`,** on the auth path, for the sake of a cache key.
   Small, audited, RustCrypto-maintained; the alternative (no cache) doubles
   Redmine traffic per tool call, and a 64-bit keyed hash (as used for

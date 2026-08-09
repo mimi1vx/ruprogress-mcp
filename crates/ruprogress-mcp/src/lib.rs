@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 mod health;
+mod oauth;
 pub mod readonly;
 pub mod render;
 pub mod server;

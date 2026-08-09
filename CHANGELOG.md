@@ -20,9 +20,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never a `401`. The validated token is forwarded to Redmine verbatim.
   Requires the new `REDMINE_INTROSPECT_CLIENT_ID`/
   `REDMINE_INTROSPECT_CLIENT_SECRET`(`_FILE`) variables; `oauth` on the stdio
-  transport is now a startup error, matching `legacy-per-user`. Scope
-  enforcement, discovery documents, and `/revoke` are not implemented yet —
-  see `docs/oauth-setup.md`.
+  transport is now a startup error, matching `legacy-per-user`. Per-tool scope
+  enforcement is not implemented yet — see `docs/oauth-setup.md`.
+- `oauth` mode now serves RFC 9728 protected-resource metadata at
+  `/.well-known/oauth-protected-resource{mcp_path}` and RFC 8414
+  authorization-server metadata (pointing at Redmine's real
+  `/oauth/authorize`/`/oauth/token`/`/oauth/revoke`) at the `mcp_path`-suffixed
+  well-known path by default, or at the root well-known path with
+  `REDMINE_OAUTH_DISCOVERY_AS=self` (for clients that probe the canonical
+  root location) — the two modes never both serve a document, so one always
+  404s. Both documents' `scopes_supported` come from a new scope catalogue
+  ported from the reference server, gated by `REDMINE_MCP_READ_ONLY` and the
+  agile/tags plugin flags, and narrowable by the new `REDMINE_MCP_SCOPES`
+  (an out-of-set entry refuses to boot, naming the accepted set). `admin` is
+  never advertised. A new `POST /revoke` narrowly proxies RFC 7009 token
+  revocation to Redmine, forwarding only `token`/`token_type_hint` plus the
+  caller's own client authentication, and purges the revoked token from this
+  server's introspection cache so it stops working on the very next request
+  rather than after the cache TTL. `/readyz` in `oauth` mode now probes
+  introspection with a synthetic token (bypassing the token cache) instead of
+  reporting `not_probed`, gaining a `checks.introspection` field
+  (`ok`/`misconfigured`/`unreachable`). All of the above are unauthenticated
+  and unaffected by the bearer-auth middleware.
 - `REDMINE_AUTH_MODE=legacy-per-user` is now implemented: each HTTP request
   carries its own Redmine credential in `X-Redmine-API-Key` instead of the
   server holding one shared key. No ambient fallback and no cross-request
