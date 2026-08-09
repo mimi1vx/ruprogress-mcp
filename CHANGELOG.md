@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
+  authentication: an axum middleware guards the whole `/mcp` route (including
+  `initialize`), extracting the inbound `Authorization: Bearer` token and
+  validating it by RFC 7662 introspection against Redmine's Doorkeeper,
+  cached by a SHA-256 digest of the token (never the token itself) with a TTL
+  capped by the token's own `exp`. A missing/malformed/invalid token gets a
+  `401` carrying `WWW-Authenticate: Bearer resource_metadata="..."`; a broken
+  or misconfigured introspection endpoint gets a `503` with `Retry-After`,
+  never a `401`. The validated token is forwarded to Redmine verbatim.
+  Requires the new `REDMINE_INTROSPECT_CLIENT_ID`/
+  `REDMINE_INTROSPECT_CLIENT_SECRET`(`_FILE`) variables; `oauth` on the stdio
+  transport is now a startup error, matching `legacy-per-user`. Scope
+  enforcement, discovery documents, and `/revoke` are not implemented yet —
+  see `docs/oauth-setup.md`.
 - `REDMINE_AUTH_MODE=legacy-per-user` is now implemented: each HTTP request
   carries its own Redmine credential in `X-Redmine-API-Key` instead of the
   server holding one shared key. No ambient fallback and no cross-request

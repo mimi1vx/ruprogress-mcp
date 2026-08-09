@@ -72,14 +72,27 @@ pub enum AuthMode {
         trust: ProxyTrust,
         audit_identity: bool,
     },
-    /// Not yet implemented.
+    /// Each request carries its own Redmine credential as an
+    /// `Authorization: Bearer` token, validated by RFC 7662 introspection —
+    /// see `auth::oauth`.
     OAuth(OAuthConfig),
 }
 
-/// OAuth settings; not yet implemented, only the base URL is validated so far.
+/// OAuth settings.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
+    /// `REDMINE_MCP_BASE_URL`: this server's own public base URL, embedded in
+    /// the `WWW-Authenticate` challenge and OAuth discovery documents.
     pub base_url: Url,
+    /// `REDMINE_INTROSPECT_CLIENT_ID`: the confidential OAuth client id used
+    /// to authenticate introspection/revocation requests to Redmine.
+    pub introspect_client_id: String,
+    /// `REDMINE_INTROSPECT_CLIENT_SECRET`/`_FILE`.
+    pub introspect_client_secret: SecretString,
+    /// `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS`: how long a positive
+    /// introspection result is cached, capped further by the token's own
+    /// `exp`. `0` disables caching.
+    pub token_cache_ttl: Duration,
 }
 
 /// Zero-sized proof that `REDMINE_PER_USER_TRUST_PROXY=true` was set. Only
@@ -678,6 +691,97 @@ fn parse_http(vars: &EnvMap) -> Result<HttpConfig, ConfigError> {
     })
 }
 
+/// Validates `REDMINE_MCP_BASE_URL`: absolute, scheme `http`/`https`, no
+/// userinfo, no query, no fragment. A trailing slash is not rejected — Url
+/// forces one on a root path regardless — but every consumer that appends a
+/// path to this value (the `WWW-Authenticate` challenge, discovery documents)
+/// must strip it first; see `auth::oauth`'s challenge builder.
+///
+/// Non-`https` on a non-loopback host is a startup `WARN`, not an error:
+/// local development over loopback (and Docker-internal hostnames) is
+/// legitimate, but this value is embedded in a challenge every OAuth client
+/// receives, so a production deployment serving it over plain HTTP is worth
+/// flagging.
+fn parse_oauth_base_url(vars: &EnvMap) -> Result<Url, ConfigError> {
+    const VAR: &str = "REDMINE_MCP_BASE_URL";
+    let raw = required(
+        vars,
+        VAR,
+        "oauth auth mode requires the server's own public base URL",
+    )?;
+    let url: Url = raw.parse().map_err(|_| ConfigError::Invalid {
+        var: VAR,
+        expected: "an absolute http(s) URL with no userinfo, query, or fragment",
+        because: "the value could not be parsed as a URL".to_string(),
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "an http or https URL",
+            because: format!("scheme {:?} is not http/https", url.scheme()),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "a URL without embedded credentials",
+            because: "the URL contains userinfo".to_string(),
+        });
+    }
+    if url.query().is_some() {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "a URL without a query string",
+            because: "the URL contains a query string".to_string(),
+        });
+    }
+    if url.fragment().is_some() {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "a URL without a fragment",
+            because: "the URL contains a fragment".to_string(),
+        });
+    }
+    let is_loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() == "http" && !is_loopback {
+        tracing::warn!(
+            base_url = %url,
+            "REDMINE_MCP_BASE_URL uses http on a non-loopback host: this value is embedded in \
+             the WWW-Authenticate challenge and every OAuth discovery document, so it should be \
+             https in production"
+        );
+    }
+    Ok(url)
+}
+
+const DEFAULT_OAUTH_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
+const MAX_OAUTH_TOKEN_CACHE_TTL_SECONDS: u64 = 3600;
+
+/// `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS`: `0..=3600`, default `60`. `0`
+/// disables caching entirely — unlike [`positive_u64`], `0` is an accepted
+/// value here.
+fn parse_token_cache_ttl(vars: &EnvMap) -> Result<Duration, ConfigError> {
+    const VAR: &str = "REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS";
+    let Some(raw) = optional(vars, VAR) else {
+        return Ok(Duration::from_secs(DEFAULT_OAUTH_TOKEN_CACHE_TTL_SECONDS));
+    };
+    let invalid = |because: String| ConfigError::Invalid {
+        var: VAR,
+        expected: "a number of seconds between 0 and 3600",
+        because,
+    };
+    let seconds: u64 = raw
+        .parse()
+        .map_err(|_| invalid("the value could not be parsed as a number".to_string()))?;
+    if seconds > MAX_OAUTH_TOKEN_CACHE_TTL_SECONDS {
+        return Err(invalid(format!("{seconds} is longer than an hour")));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, ConfigError> {
     let mode = optional(vars, "REDMINE_AUTH_MODE").unwrap_or_else(|| "legacy".to_string());
     match mode.as_str() {
@@ -709,17 +813,34 @@ fn parse_auth(vars: &EnvMap, transport: TransportKind) -> Result<AuthMode, Confi
             })
         }
         "oauth" => {
-            let raw = required(
+            let base_url = parse_oauth_base_url(vars)?;
+            let introspect_client_id = required(
                 vars,
-                "REDMINE_MCP_BASE_URL",
-                "oauth auth mode requires the server's own public base URL",
+                "REDMINE_INTROSPECT_CLIENT_ID",
+                "oauth auth mode requires the OAuth client credentials used to introspect \
+                 bearer tokens",
             )?;
-            let base_url = raw.parse().map_err(|_| ConfigError::Invalid {
-                var: "REDMINE_MCP_BASE_URL",
-                expected: "a valid URL",
-                because: "the value could not be parsed as a URL".to_string(),
-            })?;
-            Ok(AuthMode::OAuth(OAuthConfig { base_url }))
+            let introspect_client_secret = secret(vars, "REDMINE_INTROSPECT_CLIENT_SECRET")?
+                .ok_or(ConfigError::Missing {
+                    var: "REDMINE_INTROSPECT_CLIENT_SECRET",
+                    because: "oauth auth mode requires the OAuth client credentials used to \
+                              introspect bearer tokens (REDMINE_INTROSPECT_CLIENT_SECRET or \
+                              REDMINE_INTROSPECT_CLIENT_SECRET_FILE)",
+                })?;
+            if transport == TransportKind::Stdio {
+                return Err(ConfigError::Conflict {
+                    because: "oauth auth requires per-request bearer tokens and a 401 challenge \
+                              to discover them, neither of which the stdio transport has"
+                        .to_string(),
+                });
+            }
+            let token_cache_ttl = parse_token_cache_ttl(vars)?;
+            Ok(AuthMode::OAuth(OAuthConfig {
+                base_url,
+                introspect_client_id,
+                introspect_client_secret,
+                token_cache_ttl,
+            }))
         }
         other => Err(ConfigError::Invalid {
             var: "REDMINE_AUTH_MODE",
@@ -1015,12 +1136,21 @@ impl Config {
                 "mcp_path": http.mcp_path,
             }),
         };
+        let oauth = match &self.auth {
+            AuthMode::OAuth(cfg) => Some(json!({
+                "base_url": cfg.base_url.as_str(),
+                "introspect_client_id": cfg.introspect_client_id,
+                "token_cache_ttl_seconds": cfg.token_cache_ttl.as_secs(),
+            })),
+            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
+        };
         json!({
             "redmine": {
                 "url_host": self.redmine.url.host_str(),
                 "ssl_verify": self.redmine.ssl_verify,
             },
             "auth_mode": self.auth_mode_label(),
+            "oauth": oauth,
             "transport": transport,
             "read_only_mode": self.read_only,
             "plugin_flags": self.plugin_flags_json(),
@@ -1164,12 +1294,24 @@ mod tests {
         assert!(matches!(err, ConfigError::Conflict { .. }));
     }
 
+    fn valid_oauth() -> EnvMap {
+        map(&[
+            ("REDMINE_URL", "https://redmine.example.com"),
+            ("REDMINE_AUTH_MODE", "oauth"),
+            ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
+            ("REDMINE_INTROSPECT_CLIENT_ID", "introspect-client"),
+            ("REDMINE_INTROSPECT_CLIENT_SECRET", "introspect-secret"),
+        ])
+    }
+
     #[test]
     fn oauth_without_base_url_is_missing() {
         let vars = map(&[
             ("REDMINE_URL", "https://redmine.example.com"),
             ("REDMINE_AUTH_MODE", "oauth"),
         ]);
+        // Base-url is checked before the introspection credentials and the
+        // transport conflict, so this reports Missing even on stdio.
         let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
         assert!(matches!(
             err,
@@ -1181,14 +1323,192 @@ mod tests {
     }
 
     #[test]
-    fn oauth_with_base_url_succeeds() {
-        let vars = map(&[
-            ("REDMINE_URL", "https://redmine.example.com"),
-            ("REDMINE_AUTH_MODE", "oauth"),
-            ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
-        ]);
-        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+    fn oauth_with_valid_config_succeeds_on_http() {
+        let config =
+            Config::from_map(&valid_oauth(), TransportKind::Http).expect("should be valid");
         assert!(matches!(config.auth, AuthMode::OAuth(_)));
+    }
+
+    #[test]
+    fn oauth_without_introspect_client_id_is_missing() {
+        let mut vars = valid_oauth();
+        vars.remove("REDMINE_INTROSPECT_CLIENT_ID");
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "REDMINE_INTROSPECT_CLIENT_ID",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_without_introspect_client_secret_is_missing() {
+        let mut vars = valid_oauth();
+        vars.remove("REDMINE_INTROSPECT_CLIENT_SECRET");
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "REDMINE_INTROSPECT_CLIENT_SECRET",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_with_both_client_secret_and_secret_file_is_conflict() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_INTROSPECT_CLIENT_SECRET_FILE".to_string(),
+            "/tmp/whatever".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_on_stdio_transport_is_conflict() {
+        let err = Config::from_map(&valid_oauth(), TransportKind::Stdio).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_base_url_with_userinfo_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_MCP_BASE_URL".to_string(),
+            "http://user:pass@localhost:3040".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_base_url_with_query_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_MCP_BASE_URL".to_string(),
+            "http://localhost:3040/?x=1".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_base_url_with_fragment_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_MCP_BASE_URL".to_string(),
+            "http://localhost:3040/#frag".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_base_url_relative_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_MCP_BASE_URL".to_string(), "not a url".to_string());
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_base_url_with_non_http_scheme_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_MCP_BASE_URL".to_string(),
+            "ftp://localhost:3040".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_token_cache_ttl_defaults_to_60() {
+        let config =
+            Config::from_map(&valid_oauth(), TransportKind::Http).expect("should be valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert_eq!(oauth.token_cache_ttl, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn oauth_token_cache_ttl_zero_is_accepted() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS".to_string(),
+            "0".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        let AuthMode::OAuth(oauth) = &config.auth else {
+            panic!("expected oauth mode");
+        };
+        assert_eq!(oauth.token_cache_ttl, Duration::ZERO);
+    }
+
+    #[test]
+    fn oauth_token_cache_ttl_out_of_range_is_invalid() {
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS".to_string(),
+            "3601".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_redacted_summary_omits_the_client_secret() {
+        const SECRET: &str = "super-secret-introspect-value";
+        let mut vars = valid_oauth();
+        vars.insert(
+            "REDMINE_INTROSPECT_CLIENT_SECRET".to_string(),
+            SECRET.to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        let summary = config.redacted_summary().to_string();
+        assert!(!summary.contains(SECRET));
+        assert!(summary.contains("introspect-client"));
     }
 
     #[test]
