@@ -1,12 +1,8 @@
-# Tool contract (vendored from upstream reference server)
+# Tool contract
 
-Source: [`jztan/redmine-mcp-server`](https://github.com/jztan/redmine-mcp-server),
-branch `develop` (`main` 404s), `docs/tool-reference.md`, captured 2026-08-06
-at commit-adjacent content (52 `###`-level tool sections found).
-
-For each tool: name, parameter names + types + required-ness (as given upstream),
-and a one-line return shape. This is a snapshot for drift detection, not a spec —
-the upstream doc is authoritative; re-vendor when implementing more tools.
+The full tool surface `ruprogress-mcp` targets: 52 tools, of which 42 are
+implemented. For each tool: name, parameter names + types + required-ness, and
+a one-line return shape.
 
 Tools currently implemented (the non-app core tools plus the
 attachment-related `get_redmine_attachment`, `list_files`, `delete_file`,
@@ -28,8 +24,8 @@ which fails CI on drift):
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
 `manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`,
 `list_files`, `delete_file`, `upload_file`, and (only with
-`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`. `
-upload_file` accepts `content_base64`/`file_path` only — `source_url` is
+`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`.
+`upload_file` accepts `content_base64`/`file_path` only — `source_url` is
 recognised as a parameter but always refused with `UNSUPPORTED_SOURCE`,
 deferred to a future release. All remaining sections below (MCP Apps, the
 rest of File Operations, Checklist Tools, Products/Contacts/Documents
@@ -389,7 +385,7 @@ Returns: List of `{id, name, is_public, project_id}` dicts. `project_id` is `nul
 ### `import_time_entries`
 
 Parameters:
-- `entries` (array of objects, required): List of time entry dicts. Each entry accepts: `hours` (required), plus at least one of `project_id`/`issue_id`. Optional: `user_id` (log on behalf of a teammate), `activity_id`, `comments`, `spent_on`. Capped at 500 entries per call -- split larger imports into multiple invocations. (The JSON-string variant was dropped in #114; passing a string is rejected at the FastMCP boundary with the `INVALID_ARGUMENTS` envelope.)
+- `entries` (array of objects, required): List of time entry dicts. Each entry accepts: `hours` (required), plus at least one of `project_id`/`issue_id`. Optional: `user_id` (log on behalf of a teammate), `activity_id`, `comments`, `spent_on`. Capped at 500 entries per call -- split larger imports into multiple invocations. Must be an array; a JSON string is rejected at the schema boundary.
 - `stop_on_error` (boolean, optional): Abort on the first error. Default: `false` (continue past errors).
 
 Returns: Dictionary with:

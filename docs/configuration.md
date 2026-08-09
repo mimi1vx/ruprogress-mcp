@@ -1,10 +1,7 @@
 # Configuration
 
-Environment variable names are vendored from the upstream reference server
-(`jztan/redmine-mcp-server`, branch `develop`, `.env.example`, captured
-2026-08-06) so existing `.env` files port unchanged. Only the variables
-`ruprogress-mcp` currently reads are validated; the rest are recorded here
-for later and are currently ignored.
+Only the variables `ruprogress-mcp` currently reads are validated; the rest
+are recorded here for later and are currently ignored.
 
 Config is loaded via `Config::from_map`, a pure function over an injected
 `BTreeMap<String, String>` — never the ambient environment directly (see ADR
@@ -26,7 +23,7 @@ real process environment.
 | `REDMINE_INTROSPECT_CLIENT_ID` | yes, in `oauth` mode | — | The confidential OAuth client id used to authenticate RFC 7662 introspection requests to Redmine's Doorkeeper. |
 | `REDMINE_INTROSPECT_CLIENT_SECRET` | yes, in `oauth` mode | — | Mutually exclusive with `REDMINE_INTROSPECT_CLIENT_SECRET_FILE`. |
 | `REDMINE_INTROSPECT_CLIENT_SECRET_FILE` | yes, in `oauth` mode (alternative) | — | Path to a file containing the secret (Docker/K8s secret mount). Setting both this and `REDMINE_INTROSPECT_CLIENT_SECRET` is a `Conflict`. |
-| `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. Has no upstream counterpart — a `ruprogress-mcp` addition, see `docs/oauth-setup.md`. |
+| `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. See `docs/oauth-setup.md`. |
 | `REDMINE_OAUTH_DISCOVERY_AS` | no, `oauth` mode only | `redmine` | `redmine` or `self`. `self` serves the RFC 8414 authorization-server document at the root well-known path with `issuer = REDMINE_MCP_BASE_URL` (and 404s the suffixed path) instead of the default — see `docs/oauth-setup.md`. |
 | `REDMINE_MCP_SCOPES` | no, `oauth` mode only | the full advertised set | Whitespace-separated subset of the scopes this server advertises in its OAuth discovery documents. Every entry must already be advertised in the current mode (respecting `REDMINE_MCP_READ_ONLY`/agile/tags gating); an out-of-set entry refuses to boot, listing the accepted set. Narrows advertisement; enforcement is `REDMINE_OAUTH_SCOPE_ENFORCEMENT` below. |
 | `REDMINE_OAUTH_SCOPE_ENFORCEMENT` | no, `oauth` mode only | `on` | `on` or `off`. `off` disables both `tools/list` filtering and `tools/call` scope denial, restoring unfiltered behaviour, and logs a startup `WARN` — intended only for tokens minted before the OAuth application advertised scopes. See `docs/oauth-setup.md`. |
@@ -93,8 +90,8 @@ mistake).
 
 ## Not yet implemented
 
-These are read by the upstream reference server but not by
-`ruprogress-mcp` yet; setting them today has no effect.
+These are recognised names that `ruprogress-mcp` does not read yet; setting
+them today has no effect.
 
 `REDMINE_USERNAME`, `REDMINE_PASSWORD`,
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
@@ -104,8 +101,8 @@ These are read by the upstream reference server but not by
 `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS`,
 `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
 
-The 8 attachment-related variables the parent reference server reads are now
-*validated and read* (see "Attachment store" below). `get_redmine_attachment`
+The 8 attachment-related variables are validated and read (see "Attachment
+store" below). `get_redmine_attachment`
 reads `ATTACHMENTS_DIR`, `ATTACHMENT_MAX_DOWNLOAD_BYTES`,
 `ATTACHMENT_STORE_MAX_BYTES`, `AUTO_CLEANUP_ENABLED`,
 `CLEANUP_INTERVAL_MINUTES`, and `ATTACHMENT_EXPIRES_MINUTES`;
@@ -219,8 +216,9 @@ services:
 
 Note that in the default `legacy` auth mode a non-loopback bind also logs a
 `WARN`: there is one shared Redmine API key, so everyone who can reach the port
-acts as that Redmine account. Put an authenticating proxy in front, or wait for
-per-user auth.
+acts as that Redmine account. Put an authenticating proxy in front, or use
+`REDMINE_AUTH_MODE=legacy-per-user` or `oauth` so each caller presents their
+own credential.
 
 ## Health endpoints
 
@@ -230,7 +228,7 @@ Served on the HTTP transport only.
 |---|---|---|
 | `/livez` | The process, and nothing else. | Always `200` |
 | `/readyz` | A TTL-cached probe: `GET /my/account.json` in `legacy` mode, RFC 7662 introspection with a synthetic token in `oauth` mode, none in `legacy-per-user`. | `200` ready, `503` not ready |
-| `/health` | Alias for `/readyz`, for parity with the reference server. | as `/readyz` |
+| `/health` | Alias for `/readyz`. | as `/readyz` |
 
 `/livez` deliberately never touches Redmine: wired to a Kubernetes
 `livenessProbe`, a dependency check would turn a Redmine blip into a restart
@@ -289,23 +287,21 @@ them.
 prompt-injected will happily relay it. `/readyz` is unauthenticated, so it
 answers only the question it exists to answer.
 
-## Divergences from the reference server
+## Deliberately conservative defaults
 
-Three deliberate differences from `jztan/redmine-mcp-server`. A silent
-behaviour difference is worse than a documented one.
+Four choices that trade convenience for a safer default. A silent behaviour
+difference is worse than a documented one.
 
 1. **The default bind is `127.0.0.1:8000`, not `0.0.0.0:8000`.** An MCP server
    whose only auth is one shared API key, reachable on every interface, is one
    `docker run -p` away from being an unauthenticated Redmine proxy.
 2. **`/health` reports readiness only** — no `version`, `auth_mode`,
-   `read_only`, or `plugin_flags`, which the reference server includes. Those
-   answer no readiness question and are configuration disclosure on an
-   unauthenticated endpoint. They remain available via `get_mcp_server_info`
-   and `--print-config`.
+   `read_only`, or `plugin_flags`. Those answer no readiness question and are
+   configuration disclosure on an unauthenticated endpoint. They remain
+   available via `get_mcp_server_info` and `--print-config`.
 3. **A non-loopback `SERVER_HOST` without `PUBLIC_HOST` or
-   `REDMINE_MCP_ALLOWED_HOSTS` refuses to start.** Porting an upstream `.env`
-   that sets only `SERVER_HOST=0.0.0.0` requires adding one variable. See
-   "Exposing the server on a network".
+   `REDMINE_MCP_ALLOWED_HOSTS` refuses to start.** See "Exposing the server on
+   a network".
 4. **`PUBLIC_HOST` is required for a non-loopback `SERVER_HOST` even when
    `REDMINE_MCP_ALLOWED_HOSTS=*` is set.** That variable turns off the `Host`
    *check*, but `/files/{uuid}` URLs still need a real origin to build from —

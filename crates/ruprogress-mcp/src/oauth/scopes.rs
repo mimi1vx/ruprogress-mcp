@@ -4,17 +4,14 @@
 //!
 //! Scope identifiers are Redmine Doorkeeper scope names — in stock Redmine
 //! 6.x they match the permission name from
-//! `lib/redmine/access_control.rb`. Ported verbatim from the reference
-//! server's `oauth_scopes.py` (`jztan/redmine-mcp-server`, `develop`,
-//! captured 2026-08-09), including the per-scope comments that record a
-//! Redmine fact rather than a Python implementation detail.
+//! `lib/redmine/access_control.rb`, which the per-scope comments below cite.
 //!
 //! `admin` is never advertised: tokens with admin scope bypass per-permission
 //! checks, so default-advertising it would make every consent screen ask for
 //! full administrative access. Vendor plugin scopes outside `agile`/`tags`
 //! (Easy Redmine, `RedmineUP`, checklists, CRM, products, DMSF) are excluded
-//! for the same reason the reference excludes them: they vary by deployment,
-//! and advertising a scope Redmine doesn't recognize causes consent errors.
+//! because they vary by deployment, and advertising a scope Redmine doesn't
+//! recognize causes consent errors.
 
 /// Redmine permissions used by the read-only MCP tools.
 const READ_SCOPES: &[&str] = &[

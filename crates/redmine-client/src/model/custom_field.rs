@@ -67,7 +67,7 @@ pub struct CustomField {
 /// A single allowed value for a `field_format: "list"` custom field, as
 /// Redmine's `GET /custom_fields.json` sends it (`{"value": ..., "label":
 /// ...}`). `CustomFieldDefinition::possible_values` collapses these to their
-/// `value`s, matching the flattened shape the reference server documents.
+/// `value`s.
 #[derive(Debug, Clone, Deserialize)]
 struct PossibleValue {
     value: String,

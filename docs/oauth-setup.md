@@ -5,10 +5,6 @@ Doorkeeper access token as `Authorization: Bearer`, and this server validates
 it by RFC 7662 introspection before forwarding it upstream verbatim. Every
 user acts as themselves, with their own token's permissions.
 
-Ported from the upstream reference server's `docs/oauth-setup.md`
-(`jztan/redmine-mcp-server`, branch `develop`, captured 2026-08-09), trimmed
-to what `ruprogress-mcp` actually implements today.
-
 ## Status
 
 **Live now:** bearer extraction, RFC 7662 introspection with
@@ -305,8 +301,8 @@ administrative access.
 Doorkeeper introspection returns no `aud` claim, so this server cannot verify
 that a presented token was issued *for it* specifically rather than for
 another OAuth client of the same Redmine instance. Any holder of any valid
-Redmine access token can drive this server as that user. This is also the
-reference server's behaviour and is not fixable without changes upstream in
+Redmine access token can drive this server as that user. This is not fixable
+without changes upstream in
 Redmine/Doorkeeper; it is bounded by the fact that the token grants no *more*
 against this server than it already grants directly against Redmine's own
 REST API. See `docs/adr/0008-oauth-resource-server.md`.

@@ -2,8 +2,8 @@
 //! permission(s) required to call it, and the pure resolution functions
 //! `server.rs`'s hand-written `list_tools`/`call_tool` use.
 //!
-//! Ported against **this** server's own `redmine-client` call sites, not
-//! transcribed from the upstream reference — every entry below was verified
+//! Derived from **this** server's own `redmine-client` call sites — every
+//! entry below was verified
 //! against the endpoint it maps to. No I/O, no async: a pure policy module
 //! over `rmcp::model::JsonObject` arguments and a token's held scope set.
 

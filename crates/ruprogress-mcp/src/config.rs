@@ -222,7 +222,7 @@ const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, schemars::JsonSchema)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "mirrors the upstream reference server's six independent plugin toggles exactly"
+    reason = "six independent, unrelated plugin toggles, each with its own env var"
 )]
 pub struct PluginFlags {
     pub agile: bool,

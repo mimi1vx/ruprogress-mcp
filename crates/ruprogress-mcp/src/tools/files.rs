@@ -32,8 +32,8 @@ use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, err};
 
 /// `upload_file`'s own per-file cap for the `file_path` source: independent
 /// of `ATTACHMENT_MAX_DOWNLOAD_BYTES`, which bounds the opposite direction
-/// (Redmine → local disk). Matches the vendored reference contract's
-/// documented 50 MiB limit; not configurable, since it is a fixed property
+/// (Redmine → local disk). Matches the tool contract's documented 50 MiB
+/// limit; not configurable, since it is a fixed property
 /// of this server's `upload_file` implementation, not a deployment choice.
 const UPLOAD_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 

@@ -29,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well-known path by default, or at the root well-known path with
   `REDMINE_OAUTH_DISCOVERY_AS=self` (for clients that probe the canonical
   root location) — the two modes never both serve a document, so one always
-  404s. Both documents' `scopes_supported` come from a new scope catalogue
-  ported from the reference server, gated by `REDMINE_MCP_READ_ONLY` and the
+  404s. Both documents' `scopes_supported` come from a new scope catalogue of
+  Redmine Doorkeeper scope names, gated by `REDMINE_MCP_READ_ONLY` and the
   agile/tags plugin flags, and narrowable by the new `REDMINE_MCP_SCOPES`
   (an out-of-set entry refuses to boot, naming the accepted set). `admin` is
   never advertised. A new `POST /revoke` narrowly proxies RFC 7009 token
@@ -174,8 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The default HTTP bind is `127.0.0.1:8000`, not the reference server's
-  `0.0.0.0:8000`.
+- The default HTTP bind is `127.0.0.1:8000`, not `0.0.0.0:8000`.
 - `list_redmine_projects` now returns `{"projects": [...], "pagination":
   {...}}` instead of a bare JSON array, so `structuredContent` is a JSON
   object per the MCP spec.

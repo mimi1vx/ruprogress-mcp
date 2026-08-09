@@ -59,11 +59,10 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "upload_file",
 ];
 
-/// Every tool name in `docs/tool-contract.md` (vendored from the upstream
-/// reference server, captured 2026-08-06). The router's tools must be a
+/// Every tool name in `docs/tool-contract.md`. The router's tools must be a
 /// *subset* of this list — not equal, until the full tool surface is built
 /// out — so a typo'd or made-up tool name is a build/test failure rather
-/// than a silent divergence from the reference contract.
+/// than a silent divergence from the documented contract.
 const EXPECTED_TOOLS: &[&str] = &[
     "list_redmine_projects",
     "list_project_issue_custom_fields",
@@ -681,7 +680,7 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 }
 
 /// `tools/list` JSON (description + input schema + output schema per tool)
-/// is materially larger than a minimal reference implementation's. This is
+/// is a material share of a client's context budget. This is
 /// a generous, not a tight, threshold on the total serialized size, so it
 /// fails loud and early if a tool's descriptions or schemas balloon rather
 /// than silently degrading context budgets. Revised upward each time new
