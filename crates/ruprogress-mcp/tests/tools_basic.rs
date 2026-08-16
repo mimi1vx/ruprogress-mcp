@@ -230,6 +230,27 @@ async fn tools_list_with_checklists_enabled_adds_exactly_the_checklist_tools() {
 /// to [`IMPLEMENTED_TOOLS`] only when their respective flag is on.
 const PRODUCTS_CRM_TOOLS: &[&str] = &["manage_product", "manage_contact"];
 
+/// The DMSF plugin's tool, added to [`IMPLEMENTED_TOOLS`] only when
+/// `REDMINE_DMSF_ENABLED` is on.
+const DMSF_TOOLS: &[&str] = &["manage_document"];
+
+#[tokio::test]
+async fn tools_list_with_dmsf_enabled_adds_exactly_manage_document() {
+    let h = support::harness(&[("REDMINE_DMSF_ENABLED", "true")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = IMPLEMENTED_TOOLS.to_vec();
+    expected.extend_from_slice(DMSF_TOOLS);
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    assert_eq!(names.len(), 42, "41 base tools + manage_document");
+}
+
 #[tokio::test]
 async fn tools_list_with_products_and_crm_enabled_adds_exactly_those_tools() {
     let h = support::harness(&[
@@ -255,8 +276,7 @@ async fn tools_list_with_products_and_crm_enabled_adds_exactly_those_tools() {
     );
 }
 
-/// Every plugin flag implemented so far, all at once. DMSF (`manage_document`,
-/// phase 7e) is not yet implemented, so this is not yet the parent plan's
+/// Every plugin flag implemented so far, all at once — the parent plan's
 /// full 47.
 #[tokio::test]
 async fn tools_list_with_every_implemented_plugin_flag_enabled() {
@@ -264,6 +284,7 @@ async fn tools_list_with_every_implemented_plugin_flag_enabled() {
         ("REDMINE_CHECKLISTS_ENABLED", "true"),
         ("REDMINE_PRODUCTS_ENABLED", "true"),
         ("REDMINE_CRM_ENABLED", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
     ])
     .await;
     let tools = h
@@ -276,12 +297,13 @@ async fn tools_list_with_every_implemented_plugin_flag_enabled() {
     let mut expected: Vec<&str> = IMPLEMENTED_TOOLS.to_vec();
     expected.extend_from_slice(CHECKLIST_TOOLS);
     expected.extend_from_slice(PRODUCTS_CRM_TOOLS);
+    expected.extend_from_slice(DMSF_TOOLS);
     expected.sort_unstable();
     assert_eq!(names, expected);
     assert_eq!(
         names.len(),
-        46,
-        "41 base + 3 checklist + manage_product + manage_contact"
+        47,
+        "41 base + 3 checklist + manage_product + manage_contact + manage_document"
     );
 }
 
@@ -803,6 +825,7 @@ async fn tools_list_serialized_size_with_every_plugin_enabled_stays_under_a_wide
         ("REDMINE_CHECKLISTS_ENABLED", "true"),
         ("REDMINE_PRODUCTS_ENABLED", "true"),
         ("REDMINE_CRM_ENABLED", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
     ])
     .await;
     let tools = h
@@ -812,13 +835,13 @@ async fn tools_list_serialized_size_with_every_plugin_enabled_stays_under_a_wide
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     // `manage_product`/`manage_contact` are the two widest schemas in the
-    // server (parent plan Risk 1) — this threshold was raised from 145 000
-    // to fit them: 150772 bytes measured for 46 tools, so 160 000 leaves
-    // modest headroom without hiding a real regression.
+    // server (parent plan Risk 1); `manage_document` adds a third
+    // action-dispatched schema. Threshold raised from 160 000 to fit it —
+    // re-measure and adjust here if a future change is a real regression.
     assert!(
-        bytes.len() < 160_000,
+        bytes.len() < 170_000,
         "tools/list is {} bytes for {} tools with every implemented plugin enabled; over the \
-         160000 threshold",
+         170000 threshold",
         bytes.len(),
         tools.tools.len()
     );

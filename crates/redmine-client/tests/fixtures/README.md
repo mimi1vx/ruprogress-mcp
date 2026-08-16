@@ -43,9 +43,11 @@ they land) are modelled differently from the pairs above:
 
 - **Provenance**: synthetic, derived from the reference implementation's
   handling of the plugin's endpoints rather than a live capture. Three of
-  the four plugin families are commercial and the fourth needs a server-side
-  install neither this repository nor CI has; none of these fixtures were
-  captured from a running instance.
+  the four plugin families are commercial and the fourth (DMSF,
+  `redmine_dmsf`, GPL v2) needs a server-side install neither this
+  repository nor CI has; none of these fixtures were captured from a
+  running instance. DMSF is the one family here that *could* in principle
+  be verified against a live instance later.
 - **No `_6_1`/`_7_0` version pair**: the version axis that matters for a
   plugin endpoint is the *plugin's* version, not Redmine core's, and the
   plugin version is not something this project can enumerate. Naming two
@@ -67,6 +69,10 @@ they land) are modelled differently from the pairs above:
 | `contact_full.json` | `GET /contacts/{id}.json` | every field populated except `email` — omitted per the scrub policy below, same reasoning as `user_6_1.json`'s `mail` |
 | `contact_minimal.json` | `GET /contacts/{id}.json` | only `id`/`first_name`; every other field absent |
 | `contacts_page.json` | `GET /contacts.json` | two contacts, `total_count`/`offset`/`limit` present (R3) |
+| `dmsf_list_canonical.json` | `GET /projects/{pid}/dmsf.json` | canonical shape, `{"dmsf": {"dmsf_nodes": [...], "total_count": N}}` |
+| `dmsf_list_bare.json` | `GET /projects/{pid}/dmsf.json` | bare-array shape, `[...]` — the same endpoint has been observed sending either; unlike the other list fixture pairs, this one carries no `total_count` at all |
+| `dmsf_file_show.json` | `GET /dmsf_files/{id}.json` | two revisions, proving the **latest** one (last element) wins, not the first |
+| `dmsf_commit_response.json` | `POST /projects/{pid}/dmsf/commit.json` | the plugin's deliberately sparse `{id, name}`-only response shape |
 
 ## Scrubbing
 

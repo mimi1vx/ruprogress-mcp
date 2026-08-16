@@ -1,0 +1,17 @@
+{
+  "dmsf": {
+    "dmsf_nodes": [
+      {
+        "id": 42,
+        "type": "file",
+        "filename": "report.pdf",
+        "title": "Report",
+        "size": 2048,
+        "content_type": "application/pdf",
+        "project_id": 1,
+        "version": "1.2.0"
+      }
+    ],
+    "total_count": 1
+  }
+}

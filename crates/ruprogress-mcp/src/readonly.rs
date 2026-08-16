@@ -86,11 +86,17 @@ pub mod write_tools {
     /// the router only when their respective `REDMINE_PRODUCTS_ENABLED`/
     /// `REDMINE_CRM_ENABLED` flag is on — see `server.rs`'s `PLUGIN_TOOLS`
     /// gating, a separate mechanism from this list that runs first.
+    ///
+    /// `manage_document` (DMSF plugin): `list`/`get` are reads;
+    /// `create`/`update` are writes (there is no `delete` action). Exists in
+    /// the router only when `REDMINE_DMSF_ENABLED=true` — same gating
+    /// mechanism as above.
     pub const PARTIAL_WRITE: &[&str] = &[
         "manage_issue_relation",
         "manage_issue_category",
         "manage_redmine_wiki_page",
         "manage_product",
         "manage_contact",
+        "manage_document",
     ];
 }

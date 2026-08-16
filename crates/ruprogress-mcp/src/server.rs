@@ -38,6 +38,7 @@ const PLUGIN_TOOLS: &[(&str, PluginFlagPredicate)] = &[
     ("update_checklist_item", |flags| flags.checklists),
     ("manage_product", |flags| flags.products),
     ("manage_contact", |flags| flags.crm),
+    ("manage_document", |flags| flags.dmsf),
 ];
 
 #[derive(Clone, Debug)]
@@ -77,6 +78,7 @@ impl RedmineMcp {
         router.merge(Self::checklists_tool_router());
         router.merge(Self::products_tool_router());
         router.merge(Self::crm_tool_router());
+        router.merge(Self::dmsf_tool_router());
         for (name, enabled) in PLUGIN_TOOLS {
             if !enabled(&config.plugins) {
                 router.remove_route(name);

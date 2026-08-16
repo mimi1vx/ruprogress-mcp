@@ -15,10 +15,11 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{
-    AttachmentId, ChecklistItemId, ContactId, IssueCategoryId, IssueId, JournalId, MembershipId,
-    ProductId, ProjectIdent, RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
+    AttachmentId, ChecklistItemId, ContactId, DmsfFolderId, DocumentId, IssueCategoryId, IssueId,
+    JournalId, MembershipId, ProductId, ProjectIdent, RelationId, TimeEntryId, UserId, VersionId,
+    WikiTitle,
 };
-use crate::model::plugins::{agile, checklists, crm, products};
+use crate::model::plugins::{agile, checklists, crm, dmsf, products};
 use crate::model::{
     BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
     issue_category, issue_status, journal, membership, project, query, relation, role, search,
@@ -2161,6 +2162,120 @@ impl Scoped<'_> {
         self.post_json_no_content(
             &format!("projects/{project}/files.json"),
             &upload::ProjectFileCreateEnvelope { file: new },
+        )
+        .await
+    }
+
+    /// `GET /projects/{pid}/dmsf.json` (DMSF plugin). Sends `limit`/`offset`
+    /// directly like every other tool-exposed list, but does **not** go
+    /// through [`Self::fetch_page`]/[`Collection`]: the bare-array response
+    /// shape [`dmsf::DmsfListEnvelope`] also accepts carries no
+    /// `total_count` at all, unlike Products/CRM's index actions, which
+    /// guarantee the full pagination envelope. When the canonical shape's
+    /// `total_count` is absent this falls back to the fetched item count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response is neither of the two shapes
+    /// [`dmsf::DmsfListEnvelope`] accepts.
+    pub async fn list_dmsf_nodes(
+        &self,
+        project: &ProjectIdent,
+        folder_id: Option<DmsfFolderId>,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<dmsf::DmsfNode>> {
+        let mut q = Query::default();
+        q.insert("limit", limit.to_string());
+        q.insert("offset", offset.to_string());
+        if let Some(folder_id) = folder_id {
+            q.insert("folder_id", folder_id.to_string());
+        }
+        let env: dmsf::DmsfListEnvelope = self
+            .get_json(&format!("projects/{project}/dmsf.json"), &q)
+            .await?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "node counts are far below u64::MAX in practice"
+        )]
+        let total_count = env.total_count.unwrap_or(env.nodes.len() as u64);
+        Ok(Page {
+            items: env.nodes,
+            total_count,
+            offset,
+            limit,
+            truncated: false,
+        })
+    }
+
+    /// `GET /dmsf_files/{id}.json` (DMSF plugin). `Ok(None)` when the
+    /// response carries no revision at all (`DmsfNode`'s doc comment on
+    /// [`dmsf::DmsfFileShowEnvelope::into_node`]) — this client's own
+    /// signal for "not a document this client can make sense of", which the
+    /// tool layer treats the same as a 404.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (including a genuine 404 for an unknown id).
+    pub async fn get_dmsf_file(&self, id: DocumentId) -> crate::Result<Option<dmsf::DmsfNode>> {
+        let env: dmsf::DmsfFileShowEnvelope = self
+            .get_json(&format!("dmsf_files/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.into_node())
+    }
+
+    /// `POST /projects/{pid}/dmsf/commit.json` (DMSF plugin), the second
+    /// half of the create flow: the first half is minting an upload token
+    /// via the existing [`Self::create_upload`] — DMSF adds no upload
+    /// primitive of its own. The response is deliberately sparse
+    /// (`{id, name}` per file); see
+    /// [`dmsf::DmsfCommitResponse`]'s doc comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (400 for an unknown/expired token, 422 with
+    /// validation errors).
+    pub async fn commit_dmsf_upload(
+        &self,
+        project: &ProjectIdent,
+        req: &dmsf::DmsfCommitRequest,
+    ) -> crate::Result<Vec<dmsf::DmsfNode>> {
+        let envelope = dmsf::DmsfCommitEnvelope {
+            attachments: dmsf::DmsfAttachments {
+                uploaded_file: &req.uploaded_file,
+            },
+            folder_id: req.folder_id,
+        };
+        let resp: dmsf::DmsfCommitResponse = self
+            .post_json(&format!("projects/{project}/dmsf/commit.json"), &envelope)
+            .await?;
+        Ok(resp.into_nodes())
+    }
+
+    /// `POST /dmsf/files/{id}/revision/create.json` (DMSF plugin) — every
+    /// update creates a new revision; old ones survive. **Trap 4**: the
+    /// route has a slash (`dmsf/files/...`); the underscore form
+    /// (`dmsf_files/{id}`) is the `GET` show route only and 404s on `POST`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status (**trap 1**: a missing `title`/`name` is a
+    /// server-side 500, not a validation error, since the controller calls
+    /// `.scrub.strip` on both unconditionally).
+    pub async fn create_dmsf_revision(
+        &self,
+        id: DocumentId,
+        req: &dmsf::DmsfRevisionWrite,
+    ) -> crate::Result<()> {
+        self.post_json_no_content(
+            &format!("dmsf/files/{id}/revision/create.json"),
+            &dmsf::DmsfRevisionEnvelope {
+                dmsf_file_revision: req,
+            },
         )
         .await
     }

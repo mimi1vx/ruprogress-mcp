@@ -88,6 +88,7 @@ async fn every_registered_tool_in_a_fully_enabled_router_has_a_tool_scopes_entry
         ("REDMINE_CHECKLISTS_ENABLED", "true"),
         ("REDMINE_PRODUCTS_ENABLED", "true"),
         ("REDMINE_CRM_ENABLED", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
     ])
     .await;
     let tools = h
@@ -113,6 +114,7 @@ async fn every_tool_scopes_key_is_a_registered_route_or_deferred() {
         ("REDMINE_CHECKLISTS_ENABLED", "true"),
         ("REDMINE_PRODUCTS_ENABLED", "true"),
         ("REDMINE_CRM_ENABLED", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
     ])
     .await;
     let tools = h

@@ -78,7 +78,13 @@ pub(crate) struct CustomFieldEntry {
     pub(crate) value: CustomFieldValueInput,
 }
 
-fn custom_field_entries_to_write(entries: Vec<CustomFieldEntry>) -> Vec<CustomFieldWrite> {
+/// Shared with `tools::plugins::dmsf`: the same `{id, value}` write-side
+/// shape, spelled `custom_fields` on this tool's wire but
+/// `custom_field_values` on DMSF's (trap 3) — the field name difference is
+/// each call site's own envelope, not this conversion.
+pub(crate) fn custom_field_entries_to_write(
+    entries: Vec<CustomFieldEntry>,
+) -> Vec<CustomFieldWrite> {
     entries
         .into_iter()
         .map(|e| CustomFieldWrite {

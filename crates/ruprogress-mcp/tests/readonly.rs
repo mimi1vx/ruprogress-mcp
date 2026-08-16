@@ -82,13 +82,15 @@ async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
 
 #[tokio::test]
 async fn partial_write_tool_names_survive_a_read_only_router() {
-    // manage_product/manage_contact only exist with their flags on, same
-    // reasoning as every_write_tool_name_exists_in_a_normal_router's
+    // manage_product/manage_contact/manage_document only exist with their
+    // flags on, same reasoning as
+    // every_write_tool_name_exists_in_a_normal_router's
     // REDMINE_CHECKLISTS_ENABLED above.
     let h = support::harness(&[
         ("REDMINE_MCP_READ_ONLY", "true"),
         ("REDMINE_PRODUCTS_ENABLED", "true"),
         ("REDMINE_CRM_ENABLED", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
     ])
     .await;
     let tools = h
@@ -210,6 +212,51 @@ async fn manage_product_list_works_but_create_is_blocked_in_read_only_mode() {
     create_request.arguments = json!({"action": "create", "name": "Widget"})
         .as_object()
         .cloned();
+    let create_result = h
+        .client
+        .call_tool(create_request)
+        .await
+        .expect("call_tool should succeed at the protocol level");
+    assert_eq!(create_result.is_error, Some(true));
+    assert_eq!(
+        create_result.structured_content.expect("structured")["code"],
+        "READ_ONLY"
+    );
+}
+
+#[tokio::test]
+async fn manage_document_list_works_but_create_is_blocked_in_read_only_mode() {
+    let h = support::harness(&[
+        ("REDMINE_MCP_READ_ONLY", "true"),
+        ("REDMINE_DMSF_ENABLED", "true"),
+    ])
+    .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/projects/1/dmsf.json"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "dmsf": {"dmsf_nodes": [], "total_count": 0}
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let mut list_request = CallToolRequestParams::new("manage_document");
+    list_request.arguments = json!({"action": "list", "project_id": 1})
+        .as_object()
+        .cloned();
+    let list_result = h
+        .client
+        .call_tool(list_request)
+        .await
+        .expect("action=\"list\" should be callable in read-only mode");
+    assert_ne!(list_result.is_error, Some(true));
+
+    let mut create_request = CallToolRequestParams::new("manage_document");
+    create_request.arguments = json!({
+        "action": "create", "project_id": 1, "name": "report.pdf",
+        "content_base64": "aGVsbG8="
+    })
+    .as_object()
+    .cloned();
     let create_result = h
         .client
         .call_tool(create_request)

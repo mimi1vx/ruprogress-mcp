@@ -67,6 +67,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation's handling of the plugins rather than a live capture
   (both plugins are commercial) — see
   `crates/redmine-client/tests/fixtures/README.md`.
+- `manage_document`, registered only when `REDMINE_DMSF_ENABLED=true` (the
+  `redmine_dmsf` plugin — open source, GPL v2, but still needs a
+  server-side install this project has not verified against): `list`/`get`/
+  `create`/`update` — there is no `delete` action. `list`/`get` work in
+  read-only mode; `create`/`update` are blocked. `create` accepts
+  `content_base64` or `file_path` (reusing the existing upload-path
+  resolver and size cap, not a second implementation) and validates an
+  optional `version` string before ever uploading, so a malformed one sends
+  zero requests; its response is deliberately sparse
+  (`{document_id}` only), and the `note` field points at `action="get"` for
+  full metadata. `update` always creates a new revision — it never replaces
+  one — and always pre-fetches the document first so a missing `title`/
+  `name` (which 500s the plugin's own endpoint) is never sent; a document
+  with no revisions at all is `NOT_FOUND` with no write attempted. The
+  update route is `/dmsf/files/{id}/revision/create.json` (a slash, not
+  `dmsf_files/{id}`), and both write actions spell the stored filename
+  `name` (not `filename`) and custom fields `custom_field_values` (not
+  `custom_fields`), matching the plugin's own field names exactly. Same
+  flat-typed-parameters divergence from the reference's untyped `fields`
+  dict as `manage_product`/`manage_contact`. The wire shapes are synthetic,
+  derived from the reference implementation's handling of the plugin rather
+  than a live capture — see `crates/redmine-client/tests/fixtures/README.md`.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

@@ -217,3 +217,74 @@ async fn calling_manage_contact_with_its_flag_off_fails_like_an_unknown_tool() {
         "a plugin-gated tool with its flag off should fail cleanly, not succeed"
     );
 }
+
+#[tokio::test]
+async fn flags_off_the_router_carries_no_dmsf_tool() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        !names.contains(&"manage_document"),
+        "manage_document present with REDMINE_DMSF_ENABLED unset"
+    );
+}
+
+#[tokio::test]
+async fn dmsf_flag_adds_exactly_manage_document() {
+    let base = support::harness(&[]).await;
+    let base_tools = base
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut expected: Vec<&str> = base_tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    expected.push("manage_document");
+    expected.sort_unstable();
+
+    let h = support::harness(&[("REDMINE_DMSF_ENABLED", "true")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn dmsf_flag_plus_read_only_keeps_only_list_and_get() {
+    let h = support::harness(&[
+        ("REDMINE_DMSF_ENABLED", "true"),
+        ("REDMINE_MCP_READ_ONLY", "true"),
+    ])
+    .await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    // manage_document is a PARTIAL_WRITE tool: it stays registered in
+    // read-only mode (its list/get actions survive), like manage_product
+    // above.
+    assert!(names.contains(&"manage_document"));
+}
+
+#[tokio::test]
+async fn calling_manage_document_with_its_flag_off_fails_like_an_unknown_tool() {
+    let h = support::harness(&[]).await;
+    let result = h
+        .client
+        .call_tool(CallToolRequestParams::new("manage_document"))
+        .await;
+    assert!(
+        result.is_err(),
+        "a plugin-gated tool with its flag off should fail cleanly, not succeed"
+    );
+}

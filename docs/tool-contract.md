@@ -587,15 +587,41 @@ Returns: `{success, contacts, pagination, contact, updated_fields, deleted_conta
 
 ## Documents (DMSF plugin)
 
+Requires the `redmine_dmsf` plugin (open source, GPL v2, but still needs a
+server-side install neither this repository nor CI has); registered only
+with `REDMINE_DMSF_ENABLED=true`. DMSF replaces rather than complements
+Redmine's built-in Documents module — an instance with legacy documents
+needs `rake redmine:dmsf_convert_documents` before they are visible here.
+The wire shapes this tool relies on are synthetic, derived from the
+reference implementation's handling of the plugin rather than a live
+capture — see `crates/redmine-client/tests/fixtures/README.md`'s plugin
+fixtures section; unlike the other three plugin families this one could in
+principle be verified against a live instance later. Unlike the reference's
+untyped `fields` dict for `update`, parameters here are flat and typed and
+shared between `create`/`update`; an unknown parameter key is rejected, not
+silently filtered. `offset` is an addition over the reference, which
+exposes only `limit`.
+
 ### `manage_document`
 
 Parameters:
-- `list` (, `project_id`):
-- `get` (, `document_id`):
-- `create` (, `project_id`, `filename`, `content_base64`):
-- `update` (, `document_id`, `fields`):
+- `action` (string, required): `list`, `get`, `create`, or `update`. There is no `delete` action
+- `project_id` (integer or string): Required for `list`/`create`
+- `folder_id` (integer, optional): For `list`, restrict to one folder (omit for the whole project). For `create`, the destination folder (omit for the project root)
+- `limit` (integer, optional): For `list`, max results per call, clamped to 1–100. Default `100`
+- `offset` (integer, optional): For `list`, pagination offset. Default `0`
+- `document_id` (integer): Required for `get` and `update`
+- `content_base64` (string, optional): For `create`; exactly one of `content_base64`/`file_path` is required
+- `file_path` (string, optional): For `create`. Absolute path to a file already on this server: inside `ATTACHMENTS_DIR` or a directory listed in `REDMINE_MCP_UPLOAD_FILE_ROOTS`
+- `name` (string, optional): The stored filename (DMSF's own `name` field, not `filename`). Required for `create` when using `content_base64`; inferred from `file_path` otherwise. For `update`, defaults to the document's current name if omitted
+- `title` (string, optional): Display title. For `create`/`update`; on `update`, defaults to the document's current title if omitted (the plugin 500s on a missing title on a revision, so this server never sends one blank)
+- `description`, `comment` (string, optional): For `create`/`update`
+- `version` (string, optional): `"X"`, `"X.Y"`, or `"X.Y.Z"`, each part a non-negative integer. `create` only — `update`'s endpoint reads version fields from a different place and DMSF auto-increments the patch version on every revision regardless
+- `custom_fields` (array of `{"id": integer, "value": string or array of strings}`, optional): For `create`/`update`. Values are accepted by id only
 
-Returns: - `list`: list of node dicts. Each node has `id`, `type` (`file` / `folder` / `file-link` / `folder-link`), `filename`, `title`, `name`, `description`, `version`, `size`, `content_type`, `folder_id`, `project_id`, `author` (`{id, name}`), `created_on`, `updated_on`.
+`update` always creates a new revision rather than replacing one; earlier revisions survive. `update` requires at least one of `title`/`name`/`description`/`comment`/`custom_fields`.
+
+Returns: `{success, documents, pagination, document, document_id, updated_fields, note}` — `documents`/`pagination` for `list`; `document` for `get` only; `document_id` for `create`/`update`; `updated_fields` for `update` only; `note` for `create` (the commit response is sparse; call `get` for full metadata) and `update` (a new revision was created). Each node/document has `id`, `type` (`file` / `folder` / `file-link` / `folder-link`), `filename`, `title`, `name`, `description`, `version`, `size`, `content_type`, `folder_id`, `project_id`, `author` (`{id, name}`), `created_on`, `updated_on`.
 
 ## Meta
 

@@ -77,6 +77,14 @@ id_newtype!(
     /// A `RedmineUP` CRM plugin contact id.
     ContactId
 );
+id_newtype!(
+    /// A DMSF plugin document (file) id.
+    DocumentId
+);
+id_newtype!(
+    /// A DMSF plugin folder id.
+    DmsfFolderId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

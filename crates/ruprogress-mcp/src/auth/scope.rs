@@ -207,12 +207,26 @@ pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     // authorization decision (parent plan P6).
     ("manage_product", ScopeRule::Fixed(&[])),
     ("manage_contact", ScopeRule::Fixed(&[])),
+    // DMSF plugin: unlike the three families above, its scopes were already
+    // committed in the OAuth discovery documents before this tool existed
+    // (`oauth/scopes.rs`'s `view_documents`/`add_documents`/
+    // `edit_documents`, unconditionally advertised, not gated behind
+    // REDMINE_DMSF_ENABLED) — the one family P6 does not apply to.
+    (
+        "manage_document",
+        ScopeRule::PerAction(&[
+            ("list", &["view_documents"]),
+            ("get", &["view_documents"]),
+            ("create", &["add_documents"]),
+            ("update", &["edit_documents"]),
+        ]),
+    ),
 ];
 
 /// Tools named in `docs/tool-contract.md`/`EXPECTED_TOOLS` with no
-/// `TOOL_SCOPES` entry, because they are not registered routes yet
-/// (`manage_document` and the MCP-Apps families). Deliberately empty: the
-/// map is ported alongside the tool that needs it, never ahead of it.
+/// `TOOL_SCOPES` entry, because they are not registered routes yet (the
+/// MCP-Apps families). Deliberately empty: the map is ported alongside the
+/// tool that needs it, never ahead of it.
 pub const NOT_YET_IMPLEMENTED: &[&str] = &[];
 
 /// The outcome of resolving a tool call's scope requirement.

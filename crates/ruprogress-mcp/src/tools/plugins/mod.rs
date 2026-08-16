@@ -8,4 +8,5 @@
 
 pub(crate) mod checklists;
 pub(crate) mod crm;
+pub(crate) mod dmsf;
 pub(crate) mod products;
