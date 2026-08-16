@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::attachment::Attachment;
 use super::journal::Journal;
+use super::plugins::tags::IssueTag;
 use super::relation::IssueRelation;
 use super::upload::UploadRef;
 use super::{
@@ -106,6 +107,12 @@ pub struct Issue {
     /// requested, `Some(vec![])` = none (a leaf issue).
     #[serde(default)]
     pub children: Option<Vec<IssueChild>>,
+    /// `AlphaNodes` `additional_tags` plugin tags, when the plugin injects
+    /// the key. `None` is ambiguous: it means either the plugin is not
+    /// installed/enabled, or the caller lacks `view_issue_tags` — Redmine
+    /// itself makes no distinction, so this client doesn't invent one.
+    #[serde(default)]
+    pub tags: Option<Vec<IssueTag>>,
 }
 
 /// One level of `Issue.children`. Redmine's own `render_api_issue_children`
@@ -198,6 +205,11 @@ pub struct IssueCreate {
     /// default, in which case the key is omitted entirely.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub uploads: Vec<UploadRef>,
+    /// The issue's initial tags (`AlphaNodes` `additional_tags` plugin).
+    /// There is no "existing set" on create, so this is simply the tags to
+    /// start with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_list: Option<Vec<String>>,
 }
 
 impl IssueCreate {
@@ -222,6 +234,7 @@ impl IssueCreate {
             estimated_hours: None,
             is_private: None,
             uploads: Vec::new(),
+            tag_list: None,
         }
     }
 }
@@ -288,6 +301,11 @@ pub struct IssueUpdate {
     /// default, in which case the key is omitted entirely.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub uploads: Vec<UploadRef>,
+    /// New tags, replacing the whole set (`AlphaNodes` `additional_tags`
+    /// plugin). `Some(vec![])` clears every tag; `None` leaves the set
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_list: Option<Vec<String>>,
 }
 
 /// `include=` values accepted by the issue endpoints.
@@ -548,6 +566,70 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .unwrap();
         assert!(!obj.contains_key("uploads"));
+    }
+
+    #[test]
+    fn issue_create_omits_tag_list_when_none() {
+        let create = IssueCreate::new(
+            ProjectIdent::Identifier("demo".parse().unwrap()),
+            "New issue",
+        );
+        let value = serde_json::to_value(IssueCreateEnvelope { issue: &create }).unwrap();
+        let obj = value
+            .get("issue")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert!(!obj.contains_key("tag_list"));
+    }
+
+    #[test]
+    fn issue_update_empty_tag_list_serializes_as_an_empty_array_not_an_omitted_key() {
+        let patch = IssueUpdate {
+            tag_list: Some(vec![]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        let tag_list = value
+            .get("issue")
+            .and_then(|issue| issue.get("tag_list"))
+            .unwrap();
+        assert_eq!(*tag_list, serde_json::json!([]));
+    }
+
+    #[test]
+    fn issue_update_tag_list_with_entries_serializes_the_full_replacement_set() {
+        let patch = IssueUpdate {
+            tag_list: Some(vec!["a".to_string(), "b".to_string()]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        let tag_list = value
+            .get("issue")
+            .and_then(|issue| issue.get("tag_list"))
+            .unwrap();
+        assert_eq!(*tag_list, serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn issue_parses_tags_with_and_without_an_id() {
+        let env: IssueEnvelope =
+            serde_json::from_str(include_str!("../../tests/fixtures/issue_with_tags.json"))
+                .expect("fixture should parse");
+        let tags = env.issue.tags.expect("tags key should be present");
+        assert_eq!(tags.len(), 2);
+        let with_id = tags.first().expect("first tag");
+        assert_eq!(with_id.id, Some(3));
+        assert_eq!(with_id.name, "urgent");
+        let without_id = tags.get(1).expect("second tag");
+        assert_eq!(without_id.id, None);
+        assert_eq!(without_id.name, "needs-review");
+    }
+
+    #[test]
+    fn issue_without_a_tags_key_has_no_tags() {
+        let env: IssueEnvelope =
+            serde_json::from_str(FIXTURE_6_1).expect("6.1 fixture should parse");
+        assert!(env.issue.tags.is_none());
     }
 
     #[test]

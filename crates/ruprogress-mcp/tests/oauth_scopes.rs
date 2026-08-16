@@ -66,7 +66,7 @@ async fn scopes_supported(harness: &support::HttpHarness) -> BTreeSet<String> {
 /// Every scope required anywhere in `rule`, applied via `f`.
 fn for_each_scope(rule: &ScopeRule, mut f: impl FnMut(&'static str)) {
     match rule {
-        ScopeRule::Fixed(scopes) => {
+        ScopeRule::Fixed(scopes) | ScopeRule::AnyOf(scopes) => {
             for scope in *scopes {
                 f(scope);
             }
@@ -145,17 +145,21 @@ async fn every_scope_the_map_enforces_is_advertised() {
             );
         });
     }
-    // `update_redmine_issue`'s special-cased requirements (S5) live in code,
-    // not in `TOOL_SCOPES`, so they are checked by name here.
+    // `update_redmine_issue`/`create_redmine_issue`'s special-cased
+    // requirements (S5, T7) live in code, not in `TOOL_SCOPES`, so they are
+    // checked by name here.
     for scope in [
         "edit_issues",
         "add_issue_notes",
         "manage_subtasks",
         "view_agile_queries",
+        "create_issue_tags",
+        "edit_issue_tags",
     ] {
         assert!(
             advertised.contains(scope),
-            "update_redmine_issue's special-cased requirement {scope} is never advertised"
+            "update_redmine_issue/create_redmine_issue's special-cased requirement {scope} is \
+             never advertised"
         );
     }
 }

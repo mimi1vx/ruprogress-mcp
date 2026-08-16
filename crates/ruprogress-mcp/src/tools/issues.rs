@@ -510,6 +510,28 @@ pub(crate) struct IssueDetailOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<u32>")]
     pub(crate) agile_position: Option<Option<u32>>,
+    /// `AlphaNodes` `additional_tags` plugin tags. Absent both when
+    /// `REDMINE_TAGS_ENABLED` is off and when the plugin itself omitted the
+    /// key (e.g. the caller lacks `view_issue_tags`) — the two cases are
+    /// indistinguishable on the wire, so this field can only promise
+    /// "nothing to report", never "no tags".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tags: Option<Vec<TagOut>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct TagOut {
+    /// The plugin's internal tag id. Not durable — `name` is the
+    /// identifier; `id` is frequently absent on the wire.
+    pub(crate) id: Option<u64>,
+    pub(crate) name: String,
+}
+
+fn tag_out(boundary: &Boundary, t: &redmine_client::model::plugins::tags::IssueTag) -> TagOut {
+    TagOut {
+        id: t.id,
+        name: boundary.wrap("issue.tag.name", &t.name),
+    }
 }
 
 // --- list_redmine_issues ---
@@ -738,6 +760,13 @@ pub(crate) struct CreateRedmineIssueParams {
     /// each item follows the same source rules as `upload_file`.
     #[serde(default)]
     pub(crate) uploads: Option<Vec<IssueUploadParams>>,
+    /// Tags to set on the new issue (`AlphaNodes` `additional_tags` plugin).
+    /// A tag name containing a comma is rejected — pass separate array
+    /// entries instead of a comma-separated string. Requires
+    /// `REDMINE_TAGS_ENABLED`; using this while the plugin is disabled
+    /// returns a `MISCONFIGURED` error before any write happens.
+    #[serde(default)]
+    pub(crate) tag_list: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -830,6 +859,42 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// Requires `REDMINE_AGILE_ENABLED`.
     #[serde(default)]
     pub(crate) agile_position: Option<u32>,
+    /// Replaces the issue's full tag set (`AlphaNodes` `additional_tags`
+    /// plugin) — not additive. `[]` clears all tags; omit to leave the tag
+    /// set unchanged. A tag name containing a comma is rejected — pass
+    /// separate array entries instead of a comma-separated string.
+    /// Requires `REDMINE_TAGS_ENABLED`; using this while the plugin is
+    /// disabled returns a `MISCONFIGURED` error before any write happens.
+    #[serde(default)]
+    pub(crate) tag_list: Option<Vec<String>>,
+}
+
+/// Validates and trims a `tag_list` parameter (T1): a name that is empty
+/// after trimming, or contains a comma, is rejected before any request is
+/// sent. Duplicate names pass through unchanged — deduplication is
+/// Redmine's job, and silently dropping one would be a data change.
+fn validate_tag_list(tags: Vec<String>) -> Result<Vec<String>, McpError> {
+    tags.into_iter()
+        .map(|tag| {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("tag_list entry {tag:?} is empty after trimming"),
+                    None,
+                ));
+            }
+            if trimmed.contains(',') {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "tag_list entry {trimmed:?} contains a comma; pass separate array \
+                         entries instead of a comma-separated string"
+                    ),
+                    None,
+                ));
+            }
+            Ok(trimmed.to_string())
+        })
+        .collect()
 }
 
 /// Distinguishes an absent `story_points` key (`None`, leave unchanged) from
@@ -1180,6 +1245,12 @@ pub(crate) struct ManageIssueCategoryOutput {
 /// `update_redmine_issue` does only when the call changed an agile field).
 /// `Some(AgileData::default())` represents "fetched, but the issue has no
 /// row" — the fields render as present-and-`null`, not absent.
+///
+/// `tags_enabled`: whether `REDMINE_TAGS_ENABLED` is on. `issue.tags` came
+/// along for free on the same fetch that produced `issue` — unlike agile,
+/// there is no separate request to gate — but the flag, not a permissive
+/// Redmine sending the key anyway, is the contract: with the flag off the
+/// `tags` output key stays absent regardless of what `issue.tags` holds.
 fn issue_detail_out(
     boundary: &Boundary,
     rewrite: &ContentUrlRewrite<'_>,
@@ -1187,6 +1258,7 @@ fn issue_detail_out(
     journal_limit: Option<u32>,
     journal_offset: Option<u64>,
     agile: Option<&AgileData>,
+    tags_enabled: bool,
 ) -> IssueDetailOutput {
     let (journals, journal_pagination) = match (issue.journals.take(), journal_limit) {
         (Some(all), Some(limit)) => {
@@ -1283,6 +1355,10 @@ fn issue_detail_out(
         story_points: agile.map(|a| a.story_points),
         agile_sprint_id: agile.map(|a| a.agile_sprint_id),
         agile_position: agile.map(|a| a.position),
+        tags: tags_enabled
+            .then(|| issue.tags.take())
+            .flatten()
+            .map(|tags| tags.iter().map(|t| tag_out(boundary, t)).collect()),
     }
 }
 
@@ -1516,6 +1592,7 @@ impl RedmineMcp {
             params.journal_limit,
             params.journal_offset,
             agile.as_ref(),
+            self.inner.config.plugins.tags,
         );
         Ok(output::ok(&output, self.output_caps()))
     }
@@ -1743,6 +1820,14 @@ impl RedmineMcp {
         if params.subject.trim().is_empty() {
             return Err(McpError::invalid_params("subject must not be empty", None));
         }
+        if params.tag_list.is_some() && !self.inner.config.plugins.tags {
+            return Ok(output::err(
+                ErrorCode::Misconfigured,
+                "tag_list requires the AlphaNodes additional_tags plugin",
+                Some("set REDMINE_TAGS_ENABLED=true, or omit tag_list"),
+            ));
+        }
+        let tag_list = params.tag_list.map(validate_tag_list).transpose()?;
         let project_id = resolve_project_ref(params.project_id)?;
         let scoped = self.scoped(&ctx)?;
 
@@ -1777,6 +1862,7 @@ impl RedmineMcp {
             estimated_hours: params.estimated_hours,
             is_private: params.is_private,
             uploads,
+            tag_list,
         };
 
         let mut issue = match scoped.create_issue(&create).await {
@@ -1794,7 +1880,15 @@ impl RedmineMcp {
         let rewrite = self.content_url_rewrite();
         // `create_redmine_issue` never touches the agile plugin — see the
         // "Verified endpoint shapes" reasoning above `IssueDetailOutput`.
-        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None, None);
+        let issue_out = issue_detail_out(
+            &boundary,
+            &rewrite,
+            issue,
+            None,
+            None,
+            None,
+            self.inner.config.plugins.tags,
+        );
         Ok(output::ok(
             &CreateRedmineIssueOutput {
                 success: true,
@@ -1844,6 +1938,7 @@ impl RedmineMcp {
             || params.estimated_hours.is_some()
             || params.is_private.is_some()
             || params.notes.is_some()
+            || params.tag_list.is_some()
             // uploads alone (no other field, no notes) is a legitimate
             // update, not a no-op.
             || params.uploads.as_ref().is_some_and(|u| !u.is_empty());
@@ -1863,6 +1958,14 @@ impl RedmineMcp {
                 Some("set REDMINE_AGILE_ENABLED=true, or omit these parameters"),
             ));
         }
+        if params.tag_list.is_some() && !self.inner.config.plugins.tags {
+            return Ok(output::err(
+                ErrorCode::Misconfigured,
+                "tag_list requires the AlphaNodes additional_tags plugin",
+                Some("set REDMINE_TAGS_ENABLED=true, or omit tag_list"),
+            ));
+        }
+        let tag_list = params.tag_list.map(validate_tag_list).transpose()?;
 
         let scoped = self.scoped(&ctx)?;
         let store = self.attachments();
@@ -1897,6 +2000,7 @@ impl RedmineMcp {
             notes: params.notes,
             private_notes: params.private_notes,
             uploads,
+            tag_list,
         };
 
         // The core PUT and the agile PUT are separate requests to endpoints
@@ -1952,8 +2056,15 @@ impl RedmineMcp {
 
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
-        let issue_out =
-            issue_detail_out(&boundary, &rewrite, issue, None, None, agile_out.as_ref());
+        let issue_out = issue_detail_out(
+            &boundary,
+            &rewrite,
+            issue,
+            None,
+            None,
+            agile_out.as_ref(),
+            self.inner.config.plugins.tags,
+        );
         Ok(output::ok(
             &UpdateRedmineIssueOutput {
                 success: true,
@@ -2147,6 +2258,7 @@ impl RedmineMcp {
             estimated_hours: source.estimated_hours,
             is_private: source.is_private,
             uploads: Vec::new(),
+            tag_list: None,
         };
 
         let created = match scoped.create_issue(&root_create).await {
@@ -2210,6 +2322,7 @@ impl RedmineMcp {
                         estimated_hours: child.estimated_hours,
                         is_private: child.is_private,
                         uploads: Vec::new(),
+                        tag_list: None,
                     };
                     match scoped.create_issue(&child_create).await {
                         Ok(new_child) => {
@@ -2233,7 +2346,15 @@ impl RedmineMcp {
         let rewrite = self.content_url_rewrite();
         // `copy_issue` is create-like — see `create_redmine_issue`'s own note
         // on why it never touches the agile plugin.
-        let issue_out = issue_detail_out(&boundary, &rewrite, created, None, None, None);
+        let issue_out = issue_detail_out(
+            &boundary,
+            &rewrite,
+            created,
+            None,
+            None,
+            None,
+            self.inner.config.plugins.tags,
+        );
         Ok(output::ok(
             &CopyIssueOutput {
                 success: true,

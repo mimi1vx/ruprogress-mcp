@@ -303,6 +303,86 @@ async fn create_redmine_issue_dominant_error_is_in_band() {
     );
 }
 
+// --- create_redmine_issue: AlphaNodes additional_tags plugin fields ---
+
+#[tokio::test]
+async fn create_redmine_issue_tag_list_with_flag_off_is_misconfigured_with_zero_requests() {
+    let h = support::harness(&[]).await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue", "tag_list": ["a"]}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "MISCONFIGURED");
+    assert!(
+        structured["hint"]
+            .as_str()
+            .unwrap()
+            .contains("REDMINE_TAGS_ENABLED")
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_sends_tag_list_when_flag_is_on() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(body_json(json!({
+            "issue": {"project_id": "1", "subject": "New issue", "tag_list": ["a", "b"]}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue", "tag_list": ["a", "b"]}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn create_redmine_issue_rejects_a_comma_containing_tag_naming_the_array_form() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    let mut request = CallToolRequestParams::new("create_redmine_issue".to_string());
+    request.arguments = json!({
+        "project_id": 1, "subject": "New issue", "tag_list": ["a,b"]
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn create_redmine_issue_rejects_a_blank_after_trim_tag() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    let mut request = CallToolRequestParams::new("create_redmine_issue".to_string());
+    request.arguments = json!({
+        "project_id": 1, "subject": "New issue", "tag_list": [" "]
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
+}
+
 // --- update_redmine_issue ---
 
 #[tokio::test]
@@ -672,6 +752,114 @@ async fn update_redmine_issue_agile_failure_after_core_success_says_core_already
         message.contains("core fields were already updated"),
         "{message}"
     );
+}
+
+// --- update_redmine_issue: AlphaNodes additional_tags plugin fields ---
+
+#[tokio::test]
+async fn update_redmine_issue_tag_list_with_flag_off_is_misconfigured_with_zero_requests() {
+    let h = support::harness(&[]).await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "tag_list": ["a"]}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "MISCONFIGURED");
+    assert!(
+        structured["hint"]
+            .as_str()
+            .unwrap()
+            .contains("REDMINE_TAGS_ENABLED")
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_tag_list_only_is_accepted_and_sends_the_full_replacement_set() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({"issue": {"tag_list": ["x"]}})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "tag_list": ["x"]}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_empty_tag_list_clears_and_is_not_rejected_as_a_no_op() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({"issue": {"tag_list": []}})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "tag_list": []}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_rejects_a_comma_containing_tag_naming_the_array_form() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    let mut request = CallToolRequestParams::new("update_redmine_issue".to_string());
+    request.arguments = json!({"issue_id": 7, "tag_list": ["a,b"]})
+        .as_object()
+        .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn update_redmine_issue_rejects_a_blank_after_trim_tag() {
+    let h = support::harness(&[("REDMINE_TAGS_ENABLED", "true")]).await;
+    let mut request = CallToolRequestParams::new("update_redmine_issue".to_string());
+    request.arguments = json!({"issue_id": 7, "tag_list": [""]})
+        .as_object()
+        .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(result.is_err());
 }
 
 // --- delete_redmine_issue ---

@@ -119,6 +119,35 @@ async fn update_issue_happy_path() {
 }
 
 #[tokio::test]
+async fn update_issue_sends_tag_list_as_the_full_replacement_array() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(serde_json::json!({
+            "issue": { "tag_list": ["a", "b"] }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let patch = IssueUpdate {
+        tag_list: Some(vec!["a".to_string(), "b".to_string()]),
+        ..Default::default()
+    };
+    client
+        .as_user(&cred)
+        .update_issue(IssueId(7), &patch)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn update_issue_dominant_error_422() {
     let (server, client) = support::mock_redmine().await;
     Mock::given(method("PUT"))

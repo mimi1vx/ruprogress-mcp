@@ -30,6 +30,15 @@ pub enum ScopeRule {
     /// to [`Requirement::Unchecked`], not a denial: the tool's own
     /// `action` enum will reject it with a precise message a moment later.
     PerAction(&'static [(&'static str, &'static [&'static str])]),
+    /// The token must hold **at least one** of the listed scopes, not all
+    /// (T7) — for a Redmine/plugin permission check that is itself an OR of
+    /// two grants. Not used as a static `TOOL_SCOPES` entry today:
+    /// `create_redmine_issue`/`update_redmine_issue`'s `tag_list` parameter
+    /// needs this combined with an unconditional base requirement, which
+    /// [`Requirement::ScopesWithAnyOf`] expresses instead — both tools
+    /// resolve it by hand, argument-sensitively, alongside their other
+    /// special-cased logic.
+    AnyOf(&'static [&'static str]),
 }
 
 /// `update_redmine_issue`'s three possible requirements (S5). Kept as
@@ -54,6 +63,17 @@ const NOTES_ONLY_FIELDS: &[&str] = &["notes", "private_notes"];
 /// The three agile parameter names on `update_redmine_issue`.
 const AGILE_UPDATE_FIELDS: &[&str] = &["story_points", "agile_sprint_id", "agile_position"];
 
+/// `create_redmine_issue`'s unconditional base requirement.
+const CREATE_ISSUE_BASE: &[&str] = &["add_issues"];
+
+/// The `AlphaNodes` `additional_tags` plugin's own gate on `tag_list` (T7):
+/// `create_issue_tags` may mint new tag names, `edit_issue_tags` may only
+/// apply existing ones — either is sufficient. Combined with each tool's
+/// unconditional base requirement via [`Requirement::ScopesWithAnyOf`],
+/// since a single [`ScopeRule`] cannot express "all of X, and at least one
+/// of Y".
+const TAG_LIST_SCOPES: &[&str] = &["create_issue_tags", "edit_issue_tags"];
+
 /// The per-tool scope map (S1). A tool absent here is denied by
 /// [`required_for_call`] (S3) — see `NOT_YET_IMPLEMENTED` below for the
 /// tools deliberately left out because they are not registered yet.
@@ -61,7 +81,9 @@ const AGILE_UPDATE_FIELDS: &[&str] = &["story_points", "agile_sprint_id", "agile
 /// `update_redmine_issue`'s entry is its common-case requirement only:
 /// [`required_for_call`] and [`visible_for`] special-case its notes-only
 /// carve-out and `parent_issue_id` reparent case (S5) before ever
-/// consulting this table for that tool.
+/// consulting this table for that tool. `create_redmine_issue`'s entry is
+/// likewise its common case only: [`required_for_call`] special-cases its
+/// `tag_list` parameter (T7) before consulting this table.
 pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     ("get_current_user", ScopeRule::Fixed(&[])),
     ("get_mcp_server_info", ScopeRule::Fixed(&[])),
@@ -113,7 +135,7 @@ pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     ),
     ("list_time_entry_activities", ScopeRule::Fixed(&[])),
     ("import_time_entries", ScopeRule::Fixed(&["log_time"])),
-    ("create_redmine_issue", ScopeRule::Fixed(&["add_issues"])),
+    ("create_redmine_issue", ScopeRule::Fixed(CREATE_ISSUE_BASE)),
     ("update_redmine_issue", ScopeRule::Fixed(UPDATE_ISSUE_BASE)),
     ("delete_redmine_issue", ScopeRule::Fixed(&["delete_issues"])),
     (
@@ -199,6 +221,16 @@ pub enum Requirement {
     /// The scopes the token must hold, in full, to proceed. Empty means any
     /// authenticated token.
     Scopes(&'static [&'static str]),
+    /// At least one of the listed scopes must be held (T7).
+    AnyOf(&'static [&'static str]),
+    /// Every scope in `all` must be held, **and** at least one of `any`
+    /// (T7) — `create_redmine_issue`/`update_redmine_issue`'s `tag_list`
+    /// parameter combines an unconditional base requirement with the
+    /// tag plugin's own create-or-edit gate.
+    ScopesWithAnyOf {
+        all: &'static [&'static str],
+        any: &'static [&'static str],
+    },
     /// No `TOOL_SCOPES` entry exists for this tool name: deny by default
     /// (S3).
     Unmapped,
@@ -232,44 +264,73 @@ fn has_agile_field(args: &JsonObject) -> bool {
     AGILE_UPDATE_FIELDS.iter().any(|f| args.contains_key(*f))
 }
 
-/// `update_redmine_issue`'s requirement (S5): the notes-only carve-out,
+/// `update_redmine_issue`'s requirement (S5, T7): the notes-only carve-out,
 /// otherwise the `edit_issues` base case plus `manage_subtasks` when
 /// `parent_issue_id` is present (reparenting is its own Redmine permission)
 /// and/or `view_agile_queries` when an agile field is present (its
 /// mandatory read hits the agile endpoint even though the write shares
-/// `update_redmine_issue`'s own `PUT`).
-fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> &'static [&'static str] {
+/// `update_redmine_issue`'s own `PUT`), and/or the [`TAG_LIST_SCOPES`]
+/// any-of when `tag_list` is present. `tag_list` never joins the notes-only
+/// carve-out — it is not a `NOTES_ONLY_FIELDS` entry, so a call combining it
+/// with only `notes`/`private_notes` still requires `edit_issues`.
+fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> Requirement {
     let Some(args) = args else {
-        return UPDATE_ISSUE_BASE;
+        return Requirement::Scopes(UPDATE_ISSUE_BASE);
     };
     if is_notes_only_update(args) {
-        return UPDATE_ISSUE_NOTES_ONLY;
+        return Requirement::Scopes(UPDATE_ISSUE_NOTES_ONLY);
     }
     let agile = has_agile_field(args);
-    if args.contains_key("parent_issue_id") {
-        return if agile {
+    let base: &'static [&'static str] = if args.contains_key("parent_issue_id") {
+        if agile {
             UPDATE_ISSUE_WITH_SUBTASKS_AND_AGILE
         } else {
             UPDATE_ISSUE_WITH_SUBTASKS
-        };
+        }
+    } else if agile {
+        UPDATE_ISSUE_BASE_WITH_AGILE
+    } else {
+        UPDATE_ISSUE_BASE
+    };
+    if args.contains_key("tag_list") {
+        Requirement::ScopesWithAnyOf {
+            all: base,
+            any: TAG_LIST_SCOPES,
+        }
+    } else {
+        Requirement::Scopes(base)
     }
-    if agile {
-        return UPDATE_ISSUE_BASE_WITH_AGILE;
-    }
-    UPDATE_ISSUE_BASE
 }
 
-/// Resolve `tool`'s scope requirement for this call's `args` (S1–S5).
+/// `create_redmine_issue`'s requirement (T7): the unconditional `add_issues`
+/// base, plus the [`TAG_LIST_SCOPES`] any-of when `tag_list` is present.
+fn create_redmine_issue_requirement(args: Option<&JsonObject>) -> Requirement {
+    let has_tag_list = args.is_some_and(|a| a.contains_key("tag_list"));
+    if has_tag_list {
+        Requirement::ScopesWithAnyOf {
+            all: CREATE_ISSUE_BASE,
+            any: TAG_LIST_SCOPES,
+        }
+    } else {
+        Requirement::Scopes(CREATE_ISSUE_BASE)
+    }
+}
+
+/// Resolve `tool`'s scope requirement for this call's `args` (S1–S5, T7).
 #[must_use]
 pub fn required_for_call(tool: &str, args: Option<&JsonObject>) -> Requirement {
     if tool == "update_redmine_issue" {
-        return Requirement::Scopes(update_redmine_issue_requirement(args));
+        return update_redmine_issue_requirement(args);
+    }
+    if tool == "create_redmine_issue" {
+        return create_redmine_issue_requirement(args);
     }
     let Some((_, rule)) = TOOL_SCOPES.iter().find(|(name, _)| *name == tool) else {
         return Requirement::Unmapped;
     };
     match rule {
         ScopeRule::Fixed(scopes) => Requirement::Scopes(scopes),
+        ScopeRule::AnyOf(scopes) => Requirement::AnyOf(scopes),
         ScopeRule::PerAction(actions) => {
             let Some(action) = action_str(args) else {
                 return Requirement::Unchecked;
@@ -302,11 +363,24 @@ pub fn missing(required: &[&'static str], held: &BTreeSet<String>) -> Vec<&'stat
         .collect()
 }
 
+/// `true` if `held` contains at least one of `candidates` (the any-of half
+/// of [`Requirement::AnyOf`]/[`Requirement::ScopesWithAnyOf`]).
+#[must_use]
+pub fn any_held(candidates: &[&'static str], held: &BTreeSet<String>) -> bool {
+    candidates.iter().any(|scope| held.contains(*scope))
+}
+
 /// Whether `tool` should appear in `tools/list` for a token holding `held`
-/// (S2, S5). A `Fixed` tool is visible iff every required scope is held; a
+/// (S2, S5). A `Fixed` tool is visible iff every required scope is held; an
+/// `AnyOf` tool is visible iff at least one listed scope is held; a
 /// `PerAction` tool is visible iff at least one action is fully reachable —
 /// hiding it entirely just because one action needs more scope would hide
 /// the actions the token *can* already use.
+///
+/// `tag_list`'s `ScopesWithAnyOf` requirement (T7) is deliberately **not**
+/// reflected here: visibility cannot know a future call's arguments, and
+/// `create_redmine_issue`/`update_redmine_issue` already default-visible via
+/// their unconditional base requirement.
 #[must_use]
 pub fn visible_for(tool: &str, held: &BTreeSet<String>) -> bool {
     if is_admin(held) {
@@ -320,6 +394,7 @@ pub fn visible_for(tool: &str, held: &BTreeSet<String>) -> bool {
     };
     match rule {
         ScopeRule::Fixed(scopes) => scopes.iter().all(|scope| held.contains(*scope)),
+        ScopeRule::AnyOf(scopes) => any_held(scopes, held),
         ScopeRule::PerAction(actions) => actions
             .iter()
             .any(|(_, scopes)| scopes.iter().all(|scope| held.contains(*scope))),
@@ -346,6 +421,22 @@ pub(crate) fn insufficient_scope_result(tool: &str, missing: &[&str]) -> CallToo
         ErrorCode::InsufficientScope,
         message,
         Some("re-authorize with the missing scope(s), or use a different tool"),
+    )
+}
+
+/// The S6 in-band denial for a [`Requirement::AnyOf`]/
+/// [`Requirement::ScopesWithAnyOf`] failure: the token holds none of an
+/// "at least one of" requirement.
+pub(crate) fn insufficient_any_of_result(tool: &str, any: &[&str]) -> CallToolResult {
+    let message = format!(
+        "this token is missing every scope that would satisfy {tool}'s requirement: at least \
+         one of {}",
+        any.join(", ")
+    );
+    err(
+        ErrorCode::InsufficientScope,
+        message,
+        Some("re-authorize with one of the listed scopes, or use a different tool"),
     )
 }
 
@@ -515,6 +606,143 @@ mod tests {
         assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_BASE));
     }
 
+    // --- T7: tag_list's any-of requirement ---
+
+    #[test]
+    fn update_issue_tag_list_requires_edit_issues_and_either_tag_scope() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("tag_list", serde_json::json!(["a"])),
+            ])),
+        );
+        assert_eq!(
+            req,
+            Requirement::ScopesWithAnyOf {
+                all: UPDATE_ISSUE_BASE,
+                any: TAG_LIST_SCOPES,
+            }
+        );
+    }
+
+    #[test]
+    fn update_issue_tag_list_passes_with_create_issue_tags_alone() {
+        let held = scopes(&["edit_issues", "create_issue_tags"]);
+        match required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("tag_list", serde_json::json!(["a"])),
+            ])),
+        ) {
+            Requirement::ScopesWithAnyOf { all, any } => {
+                assert!(missing(all, &held).is_empty());
+                assert!(any_held(any, &held));
+            }
+            other => panic!("unexpected requirement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_issue_tag_list_passes_with_edit_issue_tags_alone() {
+        let held = scopes(&["edit_issues", "edit_issue_tags"]);
+        match required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("tag_list", serde_json::json!(["a"])),
+            ])),
+        ) {
+            Requirement::ScopesWithAnyOf { all, any } => {
+                assert!(missing(all, &held).is_empty());
+                assert!(any_held(any, &held));
+            }
+            other => panic!("unexpected requirement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_issue_tag_list_denies_with_neither_tag_scope() {
+        let held = scopes(&["edit_issues"]);
+        match required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("tag_list", serde_json::json!(["a"])),
+            ])),
+        ) {
+            Requirement::ScopesWithAnyOf { any, .. } => assert!(!any_held(any, &held)),
+            other => panic!("unexpected requirement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_issue_notes_plus_tag_list_is_not_the_notes_only_carve_out() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("notes", "a comment".into()),
+                ("tag_list", serde_json::json!(["a"])),
+            ])),
+        );
+        assert_eq!(
+            req,
+            Requirement::ScopesWithAnyOf {
+                all: UPDATE_ISSUE_BASE,
+                any: TAG_LIST_SCOPES,
+            }
+        );
+    }
+
+    #[test]
+    fn create_issue_without_tag_list_is_unaffected() {
+        let req = required_for_call(
+            "create_redmine_issue",
+            Some(&args(&[("subject", "x".into())])),
+        );
+        assert_eq!(req, Requirement::Scopes(CREATE_ISSUE_BASE));
+    }
+
+    #[test]
+    fn create_issue_tag_list_requires_add_issues_and_either_tag_scope() {
+        let req = required_for_call(
+            "create_redmine_issue",
+            Some(&args(&[("tag_list", serde_json::json!(["a"]))])),
+        );
+        assert_eq!(
+            req,
+            Requirement::ScopesWithAnyOf {
+                all: CREATE_ISSUE_BASE,
+                any: TAG_LIST_SCOPES,
+            }
+        );
+    }
+
+    #[test]
+    fn create_issue_tag_list_denies_add_issues_alone_with_neither_tag_scope() {
+        let held = scopes(&["add_issues"]);
+        match required_for_call(
+            "create_redmine_issue",
+            Some(&args(&[("tag_list", serde_json::json!(["a"]))])),
+        ) {
+            Requirement::ScopesWithAnyOf { all, any } => {
+                assert!(missing(all, &held).is_empty());
+                assert!(!any_held(any, &held));
+            }
+            other => panic!("unexpected requirement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_of_scope_rule_passes_with_either_alone_and_denies_with_neither() {
+        let candidates: &[&str] = &["a", "b"];
+        assert!(any_held(candidates, &scopes(&["a"])));
+        assert!(any_held(candidates, &scopes(&["b"])));
+        assert!(!any_held(candidates, &scopes(&["c"])));
+    }
+
     #[test]
     fn update_issue_visibility_ors_edit_and_notes_scopes() {
         assert!(visible_for(
@@ -555,7 +783,9 @@ mod tests {
     fn admin_is_never_a_required_scope() {
         for (_, rule) in TOOL_SCOPES {
             match rule {
-                ScopeRule::Fixed(scopes) => assert!(!scopes.contains(&ADMIN_SCOPE)),
+                ScopeRule::Fixed(scopes) | ScopeRule::AnyOf(scopes) => {
+                    assert!(!scopes.contains(&ADMIN_SCOPE));
+                }
                 ScopeRule::PerAction(actions) => {
                     for (_, scopes) in *actions {
                         assert!(!scopes.contains(&ADMIN_SCOPE));

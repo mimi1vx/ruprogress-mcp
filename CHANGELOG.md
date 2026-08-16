@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation's handling of the plugin rather than a live capture
   (RedmineUP Agile is commercial) — see
   `crates/redmine-client/tests/fixtures/README.md`.
+- `REDMINE_TAGS_ENABLED=true` makes `get_redmine_issue` report an issue's
+  `tags` (AlphaNodes `additional_tags` plugin, each `{id, name}` with `id`
+  frequently `null`) and lets `create_redmine_issue`/`update_redmine_issue`
+  replace the full tag set via `tag_list` — no new tool, like Agile. A
+  `tag_list` write always replaces the whole set (`[]` clears it); a tag name
+  containing a comma is rejected rather than silently split, naming the
+  array form. With the flag off, `tags` never appears and `tag_list` fails
+  in-band with `MISCONFIGURED` before any write happens. Setting `tag_list`
+  requires `create_issue_tags` or `edit_issue_tags` in `oauth` mode, on top
+  of the tool's usual `add_issues`/`edit_issues` requirement. The wire shape
+  is synthetic, derived from the reference implementation's handling of the
+  plugin rather than a live capture — see
+  `crates/redmine-client/tests/fixtures/README.md`.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

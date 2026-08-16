@@ -35,7 +35,7 @@ real process environment.
 | `REDMINE_PRODUCTS_ENABLED` | no | `false` | `plugin_flags.products`. |
 | `REDMINE_CRM_ENABLED` | no | `false` | `plugin_flags.crm`. |
 | `REDMINE_DMSF_ENABLED` | no | `false` | `plugin_flags.dmsf`. |
-| `REDMINE_TAGS_ENABLED` | no | `false` | `plugin_flags.tags`. |
+| `REDMINE_TAGS_ENABLED` | no | `false` | `plugin_flags.tags` (`get_mcp_server_info`). Adds no new tools — `true` makes `get_redmine_issue` report an issue's `tags` (AlphaNodes `additional_tags` plugin) and lets `create_redmine_issue`/`update_redmine_issue` replace them via `tag_list`; `false` (the default) makes `tags` absent from `get_redmine_issue` and `tag_list` fail with `MISCONFIGURED` before any write happens. |
 
 ### HTTP transport (`--transport http` only)
 

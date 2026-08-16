@@ -7,3 +7,4 @@
 
 pub mod agile;
 pub mod checklists;
+pub mod tags;

@@ -60,6 +60,7 @@ they land) are modelled differently from the pairs above:
 | `checklist_item_created.json` | `POST /issues/{id}/checklists.json` | nested `{"checklist": {"id": N}}` shape |
 | `agile_data_full.json` | `GET /issues/{id}/agile_data.json` | a populated row, all fields set |
 | `agile_data_empty.json` | `GET /issues/{id}/agile_data.json` | `{"agile_data": null}` — the issue has no agile row |
+| `issue_with_tags.json` | `GET /issues/{id}.json` | `additional_tags` plugin's injected `tags` array: one tag with `id`, one without (the plugin frequently omits it — see `model::plugins::tags::IssueTag`'s doc comment). Unlike the other plugin fixtures, `additional_tags` is open-source, but the wire shape is still unverified against a live instance. |
 
 ## Scrubbing
 

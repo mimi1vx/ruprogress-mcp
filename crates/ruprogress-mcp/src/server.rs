@@ -273,6 +273,22 @@ impl ServerHandler for RedmineMcp {
                             );
                         }
                     }
+                    scope::Requirement::AnyOf(any) => {
+                        if !scope::any_held(any, &auth.scopes) {
+                            return Ok(scope::insufficient_any_of_result(&request.name, any).into());
+                        }
+                    }
+                    scope::Requirement::ScopesWithAnyOf { all, any } => {
+                        let missing = scope::missing(all, &auth.scopes);
+                        if !missing.is_empty() {
+                            return Ok(
+                                scope::insufficient_scope_result(&request.name, &missing).into()
+                            );
+                        }
+                        if !scope::any_held(any, &auth.scopes) {
+                            return Ok(scope::insufficient_any_of_result(&request.name, any).into());
+                        }
+                    }
                     scope::Requirement::Unmapped => {
                         tracing::error!(
                             tool = %request.name,
