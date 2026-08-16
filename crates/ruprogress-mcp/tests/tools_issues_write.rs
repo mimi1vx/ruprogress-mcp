@@ -438,6 +438,242 @@ async fn update_redmine_issue_dominant_error_is_in_band() {
     assert_eq!(result.structured_content.unwrap()["code"], "NOT_FOUND");
 }
 
+// --- update_redmine_issue: RedmineUP Agile plugin fields ---
+
+#[tokio::test]
+async fn update_redmine_issue_agile_param_with_flag_off_is_misconfigured_with_zero_requests() {
+    let h = support::harness(&[]).await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "story_points": 8}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "MISCONFIGURED");
+    assert!(
+        structured["hint"]
+            .as_str()
+            .unwrap()
+            .contains("REDMINE_AGILE_ENABLED")
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_agile_only_update_skips_the_core_put_and_preserves_other_fields() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 9, "story_points": 8, "agile_sprint_id": 3, "position": 2}
+        })))
+        .up_to_n_times(1)
+        .mount(&h.redmine)
+        .await;
+    // The load-bearing assertion: `story_points`/`position` survive a
+    // sprint-only change. A payload that dropped them here would be the
+    // replace-vs-merge bug this whole feature exists to avoid.
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {"agile_data_attributes": {
+                "id": 9, "story_points": 8, "agile_sprint_id": 7, "position": 2
+            }}
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 9, "story_points": 8, "agile_sprint_id": 7, "position": 2}
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Existing")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "agile_sprint_id": 7}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = body_of(&result);
+    assert_eq!(body["issue"]["story_points"], 8);
+    assert_eq!(body["issue"]["agile_sprint_id"], 7);
+    assert_eq!(body["issue"]["agile_position"], 2);
+}
+
+#[tokio::test]
+async fn update_redmine_issue_combined_core_and_agile_change_sends_both_puts() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({"issue": {"subject": "Updated"}})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Updated")))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {"agile_data_attributes": {"story_points": 5}}
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 1, "story_points": 5}
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "subject": "Updated", "story_points": 5}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = body_of(&result);
+    assert_eq!(body["issue"]["story_points"], 5);
+}
+
+#[tokio::test]
+async fn update_redmine_issue_story_points_null_clears_and_sprint_zero_clears() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 9, "story_points": 8, "agile_sprint_id": 3, "position": 2}
+        })))
+        .up_to_n_times(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {"agile_data_attributes": {
+                "id": 9, "story_points": null, "agile_sprint_id": 0, "position": 2
+            }}
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 9, "position": 2}
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Existing")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "story_points": null, "agile_sprint_id": 0}),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = body_of(&result);
+    assert!(body["issue"]["story_points"].is_null());
+    assert!(body["issue"]["agile_sprint_id"].is_null());
+}
+
+#[tokio::test]
+async fn update_redmine_issue_agile_failure_after_core_success_says_core_already_applied() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({"issue": {"subject": "Updated"}})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Updated")))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7/agile_data.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {"agile_data_attributes": {"story_points": 5}}
+        })))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "subject": "Updated", "story_points": 5}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let message = result.structured_content.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("core fields were already updated"),
+        "{message}"
+    );
+}
+
 // --- delete_redmine_issue ---
 
 async fn mount_delete_impact_mocks(server: &wiremock::MockServer, children: usize) {

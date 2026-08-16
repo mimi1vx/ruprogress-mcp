@@ -30,7 +30,7 @@ real process environment.
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
-| `REDMINE_AGILE_ENABLED` | no | `false` | Surfaced in `plugin_flags.agile` (`get_mcp_server_info`). No agile tools exist yet. |
+| `REDMINE_AGILE_ENABLED` | no | `false` | `plugin_flags.agile` (`get_mcp_server_info`). Adds no new tools — `true` makes `get_redmine_issue` report `story_points`/`agile_sprint_id`/`agile_position` (RedmineUP Agile plugin) and lets `update_redmine_issue` change them; `false` (the default) makes the fields absent from `get_redmine_issue` and any of the three parameters on `update_redmine_issue` fail with `MISCONFIGURED` before any write happens. |
 | `REDMINE_CHECKLISTS_ENABLED` | no | `false` | `plugin_flags.checklists`. `true` registers `get_checklist`/`create_checklist_item`/`update_checklist_item` (RedmineUP Checklists Pro plugin); `false` (the default) de-registers them from the router entirely — they are absent from `tools/list` and `tools/call` fails with "tool not found", not an in-band error. |
 | `REDMINE_PRODUCTS_ENABLED` | no | `false` | `plugin_flags.products`. |
 | `REDMINE_CRM_ENABLED` | no | `false` | `plugin_flags.crm`. |

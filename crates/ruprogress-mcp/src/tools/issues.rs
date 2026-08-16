@@ -23,6 +23,7 @@ use redmine_client::model::issue::{
 };
 use redmine_client::model::issue_category::{IssueCategoryCreate, IssueCategoryUpdate};
 use redmine_client::model::journal::{Journal as ClientJournal, JournalUpdate};
+use redmine_client::model::plugins::agile::{AgileChange, AgileData, AgileDataAttributes};
 use redmine_client::model::relation::{IssueRelation as ClientIssueRelation, IssueRelationCreate};
 use redmine_client::model::search::{SearchQuery, SearchScope};
 use redmine_client::model::time_entry::TimeEntryQuery;
@@ -32,7 +33,7 @@ use redmine_client::{
     AttachmentId, IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
@@ -451,6 +452,11 @@ fn custom_field_value_out(boundary: &Boundary, cf: &CustomField) -> CustomFieldV
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[allow(
+    clippy::option_option,
+    reason = "story_points/agile_sprint_id/agile_position need three states \
+              (absent/null/value); see the field doc comment"
+)]
 pub(crate) struct IssueDetailOutput {
     pub(crate) id: u64,
     pub(crate) project: IdNameOut,
@@ -489,6 +495,21 @@ pub(crate) struct IssueDetailOutput {
     pub(crate) relations: Option<Vec<RelationOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) children: Option<Vec<IssueChildOut>>,
+    /// `RedmineUP` Agile plugin fields. Three-way: the key is **absent**
+    /// when `REDMINE_AGILE_ENABLED` is off or the agile fetch failed
+    /// (logged, never fatal to this tool); it is present and `null` when
+    /// the issue genuinely has no agile row; it carries a value when the
+    /// issue has one. `update_redmine_issue` only sets these when the call
+    /// itself changed an agile field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u32>")]
+    pub(crate) story_points: Option<Option<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>")]
+    pub(crate) agile_sprint_id: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u32>")]
+    pub(crate) agile_position: Option<Option<u32>>,
 }
 
 // --- list_redmine_issues ---
@@ -731,6 +752,10 @@ pub(crate) struct CreateRedmineIssueOutput {
     clippy::struct_excessive_bools,
     reason = "one bool (is_private) among many independent optional fields; splitting it out would not help readability"
 )]
+#[allow(
+    clippy::option_option,
+    reason = "story_points needs three states (absent/null/value); see its field doc comment"
+)]
 pub(crate) struct UpdateRedmineIssueParams {
     /// The id of the issue to update.
     pub(crate) issue_id: u64,
@@ -789,6 +814,39 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// each item follows the same source rules as `upload_file`.
     #[serde(default)]
     pub(crate) uploads: Option<Vec<IssueUploadParams>>,
+    /// New story points (`RedmineUP` Agile plugin). Omit to leave unchanged,
+    /// `null` to clear, a number to set. Requires `REDMINE_AGILE_ENABLED`;
+    /// using this while the plugin is disabled returns a `MISCONFIGURED`
+    /// error before any write happens.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<u32>")]
+    pub(crate) story_points: Option<Option<u32>>,
+    /// New sprint id (`RedmineUP` Agile plugin). `0` removes the issue from
+    /// its sprint — the plugin's own sentinel. Requires
+    /// `REDMINE_AGILE_ENABLED`.
+    #[serde(default)]
+    pub(crate) agile_sprint_id: Option<u64>,
+    /// New position within its sprint/board (`RedmineUP` Agile plugin).
+    /// Requires `REDMINE_AGILE_ENABLED`.
+    #[serde(default)]
+    pub(crate) agile_position: Option<u32>,
+}
+
+/// Distinguishes an absent `story_points` key (`None`, leave unchanged) from
+/// a present `null` (`Some(None)`, clear) from a present value
+/// (`Some(Some(n))`, set) — the standard serde double-`Option` idiom.
+/// Combined with `#[serde(default)]` on the field: `default` alone would
+/// collapse "absent" and "present `null`" to the same `None`.
+#[allow(
+    clippy::option_option,
+    reason = "the whole point of this helper is to produce the three-state Option<Option<T>>"
+)]
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1116,12 +1174,19 @@ pub(crate) struct ManageIssueCategoryOutput {
 /// (the latter two always pass `journal_limit: None` — Redmine's
 /// create/update responses never include journals in the first place, so
 /// `issue.journals` is `None` and the match's last arm applies).
+///
+/// `agile`: `None` unless the caller fetched agile data (`create_redmine_issue`
+/// never does; `get_redmine_issue` does whenever the plugin flag is on;
+/// `update_redmine_issue` does only when the call changed an agile field).
+/// `Some(AgileData::default())` represents "fetched, but the issue has no
+/// row" — the fields render as present-and-`null`, not absent.
 fn issue_detail_out(
     boundary: &Boundary,
     rewrite: &ContentUrlRewrite<'_>,
     mut issue: Issue,
     journal_limit: Option<u32>,
     journal_offset: Option<u64>,
+    agile: Option<&AgileData>,
 ) -> IssueDetailOutput {
     let (journals, journal_pagination) = match (issue.journals.take(), journal_limit) {
         (Some(all), Some(limit)) => {
@@ -1215,7 +1280,30 @@ fn issue_detail_out(
             .children
             .as_ref()
             .map(|cs| cs.iter().map(|c| issue_child_out(boundary, c)).collect()),
+        story_points: agile.map(|a| a.story_points),
+        agile_sprint_id: agile.map(|a| a.agile_sprint_id),
+        agile_position: agile.map(|a| a.position),
     }
+}
+
+/// An agile-endpoint failure inside `update_redmine_issue`. When
+/// `core_already_applied` is `true`, the issue's non-agile fields already
+/// changed successfully in an earlier, separate `PUT` — the message must say
+/// so, or the model may retry the whole call and double-apply a note.
+fn agile_failure_result(e: redmine_client::Error, core_already_applied: bool) -> CallToolResult {
+    let mut result = to_tool_error(e);
+    if core_already_applied
+        && let Some(structured) = result.structured_content.as_mut()
+        && let Some(message) = structured.get("error").and_then(|v| v.as_str())
+    {
+        let combined = format!(
+            "the issue's core fields were already updated successfully; only the agile \
+             fields failed to apply: {message}"
+        );
+        structured["error"] = serde_json::Value::String(combined);
+        result.content = vec![ContentBlock::text(structured.to_string())];
+    }
+    result
 }
 
 /// A per-item `uploads[]` failure: either an argument-shape
@@ -1400,6 +1488,25 @@ impl RedmineMcp {
             issue.custom_fields = None;
         }
 
+        // Unconditional whenever the plugin flag is on: no `include_agile`
+        // parameter, matching the reference. A failed fetch never fails the
+        // whole tool — it just omits the three fields.
+        let agile = if self.inner.config.plugins.agile {
+            match scoped.get_agile_data(IssueId(params.issue_id)).await {
+                Ok(row) => Some(row.unwrap_or_default()),
+                Err(error) => {
+                    tracing::warn!(
+                        issue_id = params.issue_id,
+                        %error,
+                        "get_redmine_issue: agile data fetch failed; omitting agile fields"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
         let output = issue_detail_out(
@@ -1408,6 +1515,7 @@ impl RedmineMcp {
             issue,
             params.journal_limit,
             params.journal_offset,
+            agile.as_ref(),
         );
         Ok(output::ok(&output, self.output_caps()))
     }
@@ -1684,7 +1792,9 @@ impl RedmineMcp {
 
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
-        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None);
+        // `create_redmine_issue` never touches the agile plugin — see the
+        // "Verified endpoint shapes" reasoning above `IssueDetailOutput`.
+        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None, None);
         Ok(output::ok(
             &CreateRedmineIssueOutput {
                 success: true,
@@ -1719,28 +1829,38 @@ impl RedmineMcp {
                 None,
             ));
         }
-        let nothing_to_change = params.subject.is_none()
-            && params.description.is_none()
-            && params.tracker_id.is_none()
-            && params.status_id.is_none()
-            && params.priority_id.is_none()
-            && params.assigned_to_id.is_none()
-            && params.category_id.is_none()
-            && params.fixed_version_id.is_none()
-            && params.parent_issue_id.is_none()
-            && params.start_date.is_none()
-            && params.due_date.is_none()
-            && params.done_ratio.is_none()
-            && params.estimated_hours.is_none()
-            && params.is_private.is_none()
-            && params.notes.is_none()
+        let has_core_change = params.subject.is_some()
+            || params.description.is_some()
+            || params.tracker_id.is_some()
+            || params.status_id.is_some()
+            || params.priority_id.is_some()
+            || params.assigned_to_id.is_some()
+            || params.category_id.is_some()
+            || params.fixed_version_id.is_some()
+            || params.parent_issue_id.is_some()
+            || params.start_date.is_some()
+            || params.due_date.is_some()
+            || params.done_ratio.is_some()
+            || params.estimated_hours.is_some()
+            || params.is_private.is_some()
+            || params.notes.is_some()
             // uploads alone (no other field, no notes) is a legitimate
             // update, not a no-op.
-            && params.uploads.as_ref().is_none_or(Vec::is_empty);
-        if nothing_to_change {
+            || params.uploads.as_ref().is_some_and(|u| !u.is_empty());
+        let has_agile_change = params.story_points.is_some()
+            || params.agile_sprint_id.is_some()
+            || params.agile_position.is_some();
+        if !has_core_change && !has_agile_change {
             return Err(McpError::invalid_params(
                 "at least one field to change, or notes, must be given",
                 None,
+            ));
+        }
+        if has_agile_change && !self.inner.config.plugins.agile {
+            return Ok(output::err(
+                ErrorCode::Misconfigured,
+                "story_points/agile_sprint_id/agile_position require the RedmineUP Agile plugin",
+                Some("set REDMINE_AGILE_ENABLED=true, or omit these parameters"),
             ));
         }
 
@@ -1779,9 +1899,19 @@ impl RedmineMcp {
             uploads,
         };
 
-        let mut issue = match scoped.update_issue(IssueId(params.issue_id), &patch).await {
-            Ok(issue) => issue,
-            Err(e) => return Ok(to_tool_error(e)),
+        // The core PUT and the agile PUT are separate requests to endpoints
+        // with different validation: skip the core one when only agile
+        // fields changed, rather than sending an empty patch.
+        let mut issue = if has_core_change {
+            match scoped.update_issue(IssueId(params.issue_id), &patch).await {
+                Ok(issue) => issue,
+                Err(e) => return Ok(to_tool_error(e)),
+            }
+        } else {
+            match scoped.get_issue(IssueId(params.issue_id), &[]).await {
+                Ok(issue) => issue,
+                Err(e) => return Ok(to_tool_error(e)),
+            }
         };
         if !attachment_ids.is_empty() {
             match fetch_attachments(&scoped, &attachment_ids).await {
@@ -1790,9 +1920,40 @@ impl RedmineMcp {
             }
         }
 
+        let mut agile_out: Option<AgileData> = None;
+        if has_agile_change {
+            let current = match scoped.get_agile_data(IssueId(params.issue_id)).await {
+                Ok(row) => row,
+                Err(e) => {
+                    return Ok(agile_failure_result(e, has_core_change));
+                }
+            };
+            let change = AgileChange {
+                story_points: params.story_points,
+                agile_sprint_id: params.agile_sprint_id,
+                position: params.agile_position,
+            };
+            let merged = AgileDataAttributes::merge_over(current.as_ref(), &change);
+            if let Err(e) = scoped
+                .update_agile_data(IssueId(params.issue_id), &merged)
+                .await
+            {
+                return Ok(agile_failure_result(e, has_core_change));
+            }
+            // Re-read so the response reflects Redmine's own ground truth,
+            // not just the payload this call sent.
+            agile_out = match scoped.get_agile_data(IssueId(params.issue_id)).await {
+                Ok(row) => Some(row.unwrap_or_default()),
+                Err(e) => {
+                    return Ok(agile_failure_result(e, has_core_change));
+                }
+            };
+        }
+
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
-        let issue_out = issue_detail_out(&boundary, &rewrite, issue, None, None);
+        let issue_out =
+            issue_detail_out(&boundary, &rewrite, issue, None, None, agile_out.as_ref());
         Ok(output::ok(
             &UpdateRedmineIssueOutput {
                 success: true,
@@ -2070,7 +2231,9 @@ impl RedmineMcp {
 
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
-        let issue_out = issue_detail_out(&boundary, &rewrite, created, None, None);
+        // `copy_issue` is create-like — see `create_redmine_issue`'s own note
+        // on why it never touches the agile plugin.
+        let issue_out = issue_detail_out(&boundary, &rewrite, created, None, None, None);
         Ok(output::ok(
             &CopyIssueOutput {
                 success: true,

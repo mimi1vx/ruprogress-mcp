@@ -714,8 +714,9 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// tools or wider input schemas (like `manage_redmine_wiki_page`'s
 /// six-action parameter set or `upload_file`'s/`uploads[]`'s multi-field
 /// shapes) push the observed size close to the current limit; currently
-/// 135 000 bytes for 41 tools (~121 000 observed), leaving headroom for
-/// future growth at a similar per-tool rate.
+/// 135 000 bytes for 41 tools (~128 000 observed after the `RedmineUP` Agile
+/// plugin fields on `get_redmine_issue`/`update_redmine_issue`), leaving
+/// headroom for future growth at a similar per-tool rate.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
     let h = support::harness(&[]).await;

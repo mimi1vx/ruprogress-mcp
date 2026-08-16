@@ -202,6 +202,95 @@ async fn get_redmine_issue_dominant_error_is_in_band_not_found() {
     assert_eq!(structured["retryable"], false);
 }
 
+// --- get_redmine_issue: RedmineUP Agile plugin fields ---
+
+#[tokio::test]
+async fn get_redmine_issue_agile_flag_off_never_touches_the_agile_endpoint() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": base_issue(1)})))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(&call(&h, "get_redmine_issue", json!({"issue_id": 1})).await);
+    assert!(body.get("story_points").is_none());
+    assert!(body.get("agile_sprint_id").is_none());
+    assert!(body.get("agile_position").is_none());
+
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().contains("agile_data")),
+        "the agile endpoint must not be hit when REDMINE_AGILE_ENABLED is off: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_redmine_issue_agile_row_present_populates_the_three_fields() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": base_issue(1)})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1/agile_data.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "agile_data": {"id": 9, "story_points": 8, "agile_sprint_id": 3, "position": 2}
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(&call(&h, "get_redmine_issue", json!({"issue_id": 1})).await);
+    assert_eq!(body["story_points"], 8);
+    assert_eq!(body["agile_sprint_id"], 3);
+    assert_eq!(body["agile_position"], 2);
+}
+
+#[tokio::test]
+async fn get_redmine_issue_agile_no_row_reports_present_null_fields() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": base_issue(1)})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1/agile_data.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(&call(&h, "get_redmine_issue", json!({"issue_id": 1})).await);
+    assert!(body.get("story_points").is_some_and(Value::is_null));
+    assert!(body.get("agile_sprint_id").is_some_and(Value::is_null));
+    assert!(body.get("agile_position").is_some_and(Value::is_null));
+}
+
+#[tokio::test]
+async fn get_redmine_issue_agile_fetch_error_omits_the_fields_and_still_succeeds() {
+    let h = support::harness(&[("REDMINE_AGILE_ENABLED", "true")]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": base_issue(1)})))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1/agile_data.json"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(&h, "get_redmine_issue", json!({"issue_id": 1})).await;
+    assert_ne!(result.is_error, Some(true));
+    let body = body_of(&result);
+    assert!(body.get("story_points").is_none());
+    assert!(body.get("agile_sprint_id").is_none());
+    assert!(body.get("agile_position").is_none());
+}
+
 // --- list_redmine_issues ---
 
 #[tokio::test]

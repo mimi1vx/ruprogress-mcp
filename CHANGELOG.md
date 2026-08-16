@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the reference implementation's handling of the plugin rather than a
   live capture (Checklists Pro is commercial) — see
   `crates/redmine-client/tests/fixtures/README.md`.
+- `REDMINE_AGILE_ENABLED=true` makes `get_redmine_issue` report
+  `story_points`/`agile_sprint_id`/`agile_position` from the RedmineUP Agile
+  plugin, and lets `update_redmine_issue` change them — the three fields
+  ride on both existing tools rather than adding a new one. Writes are a
+  read-modify-write against `GET /issues/{id}/agile_data.json` because the
+  plugin's nested `agile_data_attributes` replaces the whole row rather than
+  merging it: an update naming only one field would otherwise null the
+  others. `story_points: null` clears it; `agile_sprint_id: 0` removes the
+  issue from its sprint (the plugin's own sentinel). With the flag off (the
+  default), the three fields never appear and any of the three parameters on
+  `update_redmine_issue` fails in-band with `MISCONFIGURED` before any write
+  happens. The wire shapes are synthetic, derived from the reference
+  implementation's handling of the plugin rather than a live capture
+  (RedmineUP Agile is commercial) — see
+  `crates/redmine-client/tests/fixtures/README.md`.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

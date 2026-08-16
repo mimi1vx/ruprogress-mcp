@@ -18,7 +18,7 @@ use crate::ids::{
     AttachmentId, ChecklistItemId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent,
     RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
 };
-use crate::model::plugins::checklists;
+use crate::model::plugins::{agile, checklists};
 use crate::model::{
     BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
     issue_category, issue_status, journal, membership, project, query, relation, role, search,
@@ -1292,6 +1292,57 @@ impl Scoped<'_> {
         self.put_json(
             &format!("checklists/{id}.json"),
             &checklists::ChecklistItemUpdateEnvelope { checklist: patch },
+        )
+        .await
+    }
+
+    /// `GET /issues/{id}/agile_data.json` (`RedmineUP` Agile plugin). A
+    /// `404` means the issue has no agile row at all — a normal outcome of
+    /// this endpoint, mapped to `Ok(None)` here so every caller does not
+    /// have to re-derive the distinction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, or Redmine responds with any
+    /// other non-success status.
+    pub async fn get_agile_data(&self, issue: IssueId) -> crate::Result<Option<agile::AgileData>> {
+        match self
+            .get_json::<agile::AgileDataEnvelope>(
+                &format!("issues/{issue}/agile_data.json"),
+                &Query::default(),
+            )
+            .await
+        {
+            Ok(env) => Ok(env.agile_data),
+            Err(Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `PUT /issues/{id}.json` with only a nested `agile_data_attributes` —
+    /// a separate request from [`Self::update_issue`]'s core-field `PUT`
+    /// (`RedmineUP` Agile plugin). Callers must build `attrs` via
+    /// [`agile::AgileDataAttributes::merge_over`] after a
+    /// [`Self::get_agile_data`] read: the plugin's nested-attributes
+    /// declaration replaces the row rather than merging it (see that type's
+    /// doc comment).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn update_agile_data(
+        &self,
+        issue: IssueId,
+        attrs: &agile::AgileDataAttributes,
+    ) -> crate::Result<()> {
+        self.put_json(
+            &format!("issues/{issue}.json"),
+            &agile::AgileIssueUpdateEnvelope {
+                issue: agile::AgileIssueUpdate {
+                    agile_data_attributes: attrs,
+                },
+            },
         )
         .await
     }

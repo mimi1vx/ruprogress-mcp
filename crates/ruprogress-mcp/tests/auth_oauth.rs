@@ -364,6 +364,45 @@ async fn update_redmine_issue_notes_only_carve_out_end_to_end() {
 }
 
 #[tokio::test]
+async fn update_redmine_issue_agile_field_requires_view_agile_queries_end_to_end() {
+    let harness = support::http_harness(&oauth_env(&[("REDMINE_AGILE_ENABLED", "true")])).await;
+    const TOKEN: &str = "edit-issues-only-token";
+    mock_introspect_scoped(&harness.redmine, TOKEN, "edit_issues").await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&harness.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sample_issue_body(7)))
+        .mount(&harness.redmine)
+        .await;
+
+    let subject_only = call_with_token(
+        &harness,
+        TOKEN,
+        "update_redmine_issue",
+        serde_json::json!({"issue_id": 7, "subject": "new subject"}),
+    )
+    .await;
+    assert_eq!(subject_only.is_error, Some(false));
+
+    let with_story_points = call_with_token(
+        &harness,
+        TOKEN,
+        "update_redmine_issue",
+        serde_json::json!({"issue_id": 7, "story_points": 8}),
+    )
+    .await;
+    assert_eq!(with_story_points.is_error, Some(true));
+    assert_eq!(
+        with_story_points.structured_content.unwrap()["code"],
+        "INSUFFICIENT_SCOPE"
+    );
+}
+
+#[tokio::test]
 async fn scope_enforcement_off_restores_unfiltered_visibility_and_calls() {
     let harness =
         support::http_harness(&oauth_env(&[("REDMINE_OAUTH_SCOPE_ENFORCEMENT", "off")])).await;

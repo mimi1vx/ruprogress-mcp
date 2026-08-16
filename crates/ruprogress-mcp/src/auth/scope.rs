@@ -38,10 +38,21 @@ pub enum ScopeRule {
 const UPDATE_ISSUE_NOTES_ONLY: &[&str] = &["add_issue_notes"];
 const UPDATE_ISSUE_BASE: &[&str] = &["edit_issues"];
 const UPDATE_ISSUE_WITH_SUBTASKS: &[&str] = &["edit_issues", "manage_subtasks"];
+/// `story_points`/`agile_sprint_id`/`agile_position` (`RedmineUP` Agile
+/// plugin) ride on `update_redmine_issue`'s existing parameters: the write
+/// still goes through `PUT /issues/{id}.json`, but the mandatory
+/// read-before-write hits the agile endpoint, so `view_agile_queries` is
+/// required in addition.
+const UPDATE_ISSUE_BASE_WITH_AGILE: &[&str] = &["edit_issues", "view_agile_queries"];
+const UPDATE_ISSUE_WITH_SUBTASKS_AND_AGILE: &[&str] =
+    &["edit_issues", "manage_subtasks", "view_agile_queries"];
 
 /// The two `update_redmine_issue` fields the S5 notes-only carve-out
 /// tolerates alongside `issue_id`.
 const NOTES_ONLY_FIELDS: &[&str] = &["notes", "private_notes"];
+
+/// The three agile parameter names on `update_redmine_issue`.
+const AGILE_UPDATE_FIELDS: &[&str] = &["story_points", "agile_sprint_id", "agile_position"];
 
 /// The per-tool scope map (S1). A tool absent here is denied by
 /// [`required_for_call`] (S3) — see `NOT_YET_IMPLEMENTED` below for the
@@ -215,10 +226,18 @@ fn is_notes_only_update(args: &JsonObject) -> bool {
     saw_notes_field
 }
 
+/// `true` if any of `story_points`/`agile_sprint_id`/`agile_position` is
+/// present.
+fn has_agile_field(args: &JsonObject) -> bool {
+    AGILE_UPDATE_FIELDS.iter().any(|f| args.contains_key(*f))
+}
+
 /// `update_redmine_issue`'s requirement (S5): the notes-only carve-out,
 /// otherwise the `edit_issues` base case plus `manage_subtasks` when
-/// `parent_issue_id` is present (reparenting is its own Redmine
-/// permission).
+/// `parent_issue_id` is present (reparenting is its own Redmine permission)
+/// and/or `view_agile_queries` when an agile field is present (its
+/// mandatory read hits the agile endpoint even though the write shares
+/// `update_redmine_issue`'s own `PUT`).
 fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> &'static [&'static str] {
     let Some(args) = args else {
         return UPDATE_ISSUE_BASE;
@@ -226,8 +245,16 @@ fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> &'static [&'st
     if is_notes_only_update(args) {
         return UPDATE_ISSUE_NOTES_ONLY;
     }
+    let agile = has_agile_field(args);
     if args.contains_key("parent_issue_id") {
-        return UPDATE_ISSUE_WITH_SUBTASKS;
+        return if agile {
+            UPDATE_ISSUE_WITH_SUBTASKS_AND_AGILE
+        } else {
+            UPDATE_ISSUE_WITH_SUBTASKS
+        };
+    }
+    if agile {
+        return UPDATE_ISSUE_BASE_WITH_AGILE;
     }
     UPDATE_ISSUE_BASE
 }
@@ -446,6 +473,46 @@ mod tests {
             ])),
         );
         assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_WITH_SUBTASKS));
+    }
+
+    #[test]
+    fn an_agile_field_requires_view_agile_queries_in_addition_to_edit_issues() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("story_points", serde_json::json!(8)),
+            ])),
+        );
+        assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_BASE_WITH_AGILE));
+    }
+
+    #[test]
+    fn an_agile_field_plus_reparenting_requires_all_three_scopes() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("parent_issue_id", serde_json::json!(2)),
+                ("agile_sprint_id", serde_json::json!(7)),
+            ])),
+        );
+        assert_eq!(
+            req,
+            Requirement::Scopes(UPDATE_ISSUE_WITH_SUBTASKS_AND_AGILE)
+        );
+    }
+
+    #[test]
+    fn a_non_agile_field_does_not_require_view_agile_queries() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("subject", "new subject".into()),
+            ])),
+        );
+        assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_BASE));
     }
 
     #[test]

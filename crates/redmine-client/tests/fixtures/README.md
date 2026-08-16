@@ -58,6 +58,8 @@ they land) are modelled differently from the pairs above:
 | `checklist_items.json` | `GET /issues/{id}/checklists.json` | envelope shape, `{"checklists": [...]}` |
 | `checklist_items_bare.json` | `GET /issues/{id}/checklists.json` | bare-array shape, `[...]` — the same plugin endpoint has been observed sending either |
 | `checklist_item_created.json` | `POST /issues/{id}/checklists.json` | nested `{"checklist": {"id": N}}` shape |
+| `agile_data_full.json` | `GET /issues/{id}/agile_data.json` | a populated row, all fields set |
+| `agile_data_empty.json` | `GET /issues/{id}/agile_data.json` | `{"agile_data": null}` — the issue has no agile row |
 
 ## Scrubbing
 

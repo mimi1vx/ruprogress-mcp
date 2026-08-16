@@ -5,4 +5,5 @@
 //! are registered at all is a server-side policy decision (`ruprogress-mcp`'s
 //! `PluginFlags`), not something modelled here.
 
+pub mod agile;
 pub mod checklists;

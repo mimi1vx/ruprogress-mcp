@@ -184,6 +184,7 @@ Parameters:
 - `issue_id` (integer, required): ID of the issue to update
 - `fields` (object, required): Dictionary of fields to update
 - `uploads` (list, optional): Files to attach to the issue. Maximum 10 items. Each item is an object with: Exactly ONE source key: `content_base64` (string): Raw file bytes encoded as base64. `filename` is required when using this source. `source_url` (string): HTTP(S) URL the server fetches. Filename is derived from the URL or `Content-Disposition` if omitted. `file_path` (string): Absolute path to a file already on the server. Must be inside `ATTACHMENTS_DIR` or a directory listed in `REDMINE_MCP_UPLOAD_FILE_ROOTS`. Filename is derived from the path if omitted. `filename` (string, optional): Name the attachment will have in Redmine. Required for `content_base64`; derived for other sources when omitted. `content_type` (string, optional): MIME type override (e.g. `"application/pdf"`). `description` (string, optional): Human-readable description for the attachment.
+- `story_points` (integer, optional, nullable), `agile_sprint_id` (integer, optional), `agile_position` (integer, optional): RedmineUP Agile plugin fields. Omit to leave unchanged; `story_points: null` clears it; `agile_sprint_id: 0` removes the issue from its sprint (the plugin's own sentinel). Require `REDMINE_AGILE_ENABLED=true`; wire shape unverified against a live instance — Agile is a commercial plugin.
 
 Returns: Updated issue dictionary. When `uploads` is provided and at least one attachment succeeds, the response includes:
 
