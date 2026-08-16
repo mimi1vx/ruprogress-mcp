@@ -42,6 +42,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
+use crate::tools::custom_fields::{
+    IssueCustomFieldEntry, IssueCustomFieldsOutcome, resolve_issue_custom_fields,
+    resolve_issue_custom_fields_for_update,
+};
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::files;
 use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, Pagination};
@@ -767,6 +771,16 @@ pub(crate) struct CreateRedmineIssueParams {
     /// returns a `MISCONFIGURED` error before any write happens.
     #[serde(default)]
     pub(crate) tag_list: Option<Vec<String>>,
+    /// Custom field values to set on the new issue. Each entry gives
+    /// exactly one of `id` (free) or `name` (matched case- and
+    /// punctuation-insensitively, e.g. `"Story Points"` ≡ `"story_points"`;
+    /// costs one extra project lookup, shared across every `name` entry in
+    /// this call). `value` is a string, an array of strings for a
+    /// `multiple = true` field, or `null` to clear the field. An
+    /// unresolvable, ambiguous, or duplicate entry is rejected before any
+    /// request reaches Redmine.
+    #[serde(default)]
+    pub(crate) custom_fields: Option<Vec<IssueCustomFieldEntry>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -867,6 +881,18 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// disabled returns a `MISCONFIGURED` error before any write happens.
     #[serde(default)]
     pub(crate) tag_list: Option<Vec<String>>,
+    /// Custom field values to set, if changing any. Each entry gives
+    /// exactly one of `id` (free) or `name` (matched case- and
+    /// punctuation-insensitively; costs an extra issue lookup plus an
+    /// extra project lookup, shared across every `name` entry in this
+    /// call, since this parameter only carries `issue_id` and not the
+    /// issue's project). `value` is a string, an array of strings for a
+    /// `multiple = true` field, or `null` to clear the field. An
+    /// unresolvable, ambiguous, or duplicate entry is rejected before any
+    /// request reaches Redmine. A non-empty array alone is enough to make
+    /// this a valid update — it does not need another field or `notes`.
+    #[serde(default)]
+    pub(crate) custom_fields: Option<Vec<IssueCustomFieldEntry>>,
 }
 
 /// Validates and trims a `tag_list` parameter (T1): a name that is empty
@@ -895,6 +921,38 @@ fn validate_tag_list(tags: Vec<String>) -> Result<Vec<String>, McpError> {
             Ok(trimmed.to_string())
         })
         .collect()
+}
+
+/// Whether `params` changes anything the core `PUT /issues/{id}.json`
+/// carries — as opposed to an agile-only or custom-fields-only update,
+/// which skip the core PUT (F19: extracted out of `update_redmine_issue`'s
+/// body once uploads, tags and now custom fields had each added a term).
+fn update_has_core_change(params: &UpdateRedmineIssueParams) -> bool {
+    params.subject.is_some()
+        || params.description.is_some()
+        || params.tracker_id.is_some()
+        || params.status_id.is_some()
+        || params.priority_id.is_some()
+        || params.assigned_to_id.is_some()
+        || params.category_id.is_some()
+        || params.fixed_version_id.is_some()
+        || params.parent_issue_id.is_some()
+        || params.start_date.is_some()
+        || params.due_date.is_some()
+        || params.done_ratio.is_some()
+        || params.estimated_hours.is_some()
+        || params.is_private.is_some()
+        || params.notes.is_some()
+        || params.tag_list.is_some()
+        // uploads alone (no other field, no notes) is a legitimate
+        // update, not a no-op; same for a non-empty custom_fields (F18) —
+        // both change the core PUT's body without touching any of the
+        // fields listed above.
+        || params.uploads.as_ref().is_some_and(|u| !u.is_empty())
+        || params
+            .custom_fields
+            .as_ref()
+            .is_some_and(|cf| !cf.is_empty())
 }
 
 /// Distinguishes an absent `story_points` key (`None`, leave unchanged) from
@@ -1831,6 +1889,13 @@ impl RedmineMcp {
         let project_id = resolve_project_ref(params.project_id)?;
         let scoped = self.scoped(&ctx)?;
 
+        let custom_fields =
+            match resolve_issue_custom_fields(&scoped, &project_id, params.custom_fields).await {
+                Ok(v) => v,
+                Err(IssueCustomFieldsOutcome::Protocol(e)) => return Err(e),
+                Err(IssueCustomFieldsOutcome::InBand(r)) => return Ok(r),
+            };
+
         let store = self.attachments();
         let (uploads, attachment_ids) = match resolve_and_mint_issue_uploads(
             &scoped,
@@ -1863,6 +1928,7 @@ impl RedmineMcp {
             is_private: params.is_private,
             uploads,
             tag_list,
+            custom_fields,
         };
 
         let mut issue = match scoped.create_issue(&create).await {
@@ -1923,25 +1989,7 @@ impl RedmineMcp {
                 None,
             ));
         }
-        let has_core_change = params.subject.is_some()
-            || params.description.is_some()
-            || params.tracker_id.is_some()
-            || params.status_id.is_some()
-            || params.priority_id.is_some()
-            || params.assigned_to_id.is_some()
-            || params.category_id.is_some()
-            || params.fixed_version_id.is_some()
-            || params.parent_issue_id.is_some()
-            || params.start_date.is_some()
-            || params.due_date.is_some()
-            || params.done_ratio.is_some()
-            || params.estimated_hours.is_some()
-            || params.is_private.is_some()
-            || params.notes.is_some()
-            || params.tag_list.is_some()
-            // uploads alone (no other field, no notes) is a legitimate
-            // update, not a no-op.
-            || params.uploads.as_ref().is_some_and(|u| !u.is_empty());
+        let has_core_change = update_has_core_change(&params);
         let has_agile_change = params.story_points.is_some()
             || params.agile_sprint_id.is_some()
             || params.agile_position.is_some();
@@ -1968,6 +2016,19 @@ impl RedmineMcp {
         let tag_list = params.tag_list.map(validate_tag_list).transpose()?;
 
         let scoped = self.scoped(&ctx)?;
+
+        let custom_fields = match resolve_issue_custom_fields_for_update(
+            &scoped,
+            IssueId(params.issue_id),
+            params.custom_fields,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(IssueCustomFieldsOutcome::Protocol(e)) => return Err(e),
+            Err(IssueCustomFieldsOutcome::InBand(r)) => return Ok(r),
+        };
+
         let store = self.attachments();
         let (uploads, attachment_ids) = match resolve_and_mint_issue_uploads(
             &scoped,
@@ -2001,6 +2062,7 @@ impl RedmineMcp {
             private_notes: params.private_notes,
             uploads,
             tag_list,
+            custom_fields,
         };
 
         // The core PUT and the agile PUT are separate requests to endpoints
@@ -2259,6 +2321,7 @@ impl RedmineMcp {
             is_private: source.is_private,
             uploads: Vec::new(),
             tag_list: None,
+            custom_fields: None,
         };
 
         let created = match scoped.create_issue(&root_create).await {
@@ -2323,6 +2386,7 @@ impl RedmineMcp {
                         is_private: child.is_private,
                         uploads: Vec::new(),
                         tag_list: None,
+                        custom_fields: None,
                     };
                     match scoped.create_issue(&child_create).await {
                         Ok(new_child) => {

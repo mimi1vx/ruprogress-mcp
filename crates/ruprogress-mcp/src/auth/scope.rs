@@ -320,6 +320,12 @@ fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> Requirement {
     }
 }
 
+/// `custom_fields` (7f1, F22) needs no scope rule of its own on either
+/// tool: writing a custom field value is covered by the tool's existing
+/// `add_issues`/`edit_issues` base, and the `name`-resolution lookup needs
+/// only project-view, which every path able to call these tools already
+/// holds. Deliberately not a table entry.
+///
 /// `create_redmine_issue`'s requirement (T7): the unconditional `add_issues`
 /// base, plus the [`TAG_LIST_SCOPES`] any-of when `tag_list` is present.
 fn create_redmine_issue_requirement(args: Option<&JsonObject>) -> Requirement {

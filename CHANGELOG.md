@@ -89,6 +89,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dict as `manage_product`/`manage_contact`. The wire shapes are synthetic,
   derived from the reference implementation's handling of the plugin rather
   than a live capture — see `crates/redmine-client/tests/fixtures/README.md`.
+- `create_redmine_issue`/`update_redmine_issue` gain a `custom_fields`
+  parameter — core Redmine, not plugin-gated, paying off phase 4b's
+  deferred decision (G8). Each entry gives exactly one of `id` (free) or
+  `name` (matched case- and punctuation-insensitively via a project lookup,
+  e.g. `"Story Points"` ≡ `"story_points"`; costs one extra request on
+  create, two on update since that tool's parameters carry only
+  `issue_id`), plus a `value` that is a string, an array of strings for a
+  multi-value field, or `null` to clear it. An entry with neither/both of
+  `id`/`name`, an unknown or ambiguous name, or a duplicate field id is
+  rejected before any request reaches Redmine. Diverges from the
+  reference's untyped `fields`/`extra_fields` dict (P4): an unresolvable key
+  is a clear error, not silently dropped or passed through. A
+  `custom_fields`-only update is accepted, not rejected as a no-op; an
+  empty array is not.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

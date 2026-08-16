@@ -3,10 +3,10 @@
 
 mod support;
 
-use redmine_client::model::project::ProjectQuery;
+use redmine_client::model::project::{ProjectInclude, ProjectQuery};
 use redmine_client::{Credential, Error, ProjectId, ProjectIdent};
 use secrecy::SecretString;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 fn project_json(id: u64, identifier: &str) -> serde_json::Value {
@@ -94,4 +94,35 @@ async fn list_projects_forbidden() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Forbidden));
+}
+
+#[tokio::test]
+async fn get_project_with_issue_custom_fields_sends_the_include_param_and_parses_definitions() {
+    let (server, client) = support::mock_redmine().await;
+    let fixture = include_str!("fixtures/project_with_issue_custom_fields.json");
+    let body: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/projects/1.json"))
+        .and(query_param("include", "issue_custom_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let ident = ProjectIdent::Id(ProjectId(1));
+    let project = client
+        .as_user(&cred)
+        .get_project(&ident, &[ProjectInclude::IssueCustomFields])
+        .await
+        .unwrap();
+    let defs = project
+        .issue_custom_fields
+        .expect("issue_custom_fields should be Some");
+    assert_eq!(defs.len(), 3);
+    let severity = defs.iter().find(|d| d.name == "Severity").unwrap();
+    assert_eq!(severity.default_value.as_deref(), Some("Low"));
+    assert_eq!(
+        severity.possible_values,
+        Some(vec!["Low".to_string(), "High".to_string()])
+    );
 }

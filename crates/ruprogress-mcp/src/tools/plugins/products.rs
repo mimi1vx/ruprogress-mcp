@@ -12,7 +12,6 @@
 
 use chrono::{DateTime, Utc};
 use redmine_client::ProductId;
-use redmine_client::model::custom_field::{CustomFieldValue, CustomFieldWrite};
 use redmine_client::model::plugins::products::{Product, ProductQuery, ProductWrite};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -24,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
+use crate::tools::custom_fields::{CustomFieldEntry, custom_field_entries_to_write};
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::issues::{CustomFieldValueOut, custom_field_value_out};
 use crate::tools::output::{self, ErrorCode, Pagination};
@@ -36,62 +36,6 @@ fn clamp_limit(limit: Option<u32>) -> u32 {
     limit
         .unwrap_or(LIST_DEFAULT_LIMIT)
         .clamp(LIST_MIN_LIMIT, LIST_MAX_LIMIT)
-}
-
-// --- custom_fields write input (R1): the shared write-side custom-field
-// shape, first needed here; 7f reuses both `CustomFieldValue`'s
-// `Serialize` impl and this tool-layer input struct for issues, adding name
-// resolution on top. Values are accepted by id only — there is no
-// discovery tool for product custom-field definitions to resolve a name
-// against. ---
-
-/// A custom field value as given by the caller: a single string, or an
-/// array of strings for a `multiple = true` field. Mirrors how Redmine
-/// itself represents the value on the wire (see
-/// `redmine_client::model::custom_field::CustomFieldValue`'s doc comment);
-/// unlike that type this is a tool-input shape the caller controls
-/// directly, so `#[serde(untagged)]` is the right tool here (same pattern
-/// as `tools::discovery::ProjectRef`).
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub(crate) enum CustomFieldValueInput {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl From<CustomFieldValueInput> for CustomFieldValue {
-    fn from(v: CustomFieldValueInput) -> Self {
-        match v {
-            CustomFieldValueInput::Single(s) => Self::Single(Some(s)),
-            CustomFieldValueInput::Multiple(values) => Self::Multiple(values),
-        }
-    }
-}
-
-/// One entry of a write-side `custom_fields` array.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CustomFieldEntry {
-    /// The custom field's id. Values are accepted by id only.
-    pub(crate) id: u64,
-    /// The value to set.
-    pub(crate) value: CustomFieldValueInput,
-}
-
-/// Shared with `tools::plugins::dmsf`: the same `{id, value}` write-side
-/// shape, spelled `custom_fields` on this tool's wire but
-/// `custom_field_values` on DMSF's (trap 3) — the field name difference is
-/// each call site's own envelope, not this conversion.
-pub(crate) fn custom_field_entries_to_write(
-    entries: Vec<CustomFieldEntry>,
-) -> Vec<CustomFieldWrite> {
-    entries
-        .into_iter()
-        .map(|e| CustomFieldWrite {
-            id: e.id,
-            value: e.value.into(),
-        })
-        .collect()
 }
 
 // --- shared output shape ---

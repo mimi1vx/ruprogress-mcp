@@ -2,6 +2,7 @@
 //! `#[tool_router(router = ..., vis = "pub(crate)")]` block on `RedmineMcp`;
 //! `server.rs` merges them into the router served to clients.
 
+pub(crate) mod custom_fields;
 pub(crate) mod discovery;
 pub(crate) mod files;
 pub(crate) mod gantt;

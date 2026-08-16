@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::attachment::Attachment;
+use super::custom_field::CustomFieldWrite;
 use super::journal::Journal;
 use super::plugins::tags::IssueTag;
 use super::relation::IssueRelation;
@@ -210,6 +211,9 @@ pub struct IssueCreate {
     /// start with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_list: Option<Vec<String>>,
+    /// Custom field values to set on creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_fields: Option<Vec<CustomFieldWrite>>,
 }
 
 impl IssueCreate {
@@ -235,6 +239,7 @@ impl IssueCreate {
             is_private: None,
             uploads: Vec::new(),
             tag_list: None,
+            custom_fields: None,
         }
     }
 }
@@ -306,6 +311,9 @@ pub struct IssueUpdate {
     /// unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_list: Option<Vec<String>>,
+    /// Custom field values to set, if changing any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_fields: Option<Vec<CustomFieldWrite>>,
 }
 
 /// `include=` values accepted by the issue endpoints.

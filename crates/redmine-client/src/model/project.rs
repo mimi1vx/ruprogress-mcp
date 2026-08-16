@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use super::custom_field::CustomFieldDefinition;
 use super::{Collection, CustomField, IdName, permissive_datetime};
 
 /// A Redmine project.
@@ -57,6 +58,15 @@ pub struct Project {
     /// `active`/`is_default`.
     #[serde(default)]
     pub time_entry_activities: Option<Vec<IdName>>,
+    /// Issue custom field definitions attached to this project. Same
+    /// `None` = not requested, `Some(vec![])` = requested and none
+    /// configured convention as `trackers`/`enabled_modules` above —
+    /// populated only when `include=issue_custom_fields` was requested.
+    /// This is the non-admin definitions source: any user who can see the
+    /// project can read it, unlike the admin-only `GET
+    /// /custom_fields.json`.
+    #[serde(default)]
+    pub issue_custom_fields: Option<Vec<CustomFieldDefinition>>,
 }
 
 /// `include=` values accepted by the project endpoints.
@@ -70,6 +80,8 @@ pub enum ProjectInclude {
     EnabledModules,
     /// Time-tracking activities.
     TimeEntryActivities,
+    /// Issue custom field definitions.
+    IssueCustomFields,
 }
 
 impl ProjectInclude {
@@ -79,6 +91,7 @@ impl ProjectInclude {
             Self::IssueCategories => "issue_categories",
             Self::EnabledModules => "enabled_modules",
             Self::TimeEntryActivities => "time_entry_activities",
+            Self::IssueCustomFields => "issue_custom_fields",
         }
     }
 }

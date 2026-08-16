@@ -1,0 +1,48 @@
+{
+  "project": {
+    "id": 1,
+    "name": "Example Project",
+    "identifier": "example-project",
+    "description": "An example project.",
+    "status": 1,
+    "is_public": true,
+    "parent": { "id": 5, "name": "Parent Project" },
+    "created_on": "2026-01-01T09:00:00Z",
+    "updated_on": "2026-01-01T09:00:00Z",
+    "issue_custom_fields": [
+      {
+        "id": 3,
+        "name": "Severity",
+        "field_format": "list",
+        "is_required": false,
+        "multiple": false,
+        "default_value": "Low",
+        "possible_values": [
+          { "value": "Low", "label": "Low" },
+          { "value": "High", "label": "High" }
+        ],
+        "customized_type": "issue"
+      },
+      {
+        "id": 4,
+        "name": "Affected Platforms",
+        "field_format": "list",
+        "is_required": false,
+        "multiple": true,
+        "possible_values": [
+          { "value": "linux", "label": "Linux" },
+          { "value": "macos", "label": "macOS" },
+          { "value": "windows", "label": "Windows" }
+        ],
+        "customized_type": "issue"
+      },
+      {
+        "id": 5,
+        "name": "Story Points",
+        "field_format": "string",
+        "is_required": false,
+        "customized_type": "issue"
+      }
+    ]
+  }
+}

@@ -30,11 +30,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
+use crate::tools::custom_fields::{CustomFieldEntry, custom_field_entries_to_write};
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::files;
 use crate::tools::issues::IdNameOut;
 use crate::tools::output::{self, ErrorCode, Pagination};
-use crate::tools::plugins::products::{CustomFieldEntry, custom_field_entries_to_write};
 
 const LIST_MIN_LIMIT: u32 = 1;
 const LIST_MAX_LIMIT: u32 = 100;

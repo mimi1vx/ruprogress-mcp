@@ -8,6 +8,7 @@
 
 mod support;
 
+use redmine_client::model::custom_field::{CustomFieldValue, CustomFieldWrite};
 use redmine_client::model::issue::{IssueCreate, IssueUpdate};
 use redmine_client::model::issue_category::{IssueCategoryCreate, IssueCategoryUpdate};
 use redmine_client::model::journal::JournalUpdate;
@@ -138,6 +139,141 @@ async fn update_issue_sends_tag_list_as_the_full_replacement_array() {
     let cred = Credential::ApiKey(SecretString::from("k"));
     let patch = IssueUpdate {
         tag_list: Some(vec!["a".to_string(), "b".to_string()]),
+        ..Default::default()
+    };
+    client
+        .as_user(&cred)
+        .update_issue(IssueId(7), &patch)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_issue_sends_custom_fields_with_string_null_and_array_values() {
+    let (server, client) = support::mock_redmine().await;
+    let project: redmine_client::ProjectIdentifier = "demo".parse().unwrap();
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(body_json(serde_json::json!({
+            "issue": {
+                "project_id": "demo",
+                "subject": "New issue",
+                "custom_fields": [
+                    {"id": 1, "value": "blue"},
+                    {"id": 2, "value": null},
+                    {"id": 3, "value": ["a", "b"]}
+                ]
+            }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(1, "New issue")))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let mut create = IssueCreate::new(ProjectIdent::Identifier(project), "New issue");
+    create.custom_fields = Some(vec![
+        CustomFieldWrite {
+            id: 1,
+            value: CustomFieldValue::Single(Some("blue".to_string())),
+        },
+        CustomFieldWrite {
+            id: 2,
+            value: CustomFieldValue::Single(None),
+        },
+        CustomFieldWrite {
+            id: 3,
+            value: CustomFieldValue::Multiple(vec!["a".to_string(), "b".to_string()]),
+        },
+    ]);
+    client.as_user(&cred).create_issue(&create).await.unwrap();
+}
+
+#[tokio::test]
+async fn create_issue_omits_custom_fields_key_when_none() {
+    let (server, client) = support::mock_redmine().await;
+    let project: redmine_client::ProjectIdentifier = "demo".parse().unwrap();
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(body_json(serde_json::json!({
+            "issue": { "project_id": "demo", "subject": "New issue" }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(1, "New issue")))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let create = IssueCreate::new(ProjectIdent::Identifier(project), "New issue");
+    client.as_user(&cred).create_issue(&create).await.unwrap();
+}
+
+#[tokio::test]
+async fn update_issue_sends_custom_fields_with_string_null_and_array_values() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(serde_json::json!({
+            "issue": {
+                "custom_fields": [
+                    {"id": 1, "value": "blue"},
+                    {"id": 2, "value": null},
+                    {"id": 3, "value": ["a", "b"]}
+                ]
+            }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let patch = IssueUpdate {
+        custom_fields: Some(vec![
+            CustomFieldWrite {
+                id: 1,
+                value: CustomFieldValue::Single(Some("blue".to_string())),
+            },
+            CustomFieldWrite {
+                id: 2,
+                value: CustomFieldValue::Single(None),
+            },
+            CustomFieldWrite {
+                id: 3,
+                value: CustomFieldValue::Multiple(vec!["a".to_string(), "b".to_string()]),
+            },
+        ]),
+        ..Default::default()
+    };
+    client
+        .as_user(&cred)
+        .update_issue(IssueId(7), &patch)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn update_issue_omits_custom_fields_key_when_none() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(serde_json::json!({
+            "issue": { "subject": "Updated" }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Updated")))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let patch = IssueUpdate {
+        subject: Some("Updated".to_string()),
         ..Default::default()
     };
     client
