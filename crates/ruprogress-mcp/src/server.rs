@@ -16,9 +16,27 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 use crate::attachments::AttachmentStore;
 use crate::auth::oauth::TokenVerifier;
 use crate::auth::scope;
-use crate::config::{AuthMode, Config, SchemaDialect};
+use crate::config::{AuthMode, Config, PluginFlags, SchemaDialect};
 use crate::readonly::write_tools;
 use crate::tools::schema;
+
+/// A plugin-gated tool's enablement predicate.
+type PluginFlagPredicate = fn(&PluginFlags) -> bool;
+
+/// Plugin-gated tool names and the flag predicate that keeps them
+/// registered. Every family's router is merged into `tool_router`
+/// unconditionally (`RedmineMcp::new` below); this table is what actually
+/// decides whether a name survives, by removing it when its plugin is
+/// disabled — the same `ToolRouter::remove_route` mechanism read-only mode
+/// uses, not a second one. Checked *before* the read-only loop so a name
+/// removed for both reasons (a plugin write tool, disabled, in a read-only
+/// deployment) is not a special case: `remove_route` on an already-absent
+/// name is a no-op.
+const PLUGIN_TOOLS: &[(&str, PluginFlagPredicate)] = &[
+    ("get_checklist", |flags| flags.checklists),
+    ("create_checklist_item", |flags| flags.checklists),
+    ("update_checklist_item", |flags| flags.checklists),
+];
 
 #[derive(Clone, Debug)]
 pub struct RedmineMcp {
@@ -40,8 +58,9 @@ pub(crate) struct ServerInner {
 impl RedmineMcp {
     /// Assemble the server: merge every tool module's router (see
     /// `tools/{meta,discovery,projects,issues}.rs`, each its own
-    /// `#[tool_router]` block), then remove write-tool routes if configured
-    /// read-only.
+    /// `#[tool_router]` block), remove plugin-gated tool routes whose
+    /// `PluginFlags` entry is off, then remove write-tool routes if
+    /// configured read-only.
     #[must_use]
     pub fn new(client: RedmineClient, config: Config, attachments: Arc<AttachmentStore>) -> Self {
         let mut router = ToolRouter::new();
@@ -53,6 +72,12 @@ impl RedmineMcp {
         router.merge(Self::search_wiki_tool_router());
         router.merge(Self::gantt_tool_router());
         router.merge(Self::files_tool_router());
+        router.merge(Self::checklists_tool_router());
+        for (name, enabled) in PLUGIN_TOOLS {
+            if !enabled(&config.plugins) {
+                router.remove_route(name);
+            }
+        }
         if config.read_only {
             for name in write_tools::ALL {
                 router.remove_route(name);

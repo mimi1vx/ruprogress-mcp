@@ -1,14 +1,15 @@
 # Tool contract
 
-The full tool surface `ruprogress-mcp` targets: 52 tools, of which 42 are
-implemented. For each tool: name, parameter names + types + required-ness, and
-a one-line return shape.
+The full tool surface `ruprogress-mcp` targets: 52 tools, of which 41 are
+always registered plus 3 more (the Checklist family) when
+`REDMINE_CHECKLISTS_ENABLED=true`. For each tool: name, parameter names +
+types + required-ness, and a one-line return shape.
 
 Tools currently implemented (the non-app core tools plus the
 attachment-related `get_redmine_attachment`, `list_files`, `delete_file`,
-`upload_file`, and the admin-gated `cleanup_attachment_files`; kept in sync
-with `IMPLEMENTED_TOOLS` in `crates/ruprogress-mcp/tests/tools_basic.rs`,
-which fails CI on drift):
+`upload_file`, the admin-gated `cleanup_attachment_files`, and the
+plugin-gated Checklist tools below; kept in sync with `IMPLEMENTED_TOOLS`
+in `crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
 `get_mcp_server_info`, `get_current_user`, `list_redmine_projects`,
 `list_redmine_trackers`, `list_project_trackers`,
 `list_redmine_issue_statuses`, `list_redmine_issue_priorities`,
@@ -23,14 +24,16 @@ which fails CI on drift):
 `copy_issue`, `manage_issue_relation`, `manage_issue_watcher`,
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
 `manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`,
-`list_files`, `delete_file`, `upload_file`, and (only with
-`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`.
+`list_files`, `delete_file`, `upload_file`, (only with
+`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`, and
+(only with `REDMINE_CHECKLISTS_ENABLED=true`) `get_checklist`,
+`create_checklist_item`, `update_checklist_item`.
 `upload_file` accepts `content_base64`/`file_path` only — `source_url` is
 recognised as a parameter but always refused with `UNSUPPORTED_SOURCE`,
 deferred to a future release. All remaining sections below (MCP Apps, the
-rest of File Operations, Checklist Tools, Products/Contacts/Documents
-plugin families) are recorded for reference as app-plugin tools that are
-out of scope for this implementation.
+rest of File Operations, Products/Contacts/Documents plugin families) are
+recorded for reference as app-plugin tools that are out of scope for this
+implementation.
 
 In `REDMINE_AUTH_MODE=oauth`, which of these tools a given bearer token can
 see and call is governed by `TOOL_SCOPES` in
@@ -462,12 +465,18 @@ Returns: Cleanup statistics:
 
 ## Checklist Tools
 
+Requires the RedmineUP Checklists Pro plugin (commercial); registered only
+with `REDMINE_CHECKLISTS_ENABLED=true`. The wire shapes these tools rely on
+are synthetic, derived from the reference implementation's handling of the
+plugin rather than a live capture — see
+`crates/redmine-client/tests/fixtures/README.md`'s plugin fixtures section.
+
 ### `get_checklist`
 
 Parameters:
 - `issue_id` (int, Yes): The ID of the issue whose checklist to retrieve
 
-Returns: | Field | Type | Description |
+Returns: `{issue_id, total_count, items: [{id, subject, is_done, is_section, position, created_on, updated_on}]}`
 
 ### `update_checklist_item`
 
@@ -476,8 +485,9 @@ Parameters:
 - `subject` (string, No): New text for the checklist item
 - `is_done` (bool, No): New done state
 - `position` (int, No): New position/order
+- At least one of `subject`/`is_done`/`position` is required
 
-Returns: | Field | Type | Description |
+Returns: `{success, checklist_item_id, updated_fields: [string]}` — echoes the names of the fields that were sent, not a re-fetched item
 
 ### `create_checklist_item`
 
@@ -488,7 +498,7 @@ Parameters:
 - `is_done` (bool, No): Initial done state for checkable items (ignored when `is_section=true`)
 - `position` (int, No): 1-based position in the checklist. Omit to append at the end
 
-Returns: | Field | Type | Description |
+Returns: `{success, issue_id, checklist_item_id, subject, is_section, is_done, position}` — `checklist_item_id` is `null` when the plugin's response carried no id
 
 ## Gantt Chart
 

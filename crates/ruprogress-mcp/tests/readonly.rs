@@ -23,7 +23,11 @@ use serde_json::json;
 
 #[tokio::test]
 async fn every_write_tool_name_exists_in_a_normal_router() {
-    let h = support::harness(&[]).await;
+    // Plugin-gated write tools (`create_checklist_item`/
+    // `update_checklist_item`) only exist with their flag on — enable every
+    // implemented plugin flag so this checks the full `write_tools::ALL`
+    // list, not just the always-on core.
+    let h = support::harness(&[("REDMINE_CHECKLISTS_ENABLED", "true")]).await;
     let tools = h
         .client
         .list_tools(None)
@@ -40,7 +44,11 @@ async fn every_write_tool_name_exists_in_a_normal_router() {
 
 #[tokio::test]
 async fn no_write_tool_name_exists_in_a_read_only_router() {
-    let h = support::harness(&[("REDMINE_MCP_READ_ONLY", "true")]).await;
+    let h = support::harness(&[
+        ("REDMINE_MCP_READ_ONLY", "true"),
+        ("REDMINE_CHECKLISTS_ENABLED", "true"),
+    ])
+    .await;
     let tools = h
         .client
         .list_tools(None)
@@ -58,14 +66,13 @@ async fn no_write_tool_name_exists_in_a_read_only_router() {
 #[tokio::test]
 async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
     let h = support::harness(&[]).await;
-    // `get_checklist` is a real future tool name (see
-    // docs/tool-contract.md, the Checklist plugin family, not among the
-    // tools implemented here) that does not exist in the router yet — the router's
-    // response to it is identical to what it will return for a route
-    // removed by read-only mode.
+    // `show_triage_board` is a real future tool name (see
+    // docs/tool-contract.md, Phase 8, deferred) that does not exist in the
+    // router yet — the router's response to it is identical to what it
+    // will return for a route removed by read-only mode.
     let result = h
         .client
-        .call_tool(CallToolRequestParams::new("get_checklist"))
+        .call_tool(CallToolRequestParams::new("show_triage_board"))
         .await;
     assert!(
         result.is_err(),

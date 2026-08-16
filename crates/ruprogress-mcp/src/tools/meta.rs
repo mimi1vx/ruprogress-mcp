@@ -40,7 +40,7 @@ impl RedmineMcp {
     /// identity of the authenticated Redmine user. The response excludes
     /// credentials, internal hostnames, and filesystem paths.
     #[tool(
-        description = "Return the MCP server's version, read-only/auth mode, plugin flags, and the identity of the authenticated Redmine user (or null if Redmine is unreachable). Use this once at the start of a session to learn what the server can do before calling other tools.",
+        description = "Return the MCP server's version, read-only/auth mode, plugin flags, and the identity of the authenticated Redmine user (or null if Redmine is unreachable). Use this once at the start of a session to learn what the server can do before calling other tools. Plugin-gated tools (e.g. get_checklist) are absent from tools/list unless their plugin_flags entry is on.",
         output_schema = crate::tools::schema::output::<ServerInfoOutput>(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
     )]

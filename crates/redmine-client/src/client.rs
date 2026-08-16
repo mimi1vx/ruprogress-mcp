@@ -15,9 +15,10 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{
-    AttachmentId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent, RelationId,
-    TimeEntryId, UserId, VersionId, WikiTitle,
+    AttachmentId, ChecklistItemId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent,
+    RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
 };
+use crate::model::plugins::checklists;
 use crate::model::{
     BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
     issue_category, issue_status, journal, membership, project, query, relation, role, search,
@@ -1231,6 +1232,68 @@ impl Scoped<'_> {
         }
         self.delete_with_query(&format!("issue_categories/{id}.json"), &q)
             .await
+    }
+
+    /// `GET /issues/{id}/checklists.json` (`RedmineUP` Checklists Pro plugin).
+    /// Sends no `limit`/`offset` — the endpoint carries no pagination
+    /// envelope at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response body is neither of the two
+    /// known shapes (see [`checklists::ChecklistItemsEnvelope`]).
+    pub async fn list_checklist_items(
+        &self,
+        issue: IssueId,
+    ) -> crate::Result<Vec<checklists::ChecklistItem>> {
+        self.get_collection::<checklists::ChecklistItemsEnvelope>(
+            &format!("issues/{issue}/checklists.json"),
+            &Query::default(),
+        )
+        .await
+    }
+
+    /// `POST /issues/{id}/checklists.json`. `Ok(None)` when the plugin's
+    /// response body carries no id in either known shape — not an error,
+    /// see [`checklists::ChecklistItemCreated`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn create_checklist_item(
+        &self,
+        issue: IssueId,
+        new: &checklists::ChecklistItemCreate,
+    ) -> crate::Result<Option<ChecklistItemId>> {
+        let created: checklists::ChecklistItemCreated = self
+            .post_json(
+                &format!("issues/{issue}/checklists.json"),
+                &checklists::ChecklistItemCreateEnvelope { checklist: new },
+            )
+            .await?;
+        Ok(created.0.map(ChecklistItemId))
+    }
+
+    /// `PUT /checklists/{id}.json`. The plugin's response body is
+    /// undocumented and discarded; success is inferred from a non-error
+    /// HTTP status, matching [`Self::update_journal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn update_checklist_item(
+        &self,
+        id: ChecklistItemId,
+        patch: &checklists::ChecklistItemUpdate,
+    ) -> crate::Result<()> {
+        self.put_json(
+            &format!("checklists/{id}.json"),
+            &checklists::ChecklistItemUpdateEnvelope { checklist: patch },
+        )
+        .await
     }
 
     /// `GET /time_entries.json`.

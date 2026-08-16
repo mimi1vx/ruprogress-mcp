@@ -31,7 +31,7 @@ real process environment.
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
 | `REDMINE_AGILE_ENABLED` | no | `false` | Surfaced in `plugin_flags.agile` (`get_mcp_server_info`). No agile tools exist yet. |
-| `REDMINE_CHECKLISTS_ENABLED` | no | `false` | `plugin_flags.checklists`. |
+| `REDMINE_CHECKLISTS_ENABLED` | no | `false` | `plugin_flags.checklists`. `true` registers `get_checklist`/`create_checklist_item`/`update_checklist_item` (RedmineUP Checklists Pro plugin); `false` (the default) de-registers them from the router entirely — they are absent from `tools/list` and `tools/call` fails with "tool not found", not an in-band error. |
 | `REDMINE_PRODUCTS_ENABLED` | no | `false` | `plugin_flags.products`. |
 | `REDMINE_CRM_ENABLED` | no | `false` | `plugin_flags.crm`. |
 | `REDMINE_DMSF_ENABLED` | no | `false` | `plugin_flags.dmsf`. |

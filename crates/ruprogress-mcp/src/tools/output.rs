@@ -188,8 +188,15 @@ impl<'a> ContentUrlRewrite<'a> {
 }
 
 /// The closed set of machine-readable error codes every tool's in-band error
-/// envelope carries. `#[non_exhaustive]`: future tools may add
-/// `FEATURE_DISABLED` once one exists that can produce it.
+/// envelope carries. `#[non_exhaustive]`.
+///
+/// A `FEATURE_DISABLED` code was considered for plugin-gated tools whose
+/// backing Redmine plugin is not installed, and rejected: those tools are
+/// de-registered from the router instead (`server.rs`'s `PLUGIN_TOOLS`
+/// removal loop), so calling one with its plugin disabled fails
+/// `tools/call` with rmcp's own "tool not found" rather than an in-band
+/// error a model might retry around. `get_mcp_server_info`'s `plugin_flags`
+/// is the discoverability answer for "why is this tool missing".
 ///
 /// `ReadOnly`/`ConfirmationRequired`/`ChildrenPresent` are used slightly
 /// differently from the rest: `ReadOnly` goes through

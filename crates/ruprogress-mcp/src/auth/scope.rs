@@ -161,13 +161,21 @@ pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     ("delete_file", ScopeRule::Fixed(&["manage_files"])),
     ("upload_file", ScopeRule::Fixed(&["manage_files"])),
     ("cleanup_attachment_files", ScopeRule::Fixed(&[])),
+    // RedmineUP Checklists plugin: no scope advertised. The plugin's own
+    // Doorkeeper scope names are vendor-specific, undocumented, and vary by
+    // plugin version — advertising a guess breaks the OAuth consent screen
+    // outright, which is worse than deferring the authorization decision to
+    // Redmine's own in-band 403.
+    ("get_checklist", ScopeRule::Fixed(&[])),
+    ("create_checklist_item", ScopeRule::Fixed(&[])),
+    ("update_checklist_item", ScopeRule::Fixed(&[])),
 ];
 
 /// Tools named in `docs/tool-contract.md`/`EXPECTED_TOOLS` with no
 /// `TOOL_SCOPES` entry, because they are not registered routes yet
-/// (`manage_document`, `manage_product`, `manage_contact`, the MCP-Apps and
-/// Checklist families — see the plan's step-1 table). Deliberately empty:
-/// the map is ported alongside the tool that needs it, never ahead of it.
+/// (`manage_document`, `manage_product`, `manage_contact`, and the MCP-Apps
+/// families). Deliberately empty: the map is ported alongside the tool that
+/// needs it, never ahead of it.
 pub const NOT_YET_IMPLEMENTED: &[&str] = &[];
 
 /// The outcome of resolving a tool call's scope requirement.

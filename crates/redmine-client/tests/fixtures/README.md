@@ -36,6 +36,29 @@ capture date and re-run the scrub test below.
 | `upload_token_6_1.json` | 6.1 | `POST /uploads.json` | `upload.api.rsb` is identical across both versions (verified against `redmine/redmine` `6.1-stable` and `master`); paired per convention, values differ only for test readability |
 | `upload_token_7_0.json` | 7.0 | `POST /uploads.json` | see above |
 
+## Plugin fixtures
+
+Third-party Redmine plugin endpoints (Checklists, and the other families as
+they land) are modelled differently from the pairs above:
+
+- **Provenance**: synthetic, derived from the reference implementation's
+  handling of the plugin's endpoints rather than a live capture. Three of
+  the four plugin families are commercial and the fourth needs a server-side
+  install neither this repository nor CI has; none of these fixtures were
+  captured from a running instance.
+- **No `_6_1`/`_7_0` version pair**: the version axis that matters for a
+  plugin endpoint is the *plugin's* version, not Redmine core's, and the
+  plugin version is not something this project can enumerate. Naming two
+  identical files per endpoint would imply a cross-version check that never
+  happened, so plugin fixtures are named `{family}_{operation}.json` with no
+  pair.
+
+| Fixture | Endpoint | Notes |
+|---|---|---|
+| `checklist_items.json` | `GET /issues/{id}/checklists.json` | envelope shape, `{"checklists": [...]}` |
+| `checklist_items_bare.json` | `GET /issues/{id}/checklists.json` | bare-array shape, `[...]` — the same plugin endpoint has been observed sending either |
+| `checklist_item_created.json` | `POST /issues/{id}/checklists.json` | nested `{"checklist": {"id": N}}` shape |
+
 ## Scrubbing
 
 Every fixture must be free of real secrets, emails, and IP addresses. This is

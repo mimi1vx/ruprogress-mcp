@@ -65,6 +65,10 @@ id_newtype!(
     /// not-yet-attached file, returned by `POST /uploads.json`).
     AttachmentId
 );
+id_newtype!(
+    /// A checklist item id (`RedmineUP` Checklists plugin).
+    ChecklistItemId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

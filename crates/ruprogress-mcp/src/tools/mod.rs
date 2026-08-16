@@ -8,6 +8,7 @@ pub(crate) mod gantt;
 pub(crate) mod issues;
 pub(crate) mod meta;
 pub(crate) mod output;
+pub(crate) mod plugins;
 pub(crate) mod projects;
 pub(crate) mod schema;
 pub(crate) mod search_wiki;

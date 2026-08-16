@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Three tools for the RedmineUP Checklists Pro plugin, registered only when
+  `REDMINE_CHECKLISTS_ENABLED=true`: `get_checklist`, `create_checklist_item`,
+  `update_checklist_item`. With the flag off (the default) they are fully
+  absent from `tools/list` and `tools/call` fails with "tool not found"
+  rather than an in-band error — the first user of a new plugin-gating
+  mechanism (`server.rs`'s `PLUGIN_TOOLS` route-removal table) that later
+  plugin families reuse. The plugin's wire shapes are synthetic, derived
+  from the reference implementation's handling of the plugin rather than a
+  live capture (Checklists Pro is commercial) — see
+  `crates/redmine-client/tests/fixtures/README.md`.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

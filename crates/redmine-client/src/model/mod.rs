@@ -14,6 +14,7 @@ pub mod issue_category;
 pub mod issue_status;
 pub mod journal;
 pub mod membership;
+pub mod plugins;
 pub mod project;
 pub mod query;
 pub mod relation;

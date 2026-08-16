@@ -35,6 +35,13 @@ pub mod write_tools {
     /// `update_redmine_issue` needs no entry of its own, since both tools
     /// are already unconditionally in this list.
     ///
+    /// `create_checklist_item`/`update_checklist_item` (`RedmineUP` Checklists
+    /// plugin) always write when called, by construction; `get_checklist`
+    /// is a read and is deliberately absent. All three exist in the router
+    /// only when `REDMINE_CHECKLISTS_ENABLED=true` — see `server.rs`'s
+    /// `PLUGIN_TOOLS` gating, a separate mechanism from this list that runs
+    /// first.
+    ///
     /// `cleanup_attachment_files` is deliberately **not** here: it mutates
     /// only the local attachment store, never Redmine, so read-only mode
     /// does not gate it — it is instead removed from the router entirely
@@ -57,6 +64,8 @@ pub mod write_tools {
         "manage_issue_note",
         "delete_file",
         "upload_file",
+        "create_checklist_item",
+        "update_checklist_item",
     ];
 
     /// Tools with a mix of read and write `action`s: never removed from
