@@ -78,7 +78,7 @@ fn product_out(boundary: &Boundary, p: &Product) -> ProductOut {
         }),
         custom_fields: p.custom_fields.as_ref().map(|cfs| {
             cfs.iter()
-                .map(|cf| custom_field_value_out(boundary, cf))
+                .map(|cf| custom_field_value_out(boundary, cf.id, &cf.name, cf.value.as_ref()))
                 .collect()
         }),
         created_on: p.created_on,

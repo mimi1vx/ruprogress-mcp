@@ -178,7 +178,7 @@ Parameters:
 - `tag_list` (array of strings, optional): The issue's initial tags (AlphaNodes `additional_tags` plugin). A tag name containing a comma is rejected — pass separate array entries instead of a comma-separated string. Requires `REDMINE_TAGS_ENABLED=true`; wire shape unverified against a live instance.
 - `custom_fields` (array of objects, optional): Custom field values to set. Each entry gives exactly one of `id` (integer, no extra request) or `name` (string, matched case- and punctuation-insensitively, e.g. `"Story Points"` ≡ `"story_points"`; resolved via one project lookup shared across every `name` entry in the call) plus `value` (a string, an array of strings for a multi-value field, or `null`). Diverges from the reference's untyped `fields`/`extra_fields` dict (P4): an unresolvable, ambiguous, or duplicate entry is rejected before any request reaches Redmine, rather than passed through as an arbitrary key. Core Redmine, not plugin-gated — this is the write side of phase 4b's deferred custom-field support (G8).
 
-Returns: Created issue dictionary. When `uploads` is provided and at least one attachment succeeds, the response includes:
+Returns: Created issue dictionary. When `uploads` is provided and at least one attachment succeeds, the response includes: an `attachments` array. When `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true` and a first attempt's 422 named a required custom field that was recovered on the one retry, the response also includes `autofilled_custom_fields` (array of `{id, name, value}`); absent otherwise.
 
 ### `update_redmine_issue`
 
@@ -190,7 +190,7 @@ Parameters:
 - `tag_list` (array of strings, optional): Replaces the issue's full tag set (AlphaNodes `additional_tags` plugin) — not additive. `[]` clears every tag; omit to leave the tag set unchanged. A tag name containing a comma is rejected — pass separate array entries instead of a comma-separated string. Requires `REDMINE_TAGS_ENABLED=true`; wire shape unverified against a live instance.
 - `custom_fields` (array of objects, optional): Custom field values to set, if changing any. Same entry shape as `create_redmine_issue`'s `custom_fields` (exactly one of `id`/`name`, plus `value`; `null` clears a field). Since this tool's parameters carry only `issue_id`, a `name` entry costs a dedicated issue lookup on top of the project lookup (two extra reads); an all-`id` array costs nothing. A non-empty `custom_fields` alone makes this a valid call — it does not need another field or `notes`. Core Redmine, not plugin-gated (G8).
 
-Returns: Updated issue dictionary. When `uploads` is provided and at least one attachment succeeds, the response includes:
+Returns: Updated issue dictionary. When `uploads` is provided and at least one attachment succeeds, the response includes: an `attachments` array. When `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true` and the core write's 422 named a required custom field that was recovered on the one retry, the response also includes `autofilled_custom_fields` (array of `{id, name, value}`); absent otherwise. A 422 naming a required field always gains `missing_required_fields` and a hint, whether or not autofill is enabled or able to recover.
 
 ### `delete_redmine_issue`
 

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
+use redmine_client::model::IdName;
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
 use redmine_client::model::issue::{
@@ -28,7 +29,6 @@ use redmine_client::model::relation::{IssueRelation as ClientIssueRelation, Issu
 use redmine_client::model::search::{SearchQuery, SearchScope};
 use redmine_client::model::time_entry::TimeEntryQuery;
 use redmine_client::model::upload::UploadRef;
-use redmine_client::model::{CustomField, IdName};
 use redmine_client::{
     AttachmentId, IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
 };
@@ -43,8 +43,9 @@ use crate::error::to_tool_error;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::custom_fields::{
-    IssueCustomFieldEntry, IssueCustomFieldsOutcome, resolve_issue_custom_fields,
-    resolve_issue_custom_fields_for_update,
+    AutofillTarget, IssueCustomFieldEntry, IssueCustomFieldsOutcome, RequiredFieldRecovery,
+    recover_required_fields, resolve_issue_custom_fields, resolve_issue_custom_fields_for_update,
+    retry_still_missing_required_fields,
 };
 use crate::tools::discovery::{ProjectRef, resolve_project_ref};
 use crate::tools::files;
@@ -435,8 +436,16 @@ pub(crate) struct CustomFieldValueOut {
     pub(crate) value: Option<serde_json::Value>,
 }
 
-pub(crate) fn custom_field_value_out(boundary: &Boundary, cf: &CustomField) -> CustomFieldValueOut {
-    let value = match &cf.value {
+/// Shared by the read path (an issue's existing `custom_fields`) and the
+/// autofill report (`autofilled_custom_fields`): both show a
+/// `{id, name, value}` triple to the model, boundary-wrapped the same way.
+pub(crate) fn custom_field_value_out(
+    boundary: &Boundary,
+    id: u64,
+    name: &str,
+    value: Option<&CustomFieldValue>,
+) -> CustomFieldValueOut {
+    let value = match value {
         None | Some(CustomFieldValue::Single(None)) => None,
         Some(CustomFieldValue::Single(Some(s))) => Some(serde_json::Value::String(
             boundary.wrap("issue.custom_field.value", s),
@@ -449,8 +458,8 @@ pub(crate) fn custom_field_value_out(boundary: &Boundary, cf: &CustomField) -> C
         )),
     };
     CustomFieldValueOut {
-        id: cf.id,
-        name: boundary.wrap("issue.custom_field.name", &cf.name),
+        id,
+        name: boundary.wrap("issue.custom_field.name", name),
         value,
     }
 }
@@ -787,6 +796,11 @@ pub(crate) struct CreateRedmineIssueParams {
 pub(crate) struct CreateRedmineIssueOutput {
     pub(crate) success: bool,
     pub(crate) issue: IssueDetailOutput,
+    /// Present only when a required custom field was rejected on the first
+    /// attempt and successfully filled in on a retry (requires
+    /// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) autofilled_custom_fields: Option<Vec<CustomFieldValueOut>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -976,6 +990,11 @@ where
 pub(crate) struct UpdateRedmineIssueOutput {
     pub(crate) success: bool,
     pub(crate) issue: IssueDetailOutput,
+    /// Present only when a required custom field was rejected on the first
+    /// attempt and successfully filled in on a retry (requires
+    /// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) autofilled_custom_fields: Option<Vec<CustomFieldValueOut>>,
 }
 
 // --- delete_redmine_issue ---
@@ -1384,7 +1403,7 @@ fn issue_detail_out(
         custom_fields: issue.custom_fields.as_ref().map(|fields| {
             fields
                 .iter()
-                .map(|cf| custom_field_value_out(boundary, cf))
+                .map(|cf| custom_field_value_out(boundary, cf.id, &cf.name, cf.value.as_ref()))
                 .collect()
         }),
         created_on: issue.created_on,
@@ -1860,7 +1879,7 @@ impl RedmineMcp {
 
     /// `POST /issues.json`.
     #[tool(
-        description = "Create a new Redmine issue. Use this to add a task, bug, or feature request to a project. Only project_id and subject are required; every other field defaults to the project's/tracker's own default when omitted. Write tool; blocked in read-only mode.",
+        description = "Create a new Redmine issue. Use this to add a task, bug, or feature request to a project. Only project_id and subject are required; every other field defaults to the project's/tracker's own default when omitted. A rejected required custom field may be autofilled once and reported in autofilled_custom_fields, if the operator enabled that. Write tool; blocked in read-only mode.",
         input_schema = crate::tools::schema::input::<CreateRedmineIssueParams>(),
         output_schema = crate::tools::schema::output::<CreateRedmineIssueOutput>(),
         annotations(
@@ -1910,8 +1929,8 @@ impl RedmineMcp {
             Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
         };
 
-        let create = IssueCreate {
-            project_id,
+        let mut create = IssueCreate {
+            project_id: project_id.clone(),
             subject: params.subject,
             tracker_id: params.tracker_id,
             status_id: params.status_id,
@@ -1931,9 +1950,30 @@ impl RedmineMcp {
             custom_fields,
         };
 
-        let mut issue = match scoped.create_issue(&create).await {
-            Ok(issue) => issue,
-            Err(e) => return Ok(to_tool_error(e)),
+        let (mut issue, autofilled) = match scoped.create_issue(&create).await {
+            Ok(issue) => (issue, None),
+            Err(e) => match recover_required_fields(
+                &scoped,
+                AutofillTarget::Create(&project_id),
+                create.custom_fields.clone(),
+                &self.inner.config.custom_fields,
+                &e,
+            )
+            .await
+            {
+                None => return Ok(to_tool_error(e)),
+                Some(RequiredFieldRecovery::GiveUp(result)) => return Ok(result),
+                Some(RequiredFieldRecovery::Retry { merged, fills }) => {
+                    create.custom_fields = Some(merged);
+                    match scoped.create_issue(&create).await {
+                        Ok(issue) => (issue, Some(fills)),
+                        Err(e2) => {
+                            return Ok(retry_still_missing_required_fields(&e2)
+                                .unwrap_or_else(|| to_tool_error(e2)));
+                        }
+                    }
+                }
+            },
         };
         if !attachment_ids.is_empty() {
             match fetch_attachments(&scoped, &attachment_ids).await {
@@ -1955,10 +1995,17 @@ impl RedmineMcp {
             None,
             self.inner.config.plugins.tags,
         );
+        let autofilled_custom_fields = autofilled.map(|fills| {
+            fills
+                .into_iter()
+                .map(|f| custom_field_value_out(&boundary, f.id, &f.name, Some(&f.value)))
+                .collect()
+        });
         Ok(output::ok(
             &CreateRedmineIssueOutput {
                 success: true,
                 issue: issue_out,
+                autofilled_custom_fields,
             },
             self.output_caps(),
         ))
@@ -1966,7 +2013,7 @@ impl RedmineMcp {
 
     /// `PUT /issues/{id}.json`, then a follow-up `GET`.
     #[tool(
-        description = "Update fields on an existing issue, or add a note to its history. Use this when a field needs to change or a comment should be added; omit any parameter to leave that field unchanged. Write tool; blocked in read-only mode.",
+        description = "Update fields on an existing issue, or add a note to its history. Use this when a field needs to change or a comment should be added; omit any parameter to leave that field unchanged. If the operator enabled required-custom-field autofill, a rejected required custom field may be filled from its default and reported in autofilled_custom_fields, at most once. Write tool; blocked in read-only mode.",
         input_schema = crate::tools::schema::input::<UpdateRedmineIssueParams>(),
         output_schema = crate::tools::schema::output::<UpdateRedmineIssueOutput>(),
         annotations(
@@ -2043,7 +2090,7 @@ impl RedmineMcp {
             Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
         };
 
-        let patch = IssueUpdate {
+        let mut patch = IssueUpdate {
             subject: params.subject,
             description: params.description,
             tracker_id: params.tracker_id,
@@ -2067,15 +2114,38 @@ impl RedmineMcp {
 
         // The core PUT and the agile PUT are separate requests to endpoints
         // with different validation: skip the core one when only agile
-        // fields changed, rather than sending an empty patch.
-        let mut issue = if has_core_change {
+        // fields changed, rather than sending an empty patch. Only this
+        // branch can 422 on a required custom field, so only it goes
+        // through the autofill recovery below.
+        let (mut issue, autofilled) = if has_core_change {
             match scoped.update_issue(IssueId(params.issue_id), &patch).await {
-                Ok(issue) => issue,
-                Err(e) => return Ok(to_tool_error(e)),
+                Ok(issue) => (issue, None),
+                Err(e) => match recover_required_fields(
+                    &scoped,
+                    AutofillTarget::Update(IssueId(params.issue_id)),
+                    patch.custom_fields.clone(),
+                    &self.inner.config.custom_fields,
+                    &e,
+                )
+                .await
+                {
+                    None => return Ok(to_tool_error(e)),
+                    Some(RequiredFieldRecovery::GiveUp(result)) => return Ok(result),
+                    Some(RequiredFieldRecovery::Retry { merged, fills }) => {
+                        patch.custom_fields = Some(merged);
+                        match scoped.update_issue(IssueId(params.issue_id), &patch).await {
+                            Ok(issue) => (issue, Some(fills)),
+                            Err(e2) => {
+                                return Ok(retry_still_missing_required_fields(&e2)
+                                    .unwrap_or_else(|| to_tool_error(e2)));
+                            }
+                        }
+                    }
+                },
             }
         } else {
             match scoped.get_issue(IssueId(params.issue_id), &[]).await {
-                Ok(issue) => issue,
+                Ok(issue) => (issue, None),
                 Err(e) => return Ok(to_tool_error(e)),
             }
         };
@@ -2127,10 +2197,17 @@ impl RedmineMcp {
             agile_out.as_ref(),
             self.inner.config.plugins.tags,
         );
+        let autofilled_custom_fields = autofilled.map(|fills| {
+            fills
+                .into_iter()
+                .map(|f| custom_field_value_out(&boundary, f.id, &f.name, Some(&f.value)))
+                .collect()
+        });
         Ok(output::ok(
             &UpdateRedmineIssueOutput {
                 success: true,
                 issue: issue_out,
+                autofilled_custom_fields,
             },
             self.output_caps(),
         ))

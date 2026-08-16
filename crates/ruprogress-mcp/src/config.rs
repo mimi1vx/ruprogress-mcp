@@ -38,6 +38,9 @@ pub struct Config {
     /// Which JSON Schema dialect served tool `inputSchema`s use
     /// (`REDMINE_MCP_SCHEMA_DIALECT`, default `strict`).
     pub schema_dialect: SchemaDialect,
+    /// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS` /
+    /// `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
+    pub custom_fields: CustomFieldConfig,
 }
 
 /// Which JSON Schema dialect served `inputSchema`s use. `outputSchema` is
@@ -263,6 +266,27 @@ pub struct AttachmentConfig {
     pub public_url_rewrite: Option<Url>,
 }
 
+/// One entry of `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`: a plain string, or
+/// an array of strings for a `multiple = true` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomFieldDefaultValue {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+/// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS` /
+/// `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`: recovery values for a required
+/// issue custom field Redmine rejected as blank. `defaults` is keyed by the
+/// name exactly as given in the JSON object — matching against a Redmine
+/// custom field's display name is case-/punctuation-insensitive and happens
+/// where every other such match already happens, in
+/// `tools::custom_fields`, not here.
+#[derive(Debug, Clone, Default)]
+pub struct CustomFieldConfig {
+    pub autofill_required: bool,
+    pub defaults: BTreeMap<String, CustomFieldDefaultValue>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{var} is required because {because}")]
@@ -432,6 +456,78 @@ fn parse_mcp_path(vars: &EnvMap) -> Result<String, ConfigError> {
         return Err(invalid("the path contains whitespace"));
     }
     Ok(path)
+}
+
+/// Parses `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`: a JSON object mapping a
+/// custom field name to a default value (a string, or an array of strings
+/// for a `multiple = true` field). Same "set but empty must not collapse
+/// into unset" rule as [`parse_csv`]: `{}` is rejected, not silently ignored.
+/// Never echoes the configured name or value in an error — both can be
+/// business-sensitive (F34's redaction concern extends to a boot error a
+/// misconfigured deployment might forward to a log aggregator).
+fn parse_custom_field_defaults(
+    vars: &EnvMap,
+) -> Result<BTreeMap<String, CustomFieldDefaultValue>, ConfigError> {
+    const VAR: &str = "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS";
+    let Some(raw) = optional(vars, VAR) else {
+        return Ok(BTreeMap::new());
+    };
+    let invalid = |because: &'static str| ConfigError::Invalid {
+        var: VAR,
+        expected: "a JSON object mapping custom field name to a string or an array of strings",
+        because: because.to_string(),
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| invalid("the value is not valid JSON"))?;
+    let serde_json::Value::Object(map) = parsed else {
+        return Err(invalid("the value is not a JSON object"));
+    };
+    if map.is_empty() {
+        return Err(invalid(
+            "the object has no entries; unset the variable instead of setting it empty",
+        ));
+    }
+    let mut defaults = BTreeMap::new();
+    for (name, value) in map {
+        let parsed_value = match value {
+            serde_json::Value::String(s) => CustomFieldDefaultValue::Single(s),
+            serde_json::Value::Array(items) => {
+                let mut strings = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        serde_json::Value::String(s) => strings.push(s),
+                        _ => {
+                            return Err(invalid("an array entry is not a string"));
+                        }
+                    }
+                }
+                CustomFieldDefaultValue::Multiple(strings)
+            }
+            _ => {
+                return Err(invalid(
+                    "an entry's value is neither a string nor an array of strings",
+                ));
+            }
+        };
+        defaults.insert(name, parsed_value);
+    }
+    Ok(defaults)
+}
+
+fn parse_custom_fields(vars: &EnvMap) -> Result<CustomFieldConfig, ConfigError> {
+    let autofill_required = optional_bool(vars, "REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", false)?;
+    let defaults = parse_custom_field_defaults(vars)?;
+    if !autofill_required && !defaults.is_empty() {
+        tracing::warn!(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS is set but \
+             REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS is not true; the configured defaults will \
+             never be used"
+        );
+    }
+    Ok(CustomFieldConfig {
+        autofill_required,
+        defaults,
+    })
 }
 
 /// Splits a comma-separated variable, rejecting a value that is present but
@@ -1176,6 +1272,7 @@ impl Config {
                 DEFAULT_MAX_RESPONSE_BYTES,
             )?,
             schema_dialect: parse_schema_dialect(vars)?,
+            custom_fields: parse_custom_fields(vars)?,
         })
     }
 
@@ -1260,6 +1357,8 @@ impl Config {
             "read_only_mode": self.read_only,
             "plugin_flags": self.plugin_flags_json(),
             "schema_dialect": self.schema_dialect_label(),
+            "autofill_required_custom_fields": self.custom_fields.autofill_required,
+            "required_custom_field_defaults_count": self.custom_fields.defaults.len(),
         })
     }
 }
@@ -1982,6 +2081,170 @@ mod tests {
         let summary = config.redacted_summary().to_string();
         assert!(!summary.contains(SECRET));
         assert!(summary.contains("redmine.example.com"));
+    }
+
+    // --- custom-field autofill -------------------------------------------
+
+    #[test]
+    fn autofill_required_custom_fields_defaults_to_false() {
+        let config = Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("valid");
+        assert!(!config.custom_fields.autofill_required);
+        assert!(config.custom_fields.defaults.is_empty());
+    }
+
+    #[test]
+    fn required_custom_field_defaults_accepts_string_and_array_values() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Department": "Engineering", "Tags": ["a", "b"]}"#.to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("valid");
+        assert_eq!(
+            config.custom_fields.defaults.get("Department"),
+            Some(&CustomFieldDefaultValue::Single("Engineering".to_string()))
+        );
+        assert_eq!(
+            config.custom_fields.defaults.get("Tags"),
+            Some(&CustomFieldDefaultValue::Multiple(vec![
+                "a".to_string(),
+                "b".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn required_custom_field_defaults_rejects_invalid_json() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            "not json".to_string(),
+        );
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Invalid {
+                var: "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn required_custom_field_defaults_rejects_a_top_level_array() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"["Department"]"#.to_string(),
+        );
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Invalid {
+                var: "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn required_custom_field_defaults_rejects_a_nested_object_value() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Department": {"nested": true}}"#.to_string(),
+        );
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Invalid {
+                var: "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn required_custom_field_defaults_rejects_a_numeric_value() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Department": 42}"#.to_string(),
+        );
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Invalid {
+                var: "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn required_custom_field_defaults_rejects_an_empty_object() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            "{}".to_string(),
+        );
+        assert!(matches!(
+            Config::from_map(&vars, TransportKind::Stdio),
+            Err(ConfigError::Invalid {
+                var: "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn required_custom_field_defaults_empty_string_is_unset_not_an_error() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            String::new(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("valid");
+        assert!(config.custom_fields.defaults.is_empty());
+    }
+
+    #[test]
+    fn required_custom_field_defaults_without_autofill_is_accepted() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Department": "Engineering"}"#.to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("valid");
+        assert!(!config.custom_fields.autofill_required);
+        assert!(!config.custom_fields.defaults.is_empty());
+    }
+
+    #[test]
+    fn no_config_error_message_from_custom_field_defaults_contains_the_configured_value() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Very Secret Field Name": 42}"#.to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(!format!("{err}").contains("Very Secret Field Name"));
+    }
+
+    #[test]
+    fn redacted_summary_reports_the_autofill_flag_and_defaults_count_but_not_their_contents() {
+        let mut vars = valid_legacy();
+        vars.insert(
+            "REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS".to_string(),
+            "true".to_string(),
+        );
+        vars.insert(
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS".to_string(),
+            r#"{"Cost Centre": "12345-secret"}"#.to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("valid");
+        let summary = config.redacted_summary();
+        assert_eq!(summary["autofill_required_custom_fields"], true);
+        assert_eq!(summary["required_custom_field_defaults_count"], 1);
+        let rendered = summary.to_string();
+        assert!(!rendered.contains("Cost Centre"));
+        assert!(!rendered.contains("12345-secret"));
     }
 
     // --- HTTP transport -------------------------------------------------

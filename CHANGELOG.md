@@ -103,6 +103,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a clear error, not silently dropped or passed through. A
   `custom_fields`-only update is accepted, not rejected as a no-op; an
   empty array is not.
+- `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true` recovers from a 422 naming a
+  required issue custom field as blank or invalid: `create_redmine_issue`/
+  `update_redmine_issue` retry the write **exactly once**, filled from the
+  field's own `default_value` or from the new
+  `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS` map, and report what was filled
+  as `autofilled_custom_fields`. A caller-supplied value Redmine rejected as
+  empty or outside the field's allowed values is replaced the same way; a
+  valid value is never touched. Never a guess from the field's other allowed
+  values, never a second retry. With the flag off (the default, unchanged
+  from G8's payoff above) or when nothing is fillable, the 422 still gains
+  `missing_required_fields` and a hint. `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`
+  fails the boot on invalid JSON, a non-object, or a non-string/array value;
+  neither its keys nor its values ever reach a log line, `--print-config`, or
+  `get_mcp_server_info` — only their count. Matching Redmine's validation
+  message text is English-only.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

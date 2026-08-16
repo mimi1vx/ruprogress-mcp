@@ -26,7 +26,9 @@ use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::config::{CustomFieldConfig, CustomFieldDefaultValue};
 use crate::error::to_tool_error;
+use crate::tools::output::{self, ErrorCode};
 
 // --- shared write-side shape (products/contacts/dmsf): id-only, no null ---
 
@@ -324,6 +326,318 @@ pub(crate) async fn resolve_issue_custom_fields_for_update(
     resolve_issue_custom_fields(scoped, &project_id, Some(entries)).await
 }
 
+// --- recovering from a rejected required custom field ---
+
+/// One field named in a 422 response as blank, invalid, or outside its
+/// allowed values — the part of the message before the marker that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingField {
+    pub(crate) label: String,
+}
+
+/// Redmine 422 message markers recognized as "this field has a problem
+/// autofill might fix", tried in order. Rails' actual blank-field message is
+/// `can't be blank`; `cannot be blank` is kept too in case a customized
+/// validator uses it. Matching is case-insensitive; the label is everything
+/// before the marker.
+const REQUIRED_FIELD_MARKERS: &[&str] = &[
+    "can't be blank",
+    "cannot be blank",
+    "is not included in the list",
+    "is invalid",
+];
+
+/// Extracts every `"<label> <marker>"` message in `errors` as a
+/// [`MissingField`], stripping an optional `"Validation failed: "` prefix
+/// first. A 422 whose messages match none of `REQUIRED_FIELD_MARKERS` yields
+/// an empty vec — not every validation failure names a fillable field.
+pub(crate) fn parse_required_field_errors(errors: &[String]) -> Vec<MissingField> {
+    errors
+        .iter()
+        .filter_map(|raw| {
+            let text = raw.strip_prefix("Validation failed: ").unwrap_or(raw);
+            let lower = text.to_ascii_lowercase();
+            REQUIRED_FIELD_MARKERS.iter().find_map(|marker| {
+                lower.find(marker).map(|idx| MissingField {
+                    label: text[..idx].trim().to_string(),
+                })
+            })
+        })
+        .collect()
+}
+
+/// Redmine's field labels for the standard issue attributes
+/// `create_redmine_issue`/`update_redmine_issue` expose directly — enough to
+/// tell "a core field failed" from "a custom field failed" for the error
+/// hint below, not an exhaustive Redmine list. A label missing from this
+/// list only costs a slightly-off hint, never a wrong write.
+const CORE_ISSUE_FIELD_LABELS: &[&str] = &[
+    "Subject",
+    "Description",
+    "Tracker",
+    "Status",
+    "Priority",
+    "Assignee",
+    "Category",
+    "Target version",
+    "Parent task",
+    "Start date",
+    "Due date",
+    "Estimated time",
+    "Done ratio",
+    "Is private",
+    "Spent time",
+];
+
+fn looks_like_custom_field(label: &str) -> bool {
+    !CORE_ISSUE_FIELD_LABELS
+        .iter()
+        .any(|core| core.eq_ignore_ascii_case(label))
+}
+
+/// The in-band answer to a required-field 422 that autofill did not (or
+/// could not) recover: `missing_required_fields` plus a hint that depends on
+/// whether any named field looks like a custom field, and — for a custom
+/// field, only when autofill is off — a pointer at the env var that would
+/// enable it.
+fn required_field_error(missing: &[MissingField], autofill_enabled: bool) -> CallToolResult {
+    let labels: Vec<&str> = missing.iter().map(|f| f.label.as_str()).collect();
+    let any_custom = missing.iter().any(|f| looks_like_custom_field(&f.label));
+    let hint = if !any_custom {
+        "these are standard issue fields, not custom fields; look up a valid value with the \
+         discovery tools (list_redmine_trackers, list_redmine_issue_statuses, ...) and set it \
+         explicitly"
+    } else if autofill_enabled {
+        "these look like custom fields with no usable default; call \
+         list_project_issue_custom_fields to see the allowed values and set them explicitly"
+    } else {
+        "these look like custom fields; set them explicitly (call \
+         list_project_issue_custom_fields to see the allowed values), or ask the operator to set \
+         REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS=true"
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "missing_required_fields".to_string(),
+        serde_json::Value::Array(
+            labels
+                .iter()
+                .map(|l| serde_json::Value::String((*l).to_string()))
+                .collect(),
+        ),
+    );
+    output::err_with(
+        ErrorCode::ValidationFailed,
+        format!(
+            "Redmine rejected the request: missing or invalid required field(s): {}",
+            labels.join(", ")
+        ),
+        Some(hint),
+        extra,
+    )
+}
+
+/// A value recovered for one required field, ready to merge into the
+/// retried write and to report back to the caller.
+pub(crate) struct Fill {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) value: CustomFieldValue,
+}
+
+/// The field's own `default_value` first, then the configured defaults map
+/// — matched against `def`'s normalized name the same way every other
+/// lookup in this module matches names. Returns the candidate as a
+/// `Vec<String>` (one entry for a single-valued field) so the caller can
+/// check `possible_values` membership uniformly for single and multi-value
+/// fields. `None` means neither source has anything usable.
+fn pick_candidate(def: &CustomFieldDefinition, cfg: &CustomFieldConfig) -> Option<Vec<String>> {
+    if let Some(default) = &def.default_value
+        && !default.is_empty()
+    {
+        return Some(vec![default.clone()]);
+    }
+    let normalized = normalize_field_name(&def.name);
+    let (_, value) = cfg
+        .defaults
+        .iter()
+        .find(|(name, _)| normalize_field_name(name) == normalized)?;
+    match value {
+        CustomFieldDefaultValue::Single(s) if !s.is_empty() => Some(vec![s.clone()]),
+        CustomFieldDefaultValue::Multiple(items) if !items.is_empty() => Some(items.clone()),
+        CustomFieldDefaultValue::Single(_) | CustomFieldDefaultValue::Multiple(_) => None,
+    }
+}
+
+/// Computes a recovery value for each field in `missing` that resolves to a
+/// known issue custom field definition and has a usable default. A field
+/// with no matching definition (e.g. a standard field, or one this
+/// project/tracker does not carry), or whose only candidate value is empty
+/// or outside a restricted `possible_values` list, produces no [`Fill`] —
+/// an empty result means there is nothing to retry with.
+pub(crate) fn compute_autofill(
+    defs: &[CustomFieldDefinition],
+    missing: &[MissingField],
+    cfg: &CustomFieldConfig,
+) -> Vec<Fill> {
+    missing
+        .iter()
+        .filter_map(|field| {
+            let normalized = normalize_field_name(&field.label);
+            let def = defs
+                .iter()
+                .find(|d| normalize_field_name(&d.name) == normalized)?;
+            let candidate = pick_candidate(def, cfg)?;
+            if let Some(possible) = &def.possible_values
+                && !possible.is_empty()
+                && !candidate.iter().all(|v| possible.contains(v))
+            {
+                return None;
+            }
+            let value = if def.multiple.unwrap_or(false) {
+                CustomFieldValue::Multiple(candidate)
+            } else {
+                CustomFieldValue::Single(candidate.into_iter().next())
+            };
+            Some(Fill {
+                id: def.id,
+                name: def.name.clone(),
+                value,
+            })
+        })
+        .collect()
+}
+
+/// Overlays `fills` onto `existing` by field id: a field already present is
+/// updated in place (it was just proven invalid, so its prior value — set by
+/// the caller or absent — is replaced), everything else is appended.
+fn merge_fills(existing: Option<Vec<CustomFieldWrite>>, fills: &[Fill]) -> Vec<CustomFieldWrite> {
+    let mut merged = existing.unwrap_or_default();
+    for fill in fills {
+        if let Some(entry) = merged.iter_mut().find(|e| e.id == fill.id) {
+            entry.value = fill.value.clone();
+        } else {
+            merged.push(CustomFieldWrite {
+                id: fill.id,
+                value: fill.value.clone(),
+            });
+        }
+    }
+    merged
+}
+
+/// Which Redmine resource anchors the definitions lookup a retry needs: a
+/// new issue already carries its project reference; an existing issue's
+/// parameters carry only its id, so its project is learned via a dedicated
+/// read first.
+pub(crate) enum AutofillTarget<'a> {
+    Create(&'a ProjectIdent),
+    Update(IssueId),
+}
+
+/// Always fetches fresh, even when resolving `custom_fields` by name just
+/// fetched the same project's definitions moments earlier — reusing that
+/// result would couple the two paths together to save one request on a
+/// failure path.
+async fn fetch_definitions_for_autofill(
+    scoped: &Scoped<'_>,
+    target: &AutofillTarget<'_>,
+) -> redmine_client::Result<Vec<CustomFieldDefinition>> {
+    let project_id = match target {
+        AutofillTarget::Create(id) => (*id).clone(),
+        AutofillTarget::Update(issue_id) => {
+            let issue = scoped.get_issue(*issue_id, &[]).await?;
+            ProjectIdent::Id(ProjectId(issue.project.id))
+        }
+    };
+    let project = scoped
+        .get_project(&project_id, &[ProjectInclude::IssueCustomFields])
+        .await?;
+    Ok(project.issue_custom_fields.unwrap_or_default())
+}
+
+/// What to do about a write that just failed, decided once and handed back
+/// to the caller — which performs the actual retry itself. Keeping the
+/// second HTTP call at the two tool call sites (rather than behind a generic
+/// retry-callback abstraction here) sidesteps a `Send`-bound conflict
+/// between an async closure's borrowed captures and the `#[tool]` macro's
+/// generated future; the caller still only ever issues the second write
+/// inside the single `Retry` arm below, so "exactly one retry, never a
+/// loop" stays a property you can see by reading that one call site.
+pub(crate) enum RequiredFieldRecovery {
+    /// Not recoverable, or autofill is off: return this in-band error as
+    /// the tool's result.
+    GiveUp(CallToolResult),
+    /// Retry the write with these merged custom fields; if it succeeds,
+    /// report `fills` as `autofilled_custom_fields`.
+    Retry {
+        merged: Vec<CustomFieldWrite>,
+        fills: Vec<Fill>,
+    },
+}
+
+/// Inspects a failed write's error for a recoverable required-field
+/// rejection and decides what to do. Returns `None` when autofill has
+/// nothing to say about this error at all (not a 422, or a 422 that names no
+/// fillable field) — the caller falls back to the ordinary error envelope.
+pub(crate) async fn recover_required_fields(
+    scoped: &Scoped<'_>,
+    target: AutofillTarget<'_>,
+    custom_fields: Option<Vec<CustomFieldWrite>>,
+    cfg: &CustomFieldConfig,
+    error: &redmine_client::Error,
+) -> Option<RequiredFieldRecovery> {
+    let redmine_client::Error::Api { status, errors } = error else {
+        return None;
+    };
+    if *status != http::StatusCode::UNPROCESSABLE_ENTITY {
+        return None;
+    }
+    let missing = parse_required_field_errors(errors);
+    if missing.is_empty() {
+        return None;
+    }
+    if !cfg.autofill_required {
+        return Some(RequiredFieldRecovery::GiveUp(required_field_error(
+            &missing, false,
+        )));
+    }
+
+    let Ok(defs) = fetch_definitions_for_autofill(scoped, &target).await else {
+        return Some(RequiredFieldRecovery::GiveUp(required_field_error(
+            &missing, true,
+        )));
+    };
+    let fills = compute_autofill(&defs, &missing, cfg);
+    if fills.is_empty() {
+        return Some(RequiredFieldRecovery::GiveUp(required_field_error(
+            &missing, true,
+        )));
+    }
+
+    let merged = merge_fills(custom_fields, &fills);
+    Some(RequiredFieldRecovery::Retry { merged, fills })
+}
+
+/// After a retried write also fails, decides whether that second error is
+/// itself an (unrecoverable) required-field 422 worth the enriched envelope,
+/// or an ordinary failure the caller should map with [`to_tool_error`]
+/// instead. There is no third attempt under either outcome.
+pub(crate) fn retry_still_missing_required_fields(
+    error: &redmine_client::Error,
+) -> Option<CallToolResult> {
+    let redmine_client::Error::Api { status, errors } = error else {
+        return None;
+    };
+    if *status != http::StatusCode::UNPROCESSABLE_ENTITY {
+        return None;
+    }
+    let missing = parse_required_field_errors(errors);
+    if missing.is_empty() {
+        return None;
+    }
+    Some(required_field_error(&missing, true))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -440,5 +754,253 @@ mod tests {
         };
         let out = resolve_entries(None, vec![entry]).unwrap();
         assert_eq!(out[0].value, CustomFieldValue::Single(None));
+    }
+
+    // --- parse_required_field_errors ---
+
+    #[test]
+    fn parses_rails_actual_blank_wording() {
+        let missing = parse_required_field_errors(&["Subject can't be blank".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Subject".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_the_umbrella_spelling_too() {
+        let missing = parse_required_field_errors(&["Department cannot be blank".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Department".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_not_included_in_the_list() {
+        let missing =
+            parse_required_field_errors(&["Severity is not included in the list".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Severity".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_is_invalid() {
+        let missing = parse_required_field_errors(&["Start date is invalid".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Start date".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn strips_a_validation_failed_prefix() {
+        let missing =
+            parse_required_field_errors(&["Validation failed: Subject can't be blank".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Subject".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_a_multi_word_label() {
+        let missing = parse_required_field_errors(&["Story Points can't be blank".to_string()]);
+        assert_eq!(
+            missing,
+            vec![MissingField {
+                label: "Story Points".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_422_that_names_no_fillable_field_yields_an_empty_vec() {
+        let missing = parse_required_field_errors(&[
+            "Issue relations conflict with an existing relation".to_string(),
+        ]);
+        assert!(missing.is_empty());
+    }
+
+    // --- compute_autofill ---
+
+    fn def_with(
+        id: u64,
+        name: &str,
+        default_value: Option<&str>,
+        possible_values: Option<&[&str]>,
+        multiple: bool,
+    ) -> CustomFieldDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "field_format": "string",
+            "default_value": default_value,
+            "possible_values": possible_values.map(|values| {
+                values.iter().map(|v| serde_json::json!({"value": v})).collect::<Vec<_>>()
+            }),
+            "multiple": multiple,
+        }))
+        .unwrap()
+    }
+
+    fn missing(label: &str) -> MissingField {
+        MissingField {
+            label: label.to_string(),
+        }
+    }
+
+    fn cfg_with_defaults(pairs: &[(&str, CustomFieldDefaultValue)]) -> CustomFieldConfig {
+        CustomFieldConfig {
+            autofill_required: true,
+            defaults: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn uses_the_definitions_own_default_value() {
+        let defs = vec![def_with(1, "Department", Some("Engineering"), None, false)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].id, 1);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Single(Some("Engineering".to_string()))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_configured_map_when_no_default_value() {
+        let defs = vec![def_with(1, "Department", None, None, false)];
+        let cfg = cfg_with_defaults(&[(
+            "Department",
+            CustomFieldDefaultValue::Single("Sales".to_string()),
+        )]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Single(Some("Sales".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_definitions_own_default_wins_over_the_configured_map() {
+        let defs = vec![def_with(1, "Department", Some("Engineering"), None, false)];
+        let cfg = cfg_with_defaults(&[(
+            "Department",
+            CustomFieldDefaultValue::Single("Sales".to_string()),
+        )]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Single(Some("Engineering".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_candidate_outside_possible_values_produces_no_fill() {
+        let defs = vec![def_with(
+            1,
+            "Severity",
+            Some("Unlisted"),
+            Some(&["Low", "High"]),
+            false,
+        )];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Severity")], &cfg);
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn a_multiple_field_wraps_a_single_candidate_into_an_array() {
+        let defs = vec![def_with(1, "Tags", Some("blue"), None, true)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Tags")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Multiple(vec!["blue".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_field_with_no_source_produces_no_fill() {
+        let defs = vec![def_with(1, "Department", None, None, false)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn a_label_matching_no_definition_produces_no_fill() {
+        let defs = vec![def_with(1, "Department", Some("Engineering"), None, false)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Subject")], &cfg);
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn nothing_fillable_yields_an_empty_vec() {
+        let defs = vec![def_with(1, "Department", None, None, false)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Subject"), missing("Department")], &cfg);
+        assert!(fills.is_empty());
+    }
+
+    // --- required_field_error ---
+
+    #[test]
+    fn core_field_only_gets_the_standard_field_hint() {
+        let result = required_field_error(&[missing("Subject")], false);
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["missing_required_fields"],
+            serde_json::json!(["Subject"])
+        );
+        assert!(
+            structured["hint"]
+                .as_str()
+                .unwrap()
+                .contains("discovery tools")
+        );
+    }
+
+    #[test]
+    fn custom_field_with_autofill_off_names_the_env_var() {
+        let result = required_field_error(&[missing("Department")], false);
+        let structured = result.structured_content.unwrap();
+        assert!(
+            structured["hint"]
+                .as_str()
+                .unwrap()
+                .contains("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS")
+        );
+    }
+
+    #[test]
+    fn custom_field_with_autofill_on_does_not_repeat_the_env_var() {
+        let result = required_field_error(&[missing("Department")], true);
+        let structured = result.structured_content.unwrap();
+        assert!(
+            !structured["hint"]
+                .as_str()
+                .unwrap()
+                .contains("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS")
+        );
     }
 }

@@ -32,6 +32,12 @@ pub(crate) struct ServerInfoOutput {
     /// `REDMINE_OAUTH_SCOPE_ENFORCEMENT`'s effective value; `null` outside
     /// `oauth` mode, where the setting does not apply.
     pub(crate) oauth_scope_enforcement: Option<bool>,
+    /// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS`'s effective value.
+    pub(crate) autofill_required_custom_fields: bool,
+    /// How many fields `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS` configures —
+    /// never the field names or values themselves, which can be
+    /// business-sensitive.
+    pub(crate) required_custom_field_defaults_count: usize,
 }
 
 #[tool_router(router = meta_tool_router, vis = "pub(crate)")]
@@ -74,6 +80,8 @@ impl RedmineMcp {
                 AuthMode::OAuth(oauth) => Some(oauth.scope_enforcement),
                 AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
             },
+            autofill_required_custom_fields: self.inner.config.custom_fields.autofill_required,
+            required_custom_field_defaults_count: self.inner.config.custom_fields.defaults.len(),
         };
         Ok(output::ok(&output, self.output_caps()))
     }

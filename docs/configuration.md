@@ -36,6 +36,8 @@ real process environment.
 | `REDMINE_CRM_ENABLED` | no | `false` | `plugin_flags.crm`. `true` registers `manage_contact` (RedmineUP CRM plugin); `false` (the default) de-registers it from the router entirely — absent from `tools/list`, and `tools/call` fails with "tool not found", not an in-band error. |
 | `REDMINE_DMSF_ENABLED` | no | `false` | `plugin_flags.dmsf`. `true` registers `manage_document` (`redmine_dmsf` plugin, open source but still needs a server-side install); `false` (the default) de-registers it from the router entirely — absent from `tools/list`, and `tools/call` fails with "tool not found", not an in-band error. |
 | `REDMINE_TAGS_ENABLED` | no | `false` | `plugin_flags.tags` (`get_mcp_server_info`). Adds no new tools — `true` makes `get_redmine_issue` report an issue's `tags` (AlphaNodes `additional_tags` plugin) and lets `create_redmine_issue`/`update_redmine_issue` replace them via `tag_list`; `false` (the default) makes `tags` absent from `get_redmine_issue` and `tag_list` fail with `MISCONFIGURED` before any write happens. |
+| `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS` | no | `false` | When `create_redmine_issue`/`update_redmine_issue` hit a 422 naming a required issue custom field as blank or invalid, retry the write **exactly once** with a value filled from the field's own `default_value` or from `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`, reported back as `autofilled_custom_fields`. `false` (the default) skips the retry; the 422 is still enriched with `missing_required_fields` and a hint. Matching Redmine's validation message text is English-only — a non-English Redmine locale falls back to the plain 422. |
+| `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS` | no | unset | A JSON object mapping a custom field's display name to a default value (a string, or an array of strings for a `multiple = true` field), used only when the field has no `default_value` of its own and only when autofill is enabled. Invalid JSON, a non-object, `{}`, or a value that is neither a string nor an array of strings fails the boot, naming the accepted form — this is the codebase's only map-valued env var, and a silently-ignored typo here is a safety feature that never worked. Neither the configured names nor their values appear in `--print-config`, `get_mcp_server_info`, `/readyz`, or any log line — only their count. Setting this with autofill off is accepted and logs a `WARN`; the map is simply unused. |
 
 ### HTTP transport (`--transport http` only)
 
@@ -97,9 +99,7 @@ them today has no effect.
 `REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
 `REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
 `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,
-`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`),
-`REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS`,
-`REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
+`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`).
 
 The 8 attachment-related variables are validated and read (see "Attachment
 store" below). `get_redmine_attachment`

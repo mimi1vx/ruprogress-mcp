@@ -274,6 +274,30 @@ pub(crate) fn err(
     CallToolResult::structured_error(payload)
 }
 
+/// Like [`err`], but merges `extra` keys into the same four-key envelope.
+/// The base shape (`error`, `code`, `retryable`, `hint`) is a documented
+/// contract; this is the one place that extends it, so a tool that needs to
+/// say more does it here rather than with an ad-hoc `json!` at the call
+/// site. `outputSchema` still describes the success payload only — error
+/// results, extended or not, are exempt from output-schema validation.
+pub(crate) fn err_with(
+    code: ErrorCode,
+    message: impl Into<String>,
+    hint: Option<&str>,
+    extra: serde_json::Map<String, Value>,
+) -> CallToolResult {
+    let mut payload = serde_json::json!({
+        "error": message.into(),
+        "code": code,
+        "retryable": code.is_retryable(),
+        "hint": hint,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        obj.extend(extra);
+    }
+    CallToolResult::structured_error(payload)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
