@@ -78,9 +78,19 @@ pub mod write_tools {
     ///
     /// `manage_redmine_wiki_page`: `list`/`get` are reads,
     /// `create`/`update`/`delete`/`rename` are writes.
+    ///
+    /// `manage_product`/`manage_contact` (`RedmineUP` Products/CRM plugins):
+    /// `list`/`get` are reads; `create`/`update` (`manage_product`) and
+    /// `create`/`update`/`delete`/`assign_to_project`/
+    /// `remove_from_project` (`manage_contact`) are writes. Both exist in
+    /// the router only when their respective `REDMINE_PRODUCTS_ENABLED`/
+    /// `REDMINE_CRM_ENABLED` flag is on — see `server.rs`'s `PLUGIN_TOOLS`
+    /// gating, a separate mechanism from this list that runs first.
     pub const PARTIAL_WRITE: &[&str] = &[
         "manage_issue_relation",
         "manage_issue_category",
         "manage_redmine_wiki_page",
+        "manage_product",
+        "manage_contact",
     ];
 }

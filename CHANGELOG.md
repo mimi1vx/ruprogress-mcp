@@ -47,6 +47,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is synthetic, derived from the reference implementation's handling of the
   plugin rather than a live capture — see
   `crates/redmine-client/tests/fixtures/README.md`.
+- `manage_product`, registered only when `REDMINE_PRODUCTS_ENABLED=true`
+  (RedmineUP Products plugin): `list`/`get`/`create`/`update` — the plugin
+  exposes no delete endpoint. `list`/`get` work in read-only mode;
+  `create`/`update` are blocked. Flat typed parameters replace the
+  reference's untyped `fields` dict for `update`; an unknown parameter is
+  rejected rather than silently dropped, and an added `offset` parameter
+  reaches results past the reference's 100-item ceiling.
+- `manage_contact`, registered only when `REDMINE_CRM_ENABLED=true`
+  (RedmineUP CRM plugin): `list`/`get`/`create`/`update`/`delete`/
+  `assign_to_project`/`remove_from_project`. `list`/`get` work in read-only
+  mode; every other action is blocked. Same flat-typed-parameters and
+  `offset` divergence as `manage_product`. Contact PII (`email`, `phone`,
+  `address`, `birthday`, `website`) is returned to the caller unwrapped but
+  never appears in a log line or an error message (errors reference
+  `contact_id` only); display fields (name parts, `company`, `job_title`,
+  `background`, `assigned_to`'s name) are boundary-wrapped.
+  Both tools' wire shapes are synthetic, derived from the reference
+  implementation's handling of the plugins rather than a live capture
+  (both plugins are commercial) — see
+  `crates/redmine-client/tests/fixtures/README.md`.
 - `REDMINE_AUTH_MODE=oauth` now works end to end for bearer-token
   authentication: an axum middleware guards the whole `/mcp` route (including
   `initialize`), extracting the inbound `Authorization: Bearer` token and

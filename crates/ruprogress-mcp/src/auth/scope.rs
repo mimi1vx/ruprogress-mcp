@@ -202,13 +202,17 @@ pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     ("get_checklist", ScopeRule::Fixed(&[])),
     ("create_checklist_item", ScopeRule::Fixed(&[])),
     ("update_checklist_item", ScopeRule::Fixed(&[])),
+    // RedmineUP Products/CRM plugins: same reasoning as Checklists above —
+    // no scope advertised for any action, Redmine's own in-band 403 is the
+    // authorization decision (parent plan P6).
+    ("manage_product", ScopeRule::Fixed(&[])),
+    ("manage_contact", ScopeRule::Fixed(&[])),
 ];
 
 /// Tools named in `docs/tool-contract.md`/`EXPECTED_TOOLS` with no
 /// `TOOL_SCOPES` entry, because they are not registered routes yet
-/// (`manage_document`, `manage_product`, `manage_contact`, and the MCP-Apps
-/// families). Deliberately empty: the map is ported alongside the tool that
-/// needs it, never ahead of it.
+/// (`manage_document` and the MCP-Apps families). Deliberately empty: the
+/// map is ported alongside the tool that needs it, never ahead of it.
 pub const NOT_YET_IMPLEMENTED: &[&str] = &[];
 
 /// The outcome of resolving a tool call's scope requirement.

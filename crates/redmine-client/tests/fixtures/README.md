@@ -61,6 +61,12 @@ they land) are modelled differently from the pairs above:
 | `agile_data_full.json` | `GET /issues/{id}/agile_data.json` | a populated row, all fields set |
 | `agile_data_empty.json` | `GET /issues/{id}/agile_data.json` | `{"agile_data": null}` — the issue has no agile row |
 | `issue_with_tags.json` | `GET /issues/{id}.json` | `additional_tags` plugin's injected `tags` array: one tag with `id`, one without (the plugin frequently omits it — see `model::plugins::tags::IssueTag`'s doc comment). Unlike the other plugin fixtures, `additional_tags` is open-source, but the wire shape is still unverified against a live instance. |
+| `product_full.json` | `GET /products/{id}.json` | every field populated, including `custom_fields` |
+| `product_minimal.json` | `GET /products/{id}.json` | only `id`/`name`; every other field absent |
+| `products_page.json` | `GET /products.json` | two products, `total_count`/`offset`/`limit` present (R3) |
+| `contact_full.json` | `GET /contacts/{id}.json` | every field populated except `email` — omitted per the scrub policy below, same reasoning as `user_6_1.json`'s `mail` |
+| `contact_minimal.json` | `GET /contacts/{id}.json` | only `id`/`first_name`; every other field absent |
+| `contacts_page.json` | `GET /contacts.json` | two contacts, `total_count`/`offset`/`limit` present (R3) |
 
 ## Scrubbing
 

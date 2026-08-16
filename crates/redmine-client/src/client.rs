@@ -15,10 +15,10 @@ use url::Url;
 use crate::auth::Credential;
 use crate::error::Error;
 use crate::ids::{
-    AttachmentId, ChecklistItemId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectIdent,
-    RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
+    AttachmentId, ChecklistItemId, ContactId, IssueCategoryId, IssueId, JournalId, MembershipId,
+    ProductId, ProjectIdent, RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
 };
-use crate::model::plugins::{agile, checklists};
+use crate::model::plugins::{agile, checklists, crm, products};
 use crate::model::{
     BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
     issue_category, issue_status, journal, membership, project, query, relation, role, search,
@@ -1345,6 +1345,206 @@ impl Scoped<'_> {
             },
         )
         .await
+    }
+
+    /// `GET /products.json`, or `GET /projects/{pid}/products.json` when
+    /// `q.project_id` is set (`RedmineUP` Products plugin). A single
+    /// explicit page — like every other list method exposing `limit`/
+    /// `offset` directly to a tool caller, never auto-pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response is missing its pagination
+    /// envelope (a plugin version omitting `total_count`/`offset`/`limit`).
+    pub async fn list_products(
+        &self,
+        q: &products::ProductQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<products::Product>> {
+        let path = q.project_id.as_ref().map_or_else(
+            || "products.json".to_string(),
+            |project| format!("projects/{project}/products.json"),
+        );
+        self.fetch_page::<products::ProductsEnvelope>(&path, &Query::default(), limit, offset)
+            .await
+    }
+
+    /// `GET /products/{id}.json` (`RedmineUP` Products plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_product(&self, id: ProductId) -> crate::Result<products::Product> {
+        let env: products::ProductEnvelope = self
+            .get_json(&format!("products/{id}.json"), &Query::default())
+            .await?;
+        Ok(env.product)
+    }
+
+    /// `POST /products.json` (`RedmineUP` Products plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn create_product(
+        &self,
+        new: &products::ProductWrite,
+    ) -> crate::Result<products::Product> {
+        let env: products::ProductEnvelope = self
+            .post_json(
+                "products.json",
+                &products::ProductWriteEnvelope { product: new },
+            )
+            .await?;
+        Ok(env.product)
+    }
+
+    /// `PUT /products/{id}.json`, then `GET /products/{id}.json` for the
+    /// updated resource — same shape as [`Self::update_issue_category`],
+    /// since the `PUT` response body is undocumented. The Products plugin
+    /// exposes no delete endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn update_product(
+        &self,
+        id: ProductId,
+        patch: &products::ProductWrite,
+    ) -> crate::Result<products::Product> {
+        self.put_json(
+            &format!("products/{id}.json"),
+            &products::ProductWriteEnvelope { product: patch },
+        )
+        .await?;
+        self.get_product(id).await
+    }
+
+    /// `GET /contacts.json` (`RedmineUP` CRM plugin). A single explicit
+    /// page, never auto-pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, Redmine responds with a
+    /// non-success status, or the response is missing its pagination
+    /// envelope.
+    pub async fn list_contacts(
+        &self,
+        q: &crm::ContactQuery,
+        limit: u32,
+        offset: u64,
+    ) -> crate::Result<Page<crm::Contact>> {
+        self.fetch_page::<crm::ContactsEnvelope>("contacts.json", &q.to_query(), limit, offset)
+            .await
+    }
+
+    /// `GET /contacts/{id}.json?include=...` (`RedmineUP` CRM plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn get_contact(
+        &self,
+        id: ContactId,
+        include: &[crm::ContactInclude],
+    ) -> crate::Result<crm::Contact> {
+        let mut q = Query::default();
+        if let Some(value) = crm::includes_to_query_value(include) {
+            q.insert("include", value);
+        }
+        let env: crm::ContactEnvelope = self.get_json(&format!("contacts/{id}.json"), &q).await?;
+        Ok(env.contact)
+    }
+
+    /// `POST /contacts.json` (`RedmineUP` CRM plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn create_contact(&self, new: &crm::ContactWrite) -> crate::Result<crm::Contact> {
+        let env: crm::ContactEnvelope = self
+            .post_json("contacts.json", &crm::ContactWriteEnvelope { contact: new })
+            .await?;
+        Ok(env.contact)
+    }
+
+    /// `PUT /contacts/{id}.json`, then `GET /contacts/{id}.json` for the
+    /// updated resource — same shape as [`Self::update_issue_category`],
+    /// since the `PUT` response body is undocumented.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn update_contact(
+        &self,
+        id: ContactId,
+        patch: &crm::ContactWrite,
+    ) -> crate::Result<crm::Contact> {
+        self.put_json(
+            &format!("contacts/{id}.json"),
+            &crm::ContactWriteEnvelope { contact: patch },
+        )
+        .await?;
+        self.get_contact(id, &[]).await
+    }
+
+    /// `DELETE /contacts/{id}.json` (`RedmineUP` CRM plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn delete_contact(&self, id: ContactId) -> crate::Result<()> {
+        self.delete(&format!("contacts/{id}.json")).await
+    }
+
+    /// `POST /contacts/{id}/projects.json` (`RedmineUP` CRM plugin). Does
+    /// **not** create a contact — only associates an existing one with a
+    /// project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn assign_contact_to_project(
+        &self,
+        id: ContactId,
+        project: &ProjectIdent,
+    ) -> crate::Result<()> {
+        self.post_json_no_content(
+            &format!("contacts/{id}/projects.json"),
+            &crm::ProjectAssocEnvelope {
+                project: &crm::ProjectAssocWrite {
+                    project_id: project.clone(),
+                },
+            },
+        )
+        .await
+    }
+
+    /// `DELETE /contacts/{id}/projects/{pid}.json` (`RedmineUP` CRM
+    /// plugin). Does **not** delete the contact — only removes the
+    /// association with `project`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine responds with a
+    /// non-success status.
+    pub async fn remove_contact_from_project(
+        &self,
+        id: ContactId,
+        project: &ProjectIdent,
+    ) -> crate::Result<()> {
+        self.delete(&format!("contacts/{id}/projects/{project}.json"))
+            .await
     }
 
     /// `GET /time_entries.json`.

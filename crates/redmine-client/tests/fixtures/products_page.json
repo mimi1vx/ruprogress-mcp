@@ -1,0 +1,9 @@
+{
+  "products": [
+    { "id": 1, "name": "Widget", "status_id": 1 },
+    { "id": 2, "name": "Gadget", "status_id": 1 }
+  ],
+  "total_count": 2,
+  "offset": 0,
+  "limit": 100
+}

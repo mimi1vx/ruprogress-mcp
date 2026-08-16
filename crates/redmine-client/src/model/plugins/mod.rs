@@ -7,4 +7,6 @@
 
 pub mod agile;
 pub mod checklists;
+pub mod crm;
+pub mod products;
 pub mod tags;

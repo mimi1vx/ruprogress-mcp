@@ -431,7 +431,7 @@ pub(crate) struct CustomFieldValueOut {
     pub(crate) value: Option<serde_json::Value>,
 }
 
-fn custom_field_value_out(boundary: &Boundary, cf: &CustomField) -> CustomFieldValueOut {
+pub(crate) fn custom_field_value_out(boundary: &Boundary, cf: &CustomField) -> CustomFieldValueOut {
     let value = match &cf.value {
         None | Some(CustomFieldValue::Single(None)) => None,
         Some(CustomFieldValue::Single(Some(s))) => Some(serde_json::Value::String(

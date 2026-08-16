@@ -1,0 +1,29 @@
+{
+  "contact": {
+    "id": 1,
+    "first_name": "Ada",
+    "last_name": "Lovelace",
+    "middle_name": null,
+    "company": "Analytical Engines Ltd",
+    "job_title": "Mathematician",
+    "phone": "+1-555-0100",
+    "website": "https://example.test/ada",
+    "skype_name": "ada.lovelace",
+    "birthday": "1815-12-10",
+    "background": "Met at a conference.",
+    "address": {
+      "street1": "1 Main St",
+      "street2": null,
+      "city": "London",
+      "region": null,
+      "country": "UK",
+      "postcode": "SW1A 1AA"
+    },
+    "is_company": false,
+    "tags": ["vip"],
+    "visibility": 1,
+    "assigned_to": { "id": 3, "name": "Bob" },
+    "created_on": "2026-01-01T00:00:00Z",
+    "updated_on": "2026-01-02T00:00:00Z"
+  }
+}

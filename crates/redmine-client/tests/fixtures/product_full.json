@@ -1,0 +1,19 @@
+{
+  "product": {
+    "id": 1,
+    "name": "Widget",
+    "description": "A useful widget",
+    "code": "W-100",
+    "price": 19.99,
+    "currency": "USD",
+    "status_id": 1,
+    "category_id": 4,
+    "project_id": 2,
+    "tag_list": ["hardware", "featured"],
+    "custom_fields": [
+      { "id": 3, "name": "Colour", "value": "blue" }
+    ],
+    "created_on": "2026-01-01T00:00:00Z",
+    "updated_on": "2026-01-02T00:00:00Z"
+  }
+}

@@ -4,9 +4,11 @@
 //! single-valued and a JSON array of strings when `multiple = true`. This is
 //! exactly the kind of shape `#[serde(untagged)]` handles badly (useless
 //! error messages, silent wrong-arm selection on the least-specified part of
-//! the Redmine API) — so this has a manual `Deserialize`.
+//! the Redmine API) — so this has a manual `Deserialize`. The write
+//! direction (`impl Serialize`) has no such ambiguity to worry about: each
+//! variant maps to exactly one JSON shape, so it derives no such caveat.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{BareCollection, IdName};
 
@@ -18,6 +20,32 @@ pub enum CustomFieldValue {
     Single(Option<String>),
     /// A `multiple = true` field's values.
     Multiple(Vec<String>),
+}
+
+impl Serialize for CustomFieldValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Single(Some(s)) => serializer.serialize_str(s),
+            Self::Single(None) => serializer.serialize_none(),
+            Self::Multiple(values) => values.serialize(serializer),
+        }
+    }
+}
+
+/// One entry of a write-side `custom_fields` array:
+/// `{"id": N, "value": ...}`. Shared by every tool that writes custom
+/// fields — products today, issues from `7f` onward.
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomFieldWrite {
+    /// The custom field's id. Values are accepted by id only in this
+    /// crate; resolving a field by name is a tool-layer concern (it needs a
+    /// definitions lookup this crate has no opinion on).
+    pub id: u64,
+    /// The value to set.
+    pub value: CustomFieldValue,
 }
 
 impl<'de> Deserialize<'de> for CustomFieldValue {
@@ -216,6 +244,36 @@ mod tests {
             Some(vec!["S".to_string(), "M".to_string()])
         );
         assert_eq!(field.customized_type.as_deref(), Some("issue"));
+    }
+
+    #[test]
+    fn custom_field_value_serializes_each_variant_to_its_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(CustomFieldValue::Single(Some("blue".to_string()))).unwrap(),
+            serde_json::json!("blue")
+        );
+        assert_eq!(
+            serde_json::to_value(CustomFieldValue::Single(None)).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(CustomFieldValue::Multiple(vec![
+                "a".to_string(),
+                "b".to_string()
+            ]))
+            .unwrap(),
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn custom_field_write_serializes_id_and_value() {
+        let write = CustomFieldWrite {
+            id: 7,
+            value: CustomFieldValue::Single(Some("blue".to_string())),
+        };
+        let value = serde_json::to_value(write).unwrap();
+        assert_eq!(value, serde_json::json!({"id": 7, "value": "blue"}));
     }
 
     #[test]

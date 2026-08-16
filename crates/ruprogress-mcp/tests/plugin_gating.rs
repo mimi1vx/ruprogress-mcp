@@ -108,3 +108,112 @@ async fn a_tool_removed_by_both_the_plugin_gate_and_read_only_mode_is_still_just
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(!names.contains(&"create_checklist_item"));
 }
+
+const PRODUCTS_CRM_TOOLS: &[&str] = &["manage_product", "manage_contact"];
+
+#[tokio::test]
+async fn flags_off_the_router_carries_no_products_or_crm_tools() {
+    let h = support::harness(&[]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for name in PRODUCTS_CRM_TOOLS {
+        assert!(!names.contains(name), "{name} present with its flag unset");
+    }
+}
+
+#[tokio::test]
+async fn products_flag_adds_exactly_manage_product() {
+    let base = support::harness(&[]).await;
+    let base_tools = base
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut expected: Vec<&str> = base_tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    expected.push("manage_product");
+    expected.sort_unstable();
+
+    let h = support::harness(&[("REDMINE_PRODUCTS_ENABLED", "true")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn crm_flag_adds_exactly_manage_contact() {
+    let base = support::harness(&[]).await;
+    let base_tools = base
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut expected: Vec<&str> = base_tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    expected.push("manage_contact");
+    expected.sort_unstable();
+
+    let h = support::harness(&[("REDMINE_CRM_ENABLED", "true")]).await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let mut names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn products_flag_plus_read_only_keeps_only_list_and_get() {
+    let h = support::harness(&[
+        ("REDMINE_PRODUCTS_ENABLED", "true"),
+        ("REDMINE_MCP_READ_ONLY", "true"),
+    ])
+    .await;
+    let tools = h
+        .client
+        .list_tools(None)
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    // manage_product is a PARTIAL_WRITE tool: it stays registered in
+    // read-only mode (its list/get actions survive), unlike the
+    // unconditionally-write checklist tools above.
+    assert!(names.contains(&"manage_product"));
+}
+
+#[tokio::test]
+async fn calling_manage_product_with_its_flag_off_fails_like_an_unknown_tool() {
+    let h = support::harness(&[]).await;
+    let result = h
+        .client
+        .call_tool(CallToolRequestParams::new("manage_product"))
+        .await;
+    assert!(
+        result.is_err(),
+        "a plugin-gated tool with its flag off should fail cleanly, not succeed"
+    );
+}
+
+#[tokio::test]
+async fn calling_manage_contact_with_its_flag_off_fails_like_an_unknown_tool() {
+    let h = support::harness(&[]).await;
+    let result = h
+        .client
+        .call_tool(CallToolRequestParams::new("manage_contact"))
+        .await;
+    assert!(
+        result.is_err(),
+        "a plugin-gated tool with its flag off should fail cleanly, not succeed"
+    );
+}

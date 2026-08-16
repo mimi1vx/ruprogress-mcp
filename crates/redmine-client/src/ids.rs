@@ -69,6 +69,14 @@ id_newtype!(
     /// A checklist item id (`RedmineUP` Checklists plugin).
     ChecklistItemId
 );
+id_newtype!(
+    /// A `RedmineUP` Products plugin product id.
+    ProductId
+);
+id_newtype!(
+    /// A `RedmineUP` CRM plugin contact id.
+    ContactId
+);
 
 /// A validated Redmine project identifier (the slug form, e.g. `my-project`),
 /// safe to use as a single URL path segment.

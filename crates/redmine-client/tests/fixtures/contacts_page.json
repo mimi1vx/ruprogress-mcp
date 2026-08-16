@@ -1,0 +1,9 @@
+{
+  "contacts": [
+    { "id": 1, "first_name": "Ada", "last_name": "Lovelace" },
+    { "id": 2, "first_name": "Grace", "last_name": "Hopper" }
+  ],
+  "total_count": 2,
+  "offset": 0,
+  "limit": 100
+}

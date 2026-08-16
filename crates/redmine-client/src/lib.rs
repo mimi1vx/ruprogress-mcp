@@ -17,8 +17,9 @@ pub use auth::Credential;
 pub use client::{Query, RedmineClient, RedmineClientBuilder, Scoped};
 pub use error::{Error, Result};
 pub use ids::{
-    AttachmentId, ChecklistItemId, IssueCategoryId, IssueId, JournalId, MembershipId, ProjectId,
-    ProjectIdent, ProjectIdentifier, RelationId, TimeEntryId, UserId, VersionId, WikiTitle,
+    AttachmentId, ChecklistItemId, ContactId, IssueCategoryId, IssueId, JournalId, MembershipId,
+    ProductId, ProjectId, ProjectIdent, ProjectIdentifier, RelationId, TimeEntryId, UserId,
+    VersionId, WikiTitle,
 };
 pub use page::{Limits, Page};
 pub use retry::RetryPolicy;

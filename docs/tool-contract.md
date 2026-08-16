@@ -518,45 +518,72 @@ Returns: | Field | Type | Description |
 
 ## Products (RedmineUP Products plugin)
 
+Requires the RedmineUP Products plugin (commercial); registered only with
+`REDMINE_PRODUCTS_ENABLED=true`. The wire shapes this tool relies on are
+synthetic, derived from the reference implementation's handling of the
+plugin rather than a live capture — see
+`crates/redmine-client/tests/fixtures/README.md`'s plugin fixtures section.
+Unlike the reference's untyped `fields` dict for `update`, parameters here
+are flat and typed and shared between `create`/`update`; an unknown
+parameter key is rejected, not silently filtered. `offset` is an addition
+over the reference, which exposes only `limit`.
+
 ### `manage_product`
 
 Parameters:
-- `action` (string, required): Allowed: `list`, `get`, `create`, `update`
+- `action` (string, required): `list`, `get`, `create`, or `update`. There is no `delete` action — the plugin exposes no delete endpoint
 - `project_id` (integer or string, optional): For `list`, filters products by project (omitted = all accessible). For `create`, optionally associates the new product with a project
-- `limit` (integer, optional): For `list`, max results per call (default `100`). Redmine caps `limit` at 100 server-side; values above are clamped
+- `limit` (integer, optional): For `list`, max results per call, clamped to 1–100. Default `100`
+- `offset` (integer, optional): For `list`, pagination offset. Default `0`
 - `product_id` (integer): Required for `get` and `update`
-- `name` (string): Required for `create`
-- `status_id` (integer, optional): For `create`. Must be `1` (Active, default) or `2` (Inactive)
-- `description`, `code` (string, optional): For `create`
-- `price` (float, optional): For `create`
-- `currency` (string, optional): For `create` (e.g., `"USD"`)
-- `category_id` (integer, optional): For `create`
-- `tag_list` (string, optional): For `create`, comma-separated tags
-- `custom_fields` (list, optional): For `create`, list of `{"id": N, "value": ...}` dicts
-- `fields` (dict): For `update`, fields to update. Allowed keys: `name`, `description`, `price`, `currency`, `status_id`, `code`, `project_id`, `category_id`, `tag_list`, `custom_fields`. Unknown keys are silently filtered
+- `name` (string): Required for `create`; must not be blank if given on `update`
+- `description`, `code`, `currency` (string, optional): For `create`/`update`
+- `price` (float, optional): For `create`/`update`
+- `status_id` (integer, optional): For `create`/`update`. Must be `1` (Active) or `2` (Inactive)
+- `category_id` (integer, optional): For `create`/`update`
+- `tag_list` (array of strings, optional): For `create`/`update`; replaces the product's full tag set
+- `custom_fields` (array of `{"id": integer, "value": string or array of strings}`, optional): For `create`/`update`. Values are accepted by id only — there is no discovery tool for product custom-field definitions to resolve a name against
 
-Returns: - `list`: array of product dicts
+`update` requires at least one of the fields above besides `product_id`.
+
+Returns: `{success, products, pagination, product, updated_fields}` — `products`/`pagination` for `list`; `product` for `get`/`create`/`update`; `updated_fields` (names of the fields the call changed) for `update` only.
 
 ## Contacts / CRM (RedmineUP CRM plugin)
+
+Requires the RedmineUP CRM plugin (commercial); registered only with
+`REDMINE_CRM_ENABLED=true`. The wire shapes this tool relies on are
+synthetic, derived from the reference implementation's handling of the
+plugin rather than a live capture — see
+`crates/redmine-client/tests/fixtures/README.md`'s plugin fixtures section.
+Unlike the reference's untyped `fields` dict for `update`, parameters here
+are flat and typed and shared between `create`/`update`; an unknown
+parameter key is rejected, not silently filtered. `offset` is an addition
+over the reference, which exposes only `limit`. Contact PII (`email`,
+`phone`, `address`, `birthday`, `website`) is returned to the caller
+unwrapped but never logged and never named in an error message.
 
 ### `manage_contact`
 
 Parameters:
-- `action` (string, required): Allowed: `list`, `get`, `create`, `update`, `delete`, `assign_to_project`, `remove_from_project`
-- `project_id` (integer or string): For `list`, optional project filter. For `create`, required (project to associate the new contact with). For `assign_to_project` / `remove_from_project`, the project to attach to or detach from
+- `action` (string, required): `list`, `get`, `create`, `update`, `delete`, `assign_to_project`, or `remove_from_project`
+- `project_id` (integer or string): For `list`, optional project filter. For `create`, required (project to associate the new contact with). For `assign_to_project`/`remove_from_project`, the project to attach to or detach from
 - `search` (string, optional): For `list`, free-text search (matches name/company/email)
-- `tags` (string, optional): For `list`, comma-separated tag filter
-- `assigned_to_id` (integer, optional): For `list`, filter by assignee user ID
-- `limit` (integer, optional): For `list`, max results per call (default `100`, capped at 100 by Redmine)
-- `contact_id` (integer): Required for all actions except `list` and `create`
-- `include` (string, optional): For `get`, comma-separated includes (`notes`, `deals`, `contacts`)
-- `first_name` (string): Required for `create`
-- `last_name`, `company`, `email`, `phone` (string, optional): For `create`
-- `is_company` (boolean, optional): For `create`. `true` to mark as a company entity (default `false`)
-- `visibility` (integer, optional): For `create`. `0`=Project (default), `1`=Public, `2`=Private
-- `fields` (dict): For `update`, fields to update. Allowed keys: `first_name`, `last_name`, `middle_name`, `company`, `job_title`, `phone`, `email`, `website`, `skype_name`, `birthday`, `background`, `address_attributes`, `tag_list`, `is_company`, `assigned_to_id`, `custom_fields`, `visibility`, `project_id`. For `create`, additional fields beyond the named parameters
+- `tags` (string, optional): For `list`, a comma-separated tag filter, passed through as given — a filter expression the plugin parses, not a set of values being written
+- `assigned_to_id` (integer, optional): For `list`, filter by assignee user id. For `create`/`update`, the user to assign the contact to
+- `limit` (integer, optional): For `list`, max results per call, clamped to 1–100. Default `100`
+- `offset` (integer, optional): For `list`, pagination offset. Default `0`
+- `contact_id` (integer): Required for every action except `list` and `create`
+- `include` (array of `"notes"`/`"deals"`/`"contacts"`, optional): For `get`
+- `first_name` (string): Required for `create`; must not be blank if given on `update`
+- `last_name`, `middle_name`, `company`, `job_title`, `phone`, `email`, `website`, `skype_name`, `background` (string, optional): For `create`/`update`
+- `birthday` (string, optional): `YYYY-MM-DD`. For `create`/`update`
+- `address` (object `{street1, street2, city, region, country, postcode}`, all optional): For `create`/`update`; only the sub-fields given are changed
+- `is_company` (boolean, optional): For `create`/`update`. `true` to mark as a company entity. Default `false`
+- `visibility` (integer, optional): For `create`/`update`. `0`=Project (default), `1`=Public, `2`=Private
 
-Returns: - `list`: array of contact dicts
+`update` requires at least one of the fields above besides `contact_id`. `assign_to_project` does not create a contact; `remove_from_project` does not delete one.
+
+Returns: `{success, contacts, pagination, contact, updated_fields, deleted_contact_id, message}` — `contacts`/`pagination` for `list`; `contact` for `get`/`create`/`update`; `updated_fields` for `update` only; `deleted_contact_id` for `delete` only; `message` for `assign_to_project`/`remove_from_project` only, clarifying that neither creates nor deletes the contact.
 
 ## Documents (DMSF plugin)
 

@@ -7,3 +7,5 @@
 //! not two mechanisms.
 
 pub(crate) mod checklists;
+pub(crate) mod crm;
+pub(crate) mod products;
