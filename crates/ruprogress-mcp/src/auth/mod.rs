@@ -5,6 +5,7 @@
 pub(crate) mod legacy;
 pub(crate) mod oauth;
 pub(crate) mod per_user;
+pub(crate) mod proxy;
 /// Public so `tests/oauth_scopes.rs` (an anti-drift check, same shape as
 /// `readonly::write_tools`) can inspect `TOOL_SCOPES` directly — the only
 /// reason this one auth submodule is not `pub(crate)` like its siblings.

@@ -21,12 +21,10 @@ with RFC 7591 Dynamic Client Registration rather than being hand-registered
 in Redmine's admin panel. See [oauth-proxy setup](#oauth-proxy-this-server-as-the-authorization-server)
 below.
 
-**Not live yet (`oauth-proxy`):**
-
-- `/authorize`, `/token`, and the authorization-code + PKCE flow itself
-  (arriving in a follow-up release) — until then, discovery and DCR work,
-  but `/mcp` refuses every request with a `401`.
-- `refresh_token` handling and proxy-mode `/revoke` (also follow-up work).
+**Not live yet (`oauth-proxy`):** `refresh_token` handling and proxy-mode
+`/revoke` (follow-up work) — until then, an expired proxy access token
+means re-authorizing from `/authorize` again, and there is no way to
+revoke one early.
 
 ## Scope enforcement
 
@@ -311,16 +309,19 @@ Redmine's admin panel with its exact redirect URI — fine for a known client
 list, awkward for a client that expects to discover and register itself.
 `REDMINE_AUTH_MODE=oauth-proxy` closes that gap: MCP clients discover *this*
 server as their authorization server, register via RFC 7591 Dynamic Client
-Registration, and (in a follow-up release) run authorization-code + PKCE
-against this server's own `/authorize` and `/token`, which in turn drive a
-second authorization-code flow against Redmine using one
-operator-registered upstream OAuth application.
+Registration, and run authorization-code + PKCE against this server's own
+`/authorize` and `/token`, which in turn drive a second, independent
+authorization-code + PKCE flow against Redmine using one
+operator-registered upstream OAuth application. Redmine's own authorize
+page remains the consent screen — this server renders no HTML and sets no
+cookies in any mode.
 
-**Current status:** discovery documents and `POST /register` are live.
-`/authorize` and `/token` are not — `/mcp` challenges every request with a
-`401` regardless of what it's sent, including a raw Redmine token (a proxy
-token is never interchangeable with an upstream one; see the parent design
-doc). This section only covers what already works.
+The token an MCP client ends up holding is an opaque `rup_at_`-prefixed
+handle minted by this server, never the upstream Redmine token: presenting
+the upstream token directly to `/mcp` in this mode is always `401`. A proxy
+token resolves to the upstream token on every request and is verified via
+the same RFC 7662 introspection `oauth` mode uses, so scope enforcement and
+`INSUFFICIENT_SCOPE` denial behave identically once a client holds one.
 
 ### Configure
 
@@ -340,8 +341,8 @@ REDMINE_INTROSPECT_CLIENT_SECRET=<Client Secret from Redmine>
 # the introspection client above when both are left unset; setting one
 # without the other is a startup Conflict. The application needs the
 # authorization-code grant and ${REDMINE_MCP_BASE_URL}/auth/callback
-# registered as its redirect URI (needed once /authorize exists), plus
-# use_refresh_token if you want refresh tokens to work.
+# registered as its redirect URI, plus use_refresh_token if you want refresh
+# tokens to work (refresh support in this server itself is follow-up work).
 # REDMINE_OAUTH_CLIENT_ID=<upstream Client ID>
 # REDMINE_OAUTH_CLIENT_SECRET=<upstream Client Secret>
 
@@ -398,6 +399,21 @@ this server never accepts) is `{"error": "invalid_client_metadata"}`.
 | `GET /.well-known/oauth-protected-resource{mcp_path}` | RFC 9728 §3.1 | Names this server as the resource **and** points at itself as the authorization server |
 | `GET /.well-known/oauth-authorization-server` (root only) | RFC 8414 | Advertises this server's own `/authorize`, `/token`, `/register`, `/revoke` |
 | `POST /register` | RFC 7591 | Dynamic Client Registration — open, no initial access token, every client public |
+| `GET /authorize` | RFC 6749 §3.1 | Validates the client/redirect URI/PKCE, then redirects to Redmine's own `/oauth/authorize` behind a second, independently generated upstream PKCE pair |
+| `GET /auth/callback` | — (this server's own) | Where Redmine redirects back to; exchanges Redmine's code for an upstream token and redirects to the client with this server's own code |
+| `POST /token` | RFC 6749 §4.1.3 | Redeems that code (mandatory S256 PKCE) for a `rup_at_` proxy access token — never the upstream Redmine token |
+
+## Known limitation: in-memory, single-replica state
+
+Every DCR registration, in-flight authorization transaction, authorization
+code, and issued proxy token lives in this process's memory only — nothing
+is persisted, and nothing is shared between replicas. A restart drops
+everything: clients re-register and re-authorize, driven by the same `401`
+challenge they already handle. Behind a load balancer with more than one
+replica, a flow that starts on one instance and continues on another (e.g.
+`/authorize` on instance A, `/auth/callback` on instance B) fails. Bind
+`oauth-proxy` to a single instance, or route by a sticky session, until a
+durable backend exists.
 
 ## Known limitation: no audience binding
 

@@ -64,6 +64,19 @@ pub enum Error {
         /// The observed value that exceeded it.
         actual: u64,
     },
+    /// A non-2xx response from an OAuth token endpoint, shaped per RFC 6749
+    /// §5.2 (`{"error", "error_description"}`) rather than Redmine's REST
+    /// `{"errors": [...]}` shape [`from_status`] otherwise assumes.
+    /// Produced only by [`crate::client::Scoped::exchange_authorization_code`].
+    #[error("oauth error: {error}")]
+    OAuth {
+        /// The HTTP status Doorkeeper returned.
+        status: http::StatusCode,
+        /// The RFC 6749 `error` code, e.g. `"invalid_grant"`.
+        error: String,
+        /// The optional `error_description`.
+        description: Option<String>,
+    },
 }
 
 /// Convenience alias used throughout this crate.
@@ -80,7 +93,7 @@ impl Error {
     #[must_use]
     pub fn status(&self) -> Option<http::StatusCode> {
         match self {
-            Self::Api { status, .. } => Some(*status),
+            Self::Api { status, .. } | Self::OAuth { status, .. } => Some(*status),
             Self::Unauthorized => Some(http::StatusCode::UNAUTHORIZED),
             Self::Forbidden => Some(http::StatusCode::FORBIDDEN),
             Self::NotFound => Some(http::StatusCode::NOT_FOUND),
@@ -106,7 +119,11 @@ impl Error {
             | Self::NotFound
             | Self::Decode { .. }
             | Self::Config { .. }
-            | Self::LimitExceeded { .. } => false,
+            | Self::LimitExceeded { .. }
+            // POST is never retried by `retry::method_is_retryable` anyway
+            // (the only verb this variant is ever produced for), so this is
+            // a documentation of that fact rather than a load-bearing check.
+            | Self::OAuth { .. } => false,
         }
     }
 }
@@ -116,6 +133,35 @@ impl Error {
 pub(crate) struct ErrorBody {
     #[serde(default)]
     pub errors: Vec<String>,
+}
+
+/// Shape of an RFC 6749 §5.2 OAuth error body: `{"error": "invalid_grant",
+/// "error_description": "..."}`.
+#[derive(serde::Deserialize)]
+struct OAuthErrorBody {
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// Map a non-2xx status plus response body from an OAuth token endpoint to
+/// [`Error::OAuth`]. A body that does not parse as [`OAuthErrorBody`] still
+/// yields `Error::OAuth` (with a generic `error` code) rather than silently
+/// falling back to [`Error::Api`]'s `{"errors": [...]}` shape, which
+/// Doorkeeper's OAuth endpoints never use.
+pub(crate) fn oauth_error_from_status(status: http::StatusCode, body: &[u8]) -> Error {
+    match serde_json::from_slice::<OAuthErrorBody>(body) {
+        Ok(parsed) => Error::OAuth {
+            status,
+            error: parsed.error,
+            description: parsed.error_description,
+        },
+        Err(_) => Error::OAuth {
+            status,
+            error: "unknown_error".to_string(),
+            description: None,
+        },
+    }
 }
 
 /// Map a non-2xx status plus response body to the right [`Error`] variant.

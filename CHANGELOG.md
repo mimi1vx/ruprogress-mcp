@@ -25,10 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential, cache TTL, advertised scopes, and scope-enforcement flag are
   shared verbatim with `oauth` mode, so `tools/list` filtering and
   `INSUFFICIENT_SCOPE` denial apply identically once a caller holds a valid
-  bearer token. The authorization-code flow itself (`/authorize`, `/token`)
-  is not part of this change: until it lands, `/mcp` in this mode refuses
-  every request with a `401` regardless of what it is sent, including a raw
-  upstream Redmine token, which must never authenticate here.
+  bearer token.
+- `oauth-proxy` mode's authorization-code + PKCE flow: `GET /authorize`
+  validates the client and redirect URI before anything else can redirect
+  (an unregistered `client_id` or redirect URI is a plain `400` with no
+  `Location` header — never an open redirect), then forwards the request to
+  Redmine's own `/oauth/authorize` behind a second, independently generated
+  PKCE pair this server holds on the client's behalf. `GET /auth/callback`
+  exchanges the resulting Redmine code for an upstream access (and, when
+  Doorkeeper issues one, refresh) token, and mints a short-lived
+  authorization code of its own. `POST /token` redeems that code for an
+  opaque `rup_at_`-prefixed proxy access token: a 256-bit CSPRNG handle,
+  never a signed JWT and never the upstream Redmine token itself. Presenting
+  the upstream token directly to `/mcp` is still `401`; presenting a valid
+  proxy token resolves it to the stored upstream token and verifies that via
+  the same introspection path `oauth` mode uses, so scope enforcement and
+  `INSUFFICIENT_SCOPE` denial are unchanged. A replayed authorization code is
+  `invalid_grant` and revokes the session it minted; `refresh_token` and
+  `/revoke` in this mode are follow-up work.
 - Three tools for the RedmineUP Checklists Pro plugin, registered only when
   `REDMINE_CHECKLISTS_ENABLED=true`: `get_checklist`, `create_checklist_item`,
   `update_checklist_item`. With the flag off (the default) they are fully

@@ -29,11 +29,13 @@ use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use url::Url;
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
 use crate::auth::oauth::{self, TokenVerifier};
-use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig, OAuthConfig};
+use crate::auth::proxy::{self as auth_proxy, ProxyAuthState};
+use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig, OAuthConfig, OAuthProxyConfig};
 use crate::health::{self, HealthState};
 use crate::oauth as oauth_docs;
 use crate::oauth::metadata::DiscoveryMode;
@@ -76,12 +78,15 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
     // "discovery exists" — no downstream site needs to re-derive it from
     // `AuthMode` again.
     let discovery_mode = DiscoveryMode::from_auth(&server.inner.config.auth).map(|(mode, _)| mode);
-    // `redirects` lives only on `OAuthProxyConfig`, not the shared
-    // `OAuthConfig` `from_auth` returns, so it needs its own look.
-    let redirects = match &server.inner.config.auth {
-        AuthMode::OAuthProxy(proxy) => Some(proxy.redirects.clone()),
+    // The upstream client, redirect policy, etc. live only on
+    // `OAuthProxyConfig`, not the shared `OAuthConfig` `from_auth` returns,
+    // so proxy mode needs its own look. Cloned once here, before `server`
+    // moves into `mcp_service` below.
+    let proxy_config: Option<OAuthProxyConfig> = match &server.inner.config.auth {
+        AuthMode::OAuthProxy(proxy) => Some(proxy.clone()),
         AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
     };
+    let redmine_base = server.inner.config.redmine.url.clone();
     let discovery = discovery_mode
         .zip(server.inner.config.oauth_resource().cloned())
         .zip(server.verifier())
@@ -131,10 +136,11 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
     // SECURITY: mounted on the MCP route only, and only in a bearer-token
     // auth mode. Every other route this router serves — `/livez`, `/readyz`,
     // `/health`, `/files/{uuid}` (an unguessable, TTL-bounded capability
-    // URL), `/register`, and every `/.well-known/*` discovery document —
-    // must stay reachable with no bearer token: RFC 9728 metadata has to be
-    // fetchable *before* a client has a token, and probes must not need a
-    // credential (O8).
+    // URL), `/register`, `/authorize`, `/auth/callback`, and every
+    // `/.well-known/*` discovery document — must stay reachable with no
+    // bearer token: RFC 9728 metadata has to be fetchable *before* a client
+    // has a token, and probes must not need a credential (O8).
+    let mut proxy_flow_routes: Option<Router> = None;
     match &discovery {
         Some((_, _, verifier, oauth, DiscoveryMode::Oauth)) => {
             let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, &cfg.mcp_path));
@@ -143,16 +149,30 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
                 oauth::require_bearer,
             ));
         }
-        // `oauth-proxy`: no token-store resolver exists yet, so every
-        // request is challenged unconditionally rather than risking
-        // acceptance of a raw upstream Redmine token here, which would
-        // silently downgrade this mode into plain `oauth`.
-        Some((_, _, _, oauth, DiscoveryMode::OAuthProxy)) => {
-            let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, &cfg.mcp_path));
-            mcp_route = mcp_route.layer(middleware::from_fn_with_state(
-                challenge,
-                require_bearer_proxy_stub,
-            ));
+        Some((_, client, verifier, oauth, DiscoveryMode::OAuthProxy)) => {
+            // `proxy_config` and `discovery` are both derived from
+            // `server.inner.config.auth` before `server` moved into
+            // `mcp_service` above, so they always agree; a graceful skip
+            // (never a panic) is the fail-closed response to that
+            // invariant somehow not holding.
+            if let Some(proxy) = proxy_config.as_ref() {
+                let (route, flow) = mount_oauth_proxy(
+                    mcp_route,
+                    proxy,
+                    oauth,
+                    verifier,
+                    client,
+                    &redmine_base,
+                    &cfg.mcp_path,
+                );
+                mcp_route = route;
+                proxy_flow_routes = Some(flow);
+            } else {
+                tracing::error!(
+                    "oauth-proxy discovery mode selected without an OAuthProxyConfig; refusing \
+                     to mount its routes"
+                );
+            }
         }
         None => {}
     }
@@ -175,11 +195,8 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
             router = router.merge(revoke_route(client, verifier));
         }
     }
-    if let Some(redirects) = redirects {
-        router = router.merge(oauth_docs::proxy::endpoints::register_route(
-            Arc::new(oauth_docs::proxy::store::ClientRegistry::new()),
-            Arc::new(redirects),
-        ));
+    if let Some(proxy_flow_routes) = proxy_flow_routes {
+        router = router.merge(proxy_flow_routes);
     }
 
     if let Some(cors) = cors_layer(cfg) {
@@ -190,6 +207,63 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         http::header::X_CONTENT_TYPE_OPTIONS,
         http::HeaderValue::from_static("nosniff"),
     ))
+}
+
+/// Builds `oauth-proxy` mode's state (the client registry, redirect policy,
+/// and F2/F6/F9's transaction/code/token stores), layers the proxy-bearer
+/// middleware onto `mcp_route`, and returns it alongside the stand-alone
+/// router for `/register`, `/authorize`, `/auth/callback`, and `/token`.
+/// Split out of `router` to keep that function under clippy's line-count
+/// pedantic threshold.
+fn mount_oauth_proxy(
+    mcp_route: Router,
+    proxy: &OAuthProxyConfig,
+    oauth: &OAuthConfig,
+    verifier: &Arc<TokenVerifier>,
+    client: &RedmineClient,
+    redmine_base: &Url,
+    mcp_path: &str,
+) -> (Router, Router) {
+    let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, mcp_path));
+    let registry = Arc::new(oauth_docs::proxy::store::ClientRegistry::new());
+    let redirects = Arc::new(proxy.redirects.clone());
+    let tokens = Arc::new(oauth_docs::proxy::store::TokenStore::new());
+    let upstream_tokens = Arc::new(oauth_docs::proxy::store::UpstreamStore::new());
+    let transactions = Arc::new(oauth_docs::proxy::store::TransactionStore::new());
+    let codes = Arc::new(oauth_docs::proxy::store::CodeStore::new());
+
+    // P9: a token-store lookup ahead of the same `TokenVerifier` `oauth`
+    // mode uses — never a fallback to accepting a raw upstream token here.
+    let mcp_route = mcp_route.layer(middleware::from_fn_with_state(
+        ProxyAuthState {
+            tokens: tokens.clone(),
+            upstream_tokens: upstream_tokens.clone(),
+            verifier: verifier.clone(),
+            challenge,
+        },
+        auth_proxy::require_proxy_bearer,
+    ));
+
+    let flow_routes = Router::new()
+        .merge(oauth_docs::proxy::endpoints::register_route(
+            registry.clone(),
+            redirects.clone(),
+        ))
+        .merge(oauth_docs::proxy::endpoints::flow_routes(
+            registry,
+            redirects,
+            Arc::new(oauth.clone()),
+            redmine_base.clone(),
+            proxy.upstream_client_id.clone(),
+            proxy.upstream_client_secret.clone(),
+            client.clone(),
+            transactions,
+            codes,
+            tokens,
+            upstream_tokens,
+        ));
+
+    (mcp_route, flow_routes)
 }
 
 #[derive(Clone)]
@@ -258,19 +332,6 @@ fn well_known_routes(
             mcp_path: Arc::from(mcp_path),
             mode,
         })
-}
-
-/// `oauth-proxy`'s placeholder MCP-route middleware: the token-store
-/// resolver this mode needs does not exist yet, so every request is
-/// challenged unconditionally, regardless of whether it carries a bearer
-/// token at all — never `require_bearer`'s introspection path, which would
-/// otherwise accept a raw upstream Redmine token here.
-async fn require_bearer_proxy_stub(
-    State(challenge): State<Arc<oauth::Challenge>>,
-    _req: Request,
-    _next: Next,
-) -> Response {
-    oauth::challenge_response(&challenge, None)
 }
 
 /// Bytes cap for `POST /revoke`'s request body (D4): far above any real RFC

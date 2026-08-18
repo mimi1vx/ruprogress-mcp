@@ -4,5 +4,6 @@
 //! renders discovery documents.
 
 pub(crate) mod endpoints;
+pub(crate) mod pkce;
 pub(crate) mod redirect;
 pub(crate) mod store;

@@ -1,8 +1,9 @@
 //! End-to-end `AuthMode::OAuthProxy`: discovery documents that name this
 //! server as its own authorization server, `POST /register` (RFC 7591), and
-//! the route matrix — over the real HTTP router. `/authorize` and `/token`
-//! do not exist yet, so they `404`, and `/mcp` rejects every request with
-//! the `401` challenge.
+//! the route matrix — over the real HTTP router. The full authorization-code
+//! flow through `/authorize`/`/auth/callback`/`/token` is covered in
+//! `tests/oauth_proxy_flow.rs`; here `/mcp` still rejects every request with
+//! the `401` challenge unless it carries a valid `rup_at_` proxy token.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -211,16 +212,28 @@ async fn register_404s_in_oauth_and_legacy_modes() {
 // --- route matrix -----------------------------------------------------------
 
 #[tokio::test]
-async fn authorize_and_token_404_until_implemented() {
+async fn authorize_and_token_are_mounted_and_reachable() {
+    // `/authorize` and `/token` exist as of 6c2 (the full authorization-code
+    // flow is exercised end to end in `tests/oauth_proxy_flow.rs`); this
+    // test only pins that both routes are mounted with the right method.
     let harness = support::http_harness(&oauth_proxy_env(&[])).await;
-    for path in ["/authorize", "/token"] {
-        let response = client()
-            .get(harness.url(path))
-            .send()
-            .await
-            .expect("request should complete");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-    }
+
+    // No query params at all is a Phase A failure (F1): a plain 400, never
+    // a 404.
+    let authorize = client()
+        .get(harness.url("/authorize"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(authorize.status(), StatusCode::BAD_REQUEST);
+
+    // `/token` is POST-only; a GET is a 405, not a 404.
+    let token = client()
+        .get(harness.url("/token"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(token.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
@@ -243,11 +256,12 @@ async fn mcp_route_is_401_with_a_www_authenticate_challenge_with_no_token() {
     );
 }
 
-/// A token is never accepted at `/mcp` here — not even one that would
-/// otherwise look plausible — since no token-store resolver exists yet.
-/// This also guards against the specific regression of reusing `oauth`
-/// mode's `require_bearer` unchanged, which would introspect (and could
-/// accept) a raw upstream Redmine token here.
+/// A token without the `rup_at_` prefix is never accepted at `/mcp` here —
+/// not even one that would otherwise look plausible. This guards against
+/// the specific regression of reusing `oauth` mode's `require_bearer`
+/// unchanged, which would introspect (and could accept) a raw upstream
+/// Redmine token here; see `tests/oauth_proxy_flow.rs` for the positive
+/// case of a real proxy token driving `/mcp`.
 #[tokio::test]
 async fn mcp_route_is_401_even_with_a_bearer_token_present() {
     let harness = support::http_harness(&oauth_proxy_env(&[])).await;

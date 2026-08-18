@@ -22,8 +22,8 @@ use crate::ids::{
 use crate::model::plugins::{agile, checklists, crm, dmsf, products};
 use crate::model::{
     BareCollection, Collection, attachment, custom_field, enumeration, introspection, issue,
-    issue_category, issue_status, journal, membership, project, query, relation, role, search,
-    time_entry, tracker, upload, user, version, wiki,
+    issue_category, issue_status, journal, membership, oauth_token, project, query, relation, role,
+    search, time_entry, tracker, upload, user, version, wiki,
 };
 use crate::page::{Limits, Page};
 use crate::retry::{self, RetryPolicy};
@@ -818,6 +818,58 @@ impl Scoped<'_> {
         )
         .await?;
         Ok(())
+    }
+
+    /// `POST /oauth/token`, `grant_type=authorization_code` (RFC 6749
+    /// §4.1.3). The scoping credential must be `Credential::Basic { user:
+    /// upstream_client_id, pass: upstream_client_secret }` for the
+    /// confidential upstream OAuth application `oauth-proxy` mode runs its
+    /// own authorization-code flow against — the third and last method on
+    /// this type (alongside [`Self::introspect_token`]/[`Self::revoke_token`])
+    /// whose scoping credential is a client rather than an end-user identity.
+    /// `client_id` is not sent as a form field: the scoping credential's
+    /// HTTP Basic header already authenticates the client per RFC 6749
+    /// §3.2.1.
+    ///
+    /// Not covered by the retry policy: `POST` is never retried by
+    /// [`crate::retry::method_is_retryable`] regardless, and a token
+    /// exchange must not be replayed even if it were.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuth`] for a non-2xx RFC 6749 §5.2 error response
+    /// (e.g. `invalid_grant`), or a transport/decode error otherwise.
+    pub async fn exchange_authorization_code(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> crate::Result<oauth_token::OAuthToken> {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            grant_type: &'a str,
+            code: &'a str,
+            redirect_uri: &'a str,
+            code_verifier: &'a str,
+        }
+        let url = self.build_url("oauth/token", None)?;
+        let template = self
+            .credential
+            .apply(self.inner.http.post(url))
+            .form(&Form {
+                grant_type: "authorization_code",
+                code,
+                redirect_uri,
+                code_verifier,
+            });
+        let resp = template.send().await.map_err(Error::transport)?;
+        if resp.status().is_success() {
+            self.read_json(resp, "oauth token response").await
+        } else {
+            let status = resp.status();
+            let bytes = resp.bytes().await.map_err(Error::transport)?;
+            Err(crate::error::oauth_error_from_status(status, &bytes))
+        }
     }
 
     /// `GET /projects.json`.

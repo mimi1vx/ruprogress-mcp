@@ -1,14 +1,20 @@
-//! `oauth-proxy` DCR client registry (P8, C7, C8): a bounded, `Mutex`-guarded
-//! map, not a database — the whole store is gone on restart (P4), and every
-//! operation is short enough that holding the lock across it (never across
-//! an `.await`) is the right call rather than an async lock.
+//! `oauth-proxy` state: the DCR client registry (P8, C7, C8), the
+//! in-flight-transaction/authorization-code/token stores (F2, F6, F9), all
+//! bounded, `Mutex`-guarded maps rather than a database — the whole store is
+//! gone on restart (P4), and every operation is short enough that holding
+//! the lock across it (never across an `.await`, F12) is the right call
+//! rather than an async lock.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::TryRngCore as _;
 use rand::rngs::OsRng;
+use secrecy::SecretString;
+use sha2::{Digest as _, Sha256};
 
 /// A registered DCR client (P8): every client is public — `/register` never
 /// issues, and `/token` never accepts, a `client_secret`.
@@ -160,6 +166,496 @@ impl ClientRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+}
+
+/// `Instant::now() + ttl`, saturating rather than risking an overflow panic
+/// on a duration this store itself always chooses (never caller-supplied
+/// arithmetic on untrusted input, but `checked_add` costs nothing and keeps
+/// `clippy::arithmetic_side_effects` honest).
+pub(crate) fn expires_after(ttl: Duration) -> Instant {
+    Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
+}
+
+/// SHA-256 digest, used as the map key for every store below that is keyed
+/// on a value a client presents back to us (P2, F2, F9): the plaintext
+/// never appears in a `Debug`/core-dump-walkable key.
+fn digest(value: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hasher.finalize().into()
+}
+
+/// 256 bits of `OsRng`, base64url-encoded (no padding), prefixed with
+/// `prefix`. Shared mint routine for transaction ids, authorization codes,
+/// and access tokens — all opaque CSPRNG handles per P2. `None` only on OS
+/// RNG failure (C8's failure mode), never a caller-input failure.
+fn mint_opaque_token(prefix: &str) -> Option<String> {
+    let mut bytes = [0u8; 32];
+    if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+        tracing::error!(%error, prefix, "OS RNG unavailable; cannot mint an opaque token");
+        return None;
+    }
+    Some(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes)))
+}
+
+/// Hard cap shared by every bounded map below (P4, C8): generous for one
+/// process's in-flight state, small enough that an unauthenticated or
+/// lightly-authenticated endpoint cannot become an unbounded allocator.
+const MAX_ENTRIES: usize = 10_000;
+
+/// Drops every expired entry from `map`, then refuses the insert (returning
+/// `false`) if `map` is still at [`MAX_ENTRIES`] and does not already
+/// contain `key` — the same sweep-then-cap shape
+/// `auth::oauth::TokenVerifier::cache_put` uses. Never evicts a live entry
+/// to make room: a full store degrades by rejecting new state, not by
+/// dropping someone else's in-flight flow.
+fn sweep_and_check_capacity<K: std::hash::Hash + Eq, V>(
+    map: &mut HashMap<K, (V, Instant)>,
+    key: &K,
+) -> bool {
+    let now = Instant::now();
+    map.retain(|_, (_, expires_at)| *expires_at > now);
+    map.len() < MAX_ENTRIES || map.contains_key(key)
+}
+
+// --- in-flight authorization transactions (F2) ------------------------------
+
+/// How long an authorization transaction survives between `/authorize` and
+/// `/auth/callback` before it is treated as abandoned.
+const TRANSACTION_TTL: Duration = Duration::from_mins(10);
+
+/// One in-flight `/authorize` → `/auth/callback` round trip (F2): every
+/// parameter the callback needs to finish the flow, captured at
+/// `/authorize` time.
+pub(crate) struct Transaction {
+    pub(crate) client_id: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) code_challenge: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) client_state: Option<String>,
+    pub(crate) upstream_code_verifier: String,
+}
+
+/// Digest-keyed (the raw id is also the upstream `state`, which transits the
+/// user's browser — P2's threat model applies here too), single-use,
+/// TTL-bounded.
+#[derive(Default)]
+pub(crate) struct TransactionStore {
+    inner: Mutex<HashMap<[u8; 32], (Transaction, Instant)>>,
+}
+
+impl std::fmt::Debug for TransactionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("TransactionStore")
+            .field("len", &len)
+            .finish()
+    }
+}
+
+impl TransactionStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores `transaction`, returning the raw id to send upstream as
+    /// `state`. `None` means the store is full or `OsRng` failed (C8); the
+    /// caller turns either into a `503`.
+    pub(crate) fn create(&self, transaction: Transaction) -> Option<String> {
+        let id = mint_opaque_token("")?;
+        let key = digest(&id);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sweep_and_check_capacity(&mut inner, &key) {
+            return None;
+        }
+        inner.insert(key, (transaction, expires_after(TRANSACTION_TTL)));
+        Some(id)
+    }
+
+    /// Consumes the transaction named by `state`, if it exists and has not
+    /// expired. Single-use: a second call with the same `state` returns
+    /// `None`, closing off transaction replay (risk 4 in the sub-phase
+    /// plan).
+    pub(crate) fn take(&self, state: &str) -> Option<Transaction> {
+        let key = digest(state);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (transaction, expires_at) = inner.remove(&key)?;
+        (expires_at > Instant::now()).then_some(transaction)
+    }
+}
+
+// --- the upstream token this server holds on the user's behalf (F6) --------
+
+/// What `/auth/callback`'s upstream exchange produced: never sent to the
+/// client (P10), retrieved by `auth::proxy`'s middleware on every request a
+/// proxy access token authenticates.
+pub(crate) struct UpstreamTokenSet {
+    pub(crate) access: SecretString,
+    #[allow(
+        dead_code,
+        reason = "populated now so 6c3's refresh grant has no store schema to migrate; not read \
+                  until that lands"
+    )]
+    pub(crate) refresh: Option<SecretString>,
+    pub(crate) granted_scopes: Vec<String>,
+    pub(crate) expires_at: Instant,
+}
+
+/// Keyed by a plain (non-digest) internal id: unlike a transaction id or a
+/// proxy token, this id is never observed outside this process — not in a
+/// URL, not in a response body — so digest-keying would add nothing.
+#[derive(Default)]
+pub(crate) struct UpstreamStore {
+    inner: Mutex<HashMap<String, UpstreamTokenSet>>,
+}
+
+impl std::fmt::Debug for UpstreamStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("UpstreamStore").field("len", &len).finish()
+    }
+}
+
+impl UpstreamStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores `set`, returning the internal id it was stored under. `None`
+    /// on `OsRng` failure only (C8).
+    pub(crate) fn insert(&self, set: UpstreamTokenSet) -> Option<String> {
+        let mut bytes = [0u8; 16];
+        if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+            tracing::error!(%error, "OS RNG unavailable; cannot mint an upstream-token-set id");
+            return None;
+        }
+        let mut id = String::with_capacity(32);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(id, "{byte:02x}");
+        }
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.clone(), set);
+        Some(id)
+    }
+
+    /// A clone of the stored access token, for the middleware to hand to
+    /// [`crate::auth::oauth::TokenVerifier::verify`] on every request.
+    pub(crate) fn access_token(&self, id: &str) -> Option<SecretString> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|set| set.access.clone())
+    }
+
+    pub(crate) fn remove(&self, id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+}
+
+// --- authorization codes (F6, F7, F8) ---------------------------------------
+
+/// How long a minted authorization code is redeemable.
+const CODE_TTL: Duration = Duration::from_mins(1);
+
+struct PendingCode {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+}
+
+/// What a successfully redeemed code minted, kept for [`CODE_TTL`] after
+/// redemption so a replay of the same code can be detected and contained
+/// (F8) rather than just bouncing off "not found".
+struct ConsumedRecord {
+    minted_token_digest: [u8; 32],
+    upstream_id: String,
+}
+
+/// Outcome of [`CodeStore::redeem`].
+pub(crate) enum RedeemOutcome {
+    /// The code does not exist, already expired, or was never valid —
+    /// indistinguishable from a checks-mismatch by design (F7): both are
+    /// `invalid_grant` with no further detail.
+    Invalid,
+    /// `client_id`, `redirect_uri`, or the PKCE verifier did not match this
+    /// code's bindings. The code is left untouched (F7): a legitimate
+    /// client's later, correct retry within the TTL must still work.
+    Mismatch,
+    /// The code had already been redeemed once; contains what that first
+    /// redemption minted so the caller can revoke it (F8).
+    Replayed {
+        minted_token_digest: [u8; 32],
+        upstream_id: String,
+    },
+    /// First, successful redemption: the code is now consumed. The caller
+    /// must call [`CodeStore::mark_consumed`] once it knows what it minted,
+    /// so a subsequent replay within [`CODE_TTL`] is caught.
+    Ok(UpstreamTokenSet),
+}
+
+#[derive(Default)]
+pub(crate) struct CodeStore {
+    pending: Mutex<HashMap<[u8; 32], (PendingCode, Instant)>>,
+    upstream: Mutex<HashMap<[u8; 32], UpstreamTokenSet>>,
+    consumed: Mutex<HashMap<[u8; 32], (ConsumedRecord, Instant)>>,
+}
+
+impl std::fmt::Debug for CodeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let upstream = self
+            .upstream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let consumed = self
+            .consumed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("CodeStore")
+            .field("pending", &pending)
+            .field("upstream", &upstream)
+            .field("consumed", &consumed)
+            .finish()
+    }
+}
+
+impl CodeStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mints a `rup_ac_`-prefixed authorization code bound to `client_id` +
+    /// `redirect_uri` + `code_challenge` + `upstream` (F6). `None` means the
+    /// store is full or `OsRng` failed (C8).
+    pub(crate) fn mint(
+        &self,
+        client_id: String,
+        redirect_uri: String,
+        code_challenge: String,
+        upstream: UpstreamTokenSet,
+    ) -> Option<String> {
+        let code = mint_opaque_token("rup_ac_")?;
+        let key = digest(&code);
+        let pending_entry = PendingCode {
+            client_id,
+            redirect_uri,
+            code_challenge,
+        };
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sweep_and_check_capacity(&mut pending, &key) {
+            return None;
+        }
+        self.upstream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, upstream);
+        pending.insert(key, (pending_entry, expires_after(CODE_TTL)));
+        Some(code)
+    }
+
+    /// F7's ordered checks, then F8's replay containment. Never consumes the
+    /// code on anything but a first, fully-matching redemption.
+    pub(crate) fn redeem(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> RedeemOutcome {
+        let key = digest(code);
+
+        let pending_entry = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            match pending.get(&key) {
+                Some((_, expires_at)) if *expires_at <= Instant::now() => {
+                    pending.remove(&key);
+                    None
+                }
+                Some((entry, _)) => Some(PendingCode {
+                    client_id: entry.client_id.clone(),
+                    redirect_uri: entry.redirect_uri.clone(),
+                    code_challenge: entry.code_challenge.clone(),
+                }),
+                None => None,
+            }
+        };
+
+        let Some(entry) = pending_entry else {
+            let consumed = self.consumed.lock().unwrap_or_else(PoisonError::into_inner);
+            return match consumed.get(&key) {
+                Some((record, expires_at)) if *expires_at > Instant::now() => {
+                    RedeemOutcome::Replayed {
+                        minted_token_digest: record.minted_token_digest,
+                        upstream_id: record.upstream_id.clone(),
+                    }
+                }
+                _ => RedeemOutcome::Invalid,
+            };
+        };
+
+        if entry.client_id != client_id
+            || entry.redirect_uri != redirect_uri
+            || !super::pkce::verify(&entry.code_challenge, code_verifier)
+        {
+            return RedeemOutcome::Mismatch;
+        }
+
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        let Some(upstream) = self
+            .upstream
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key)
+        else {
+            // The upstream half is always inserted alongside the pending
+            // entry in `mint`; its absence here would mean this code was
+            // never actually minted by this store.
+            return RedeemOutcome::Invalid;
+        };
+        RedeemOutcome::Ok(upstream)
+    }
+
+    /// Records what a successful [`Self::redeem`] minted, so a replay of
+    /// the same code within [`CODE_TTL`] is caught (F8) instead of falling
+    /// through to "not found".
+    pub(crate) fn mark_consumed(
+        &self,
+        code: &str,
+        minted_token_digest: [u8; 32],
+        upstream_id: String,
+    ) {
+        let key = digest(code);
+        let mut consumed = self.consumed.lock().unwrap_or_else(PoisonError::into_inner);
+        if sweep_and_check_capacity(&mut consumed, &key) {
+            consumed.insert(
+                key,
+                (
+                    ConsumedRecord {
+                        minted_token_digest,
+                        upstream_id,
+                    },
+                    expires_after(CODE_TTL),
+                ),
+            );
+        }
+    }
+}
+
+// --- proxy access tokens (F9) ------------------------------------------------
+
+pub(crate) struct TokenEntry {
+    pub(crate) upstream_id: String,
+    #[allow(
+        dead_code,
+        reason = "carried for a future scope-mismatch diagnostic; enforcement reads \
+                  introspection (P9), not this field"
+    )]
+    pub(crate) client_id: String,
+}
+
+/// Digest-keyed (P2): the plaintext `rup_at_...` token never appears as a
+/// map key walkable from a core dump.
+#[derive(Default)]
+pub(crate) struct TokenStore {
+    inner: Mutex<HashMap<[u8; 32], (TokenEntry, Instant)>>,
+}
+
+impl std::fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("TokenStore").field("len", &len).finish()
+    }
+}
+
+impl TokenStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mints a `rup_at_`-prefixed proxy access token bound to `upstream_id`,
+    /// expiring after `ttl` (P10: never longer than the upstream token's own
+    /// remaining lifetime). Returns the raw token and its digest — the
+    /// caller needs the digest to hand to [`CodeStore::mark_consumed`] for
+    /// F8's replay containment. `None` means the store is full or `OsRng`
+    /// failed (C8).
+    pub(crate) fn mint(
+        &self,
+        client_id: String,
+        upstream_id: String,
+        ttl: Duration,
+    ) -> Option<(String, [u8; 32])> {
+        let token = mint_opaque_token("rup_at_")?;
+        let key = digest(&token);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sweep_and_check_capacity(&mut inner, &key) {
+            return None;
+        }
+        inner.insert(
+            key,
+            (
+                TokenEntry {
+                    upstream_id,
+                    client_id,
+                },
+                expires_after(ttl),
+            ),
+        );
+        Some((token, key))
+    }
+
+    /// Resolves a presented `rup_at_...` token to its `upstream_id`, or
+    /// `None` if it is unknown or expired (F10 folds both into
+    /// `invalid_token`).
+    pub(crate) fn resolve(&self, token: &str) -> Option<TokenEntry> {
+        let key = digest(token);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (entry, expires_at) = inner.get(&key)?;
+        if *expires_at <= Instant::now() {
+            inner.remove(&key);
+            return None;
+        }
+        Some(TokenEntry {
+            upstream_id: entry.upstream_id.clone(),
+            client_id: entry.client_id.clone(),
+        })
+    }
+
+    /// Deletes a proxy access token by its digest (F8's replay containment;
+    /// 6c3's `/revoke`).
+    pub(crate) fn delete_by_digest(&self, digest: [u8; 32]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&digest);
     }
 }
 

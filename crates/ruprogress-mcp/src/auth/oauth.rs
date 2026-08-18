@@ -413,8 +413,10 @@ impl Challenge {
 
 /// Why [`extract_bearer`] rejected the `Authorization` header, distinct from
 /// [`AuthError`] (which only ever applies once a token has been extracted).
+/// `pub(crate)`: also matched by `auth::proxy`'s middleware, which shares
+/// this extraction step (F10, F11).
 #[derive(Debug)]
-enum BearerError {
+pub(crate) enum BearerError {
     /// No `Authorization` header at all: the ordinary "client has no token
     /// yet" case, so the challenge carries no `error` parameter.
     Missing,
@@ -427,7 +429,11 @@ enum BearerError {
 /// Extracts and validates the inbound bearer token per B9. Never falls back
 /// to a different scheme or a second header value: header smuggling through
 /// a misconfigured proxy is the realistic attack this guards against.
-fn extract_bearer(headers: &http::HeaderMap) -> Result<SecretString, BearerError> {
+///
+/// `pub(crate)`: shared with `auth::proxy`'s middleware (F10, F11) — both
+/// modes need the identical extraction/validation step, only what happens
+/// with the extracted token differs.
+pub(crate) fn extract_bearer(headers: &http::HeaderMap) -> Result<SecretString, BearerError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(value) = values.next() else {
         return Err(BearerError::Missing);
@@ -518,10 +524,8 @@ pub(crate) async fn require_bearer(
     }
 }
 
-/// `pub(crate)`: also used directly by `transport::http`'s `oauth-proxy`
-/// placeholder MCP-route middleware, which challenges unconditionally
-/// rather than attempting `require_bearer`'s verification (that mode has no
-/// token-store resolver to verify against yet).
+/// `pub(crate)`: also used by `auth::proxy`'s `oauth-proxy` middleware
+/// (F10, F11), which shares this exact challenge shape.
 pub(crate) fn challenge_response(challenge: &Challenge, error: Option<&str>) -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     response
@@ -532,7 +536,10 @@ pub(crate) fn challenge_response(challenge: &Challenge, error: Option<&str>) -> 
 
 /// `503` + `Retry-After` (O7): introspection being broken is never the
 /// caller's fault, so this must never look like an invalid-token `401`.
-fn unavailable_response() -> Response {
+/// `pub(crate)`: also used by `auth::proxy`'s middleware (F10), which hits
+/// the same introspection unavailability case through the same
+/// `TokenVerifier`.
+pub(crate) fn unavailable_response() -> Response {
     let mut response = (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
     response
         .headers_mut()

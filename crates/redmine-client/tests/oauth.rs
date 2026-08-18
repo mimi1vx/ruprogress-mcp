@@ -167,3 +167,118 @@ async fn revoke_token_of_an_unknown_token_is_still_success() {
         .await
         .expect("revoking an unknown token must not be an error");
 }
+
+// --- exchange_authorization_code (F5) ---------------------------------------
+
+#[tokio::test]
+async fn exchange_sends_basic_auth_and_the_exact_form_body_with_no_client_id() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(basic_auth("upstream-client", "upstream-secret"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .and(body_string_contains("code=the-code"))
+        .and(body_string_contains(
+            "redirect_uri=https%3A%2F%2Fmcp.example.com%2Fauth%2Fcallback",
+        ))
+        .and(body_string_contains("code_verifier=the-verifier"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "upstream-access-token",
+            "refresh_token": "upstream-refresh-token",
+            "expires_in": 7200,
+            "scope": "view_issues",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::Basic {
+        user: "upstream-client".to_string(),
+        pass: SecretString::from("upstream-secret"),
+    };
+    let token = client
+        .as_user(&cred)
+        .exchange_authorization_code(
+            "the-code",
+            "https://mcp.example.com/auth/callback",
+            "the-verifier",
+        )
+        .await
+        .expect("exchange should succeed");
+
+    use secrecy::ExposeSecret;
+    assert_eq!(token.access_token.expose_secret(), "upstream-access-token");
+    assert_eq!(
+        token
+            .refresh_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret),
+        Some("upstream-refresh-token")
+    );
+    assert_eq!(token.expires_in, Some(7200));
+
+    // Never sent as a form field: the Basic-auth header already
+    // authenticates the client per RFC 6749 §3.2.1.
+    let requests = server.received_requests().await.expect("requests recorded");
+    let request = requests.first().expect("one request recorded");
+    let body = String::from_utf8(request.body.clone()).expect("utf8 body");
+    assert!(!body.contains("client_id="));
+}
+
+#[tokio::test]
+async fn exchange_maps_a_400_invalid_grant_body_to_error_oauth() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "the code has expired",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = client_credential();
+    let err = client
+        .as_user(&cred)
+        .exchange_authorization_code("stale-code", "https://mcp.example.com/auth/callback", "v")
+        .await
+        .expect_err("400 should be an error");
+    match err {
+        Error::OAuth {
+            status,
+            error,
+            description,
+        } => {
+            assert_eq!(status, 400);
+            assert_eq!(error, "invalid_grant");
+            assert_eq!(description.as_deref(), Some("the code has expired"));
+        }
+        other => panic!("expected Error::OAuth, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exchange_error_never_contains_the_code_or_verifier() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = client_credential();
+    const CODE: &str = "super-secret-code-xyz";
+    const VERIFIER: &str = "super-secret-verifier-xyz";
+    let err = client
+        .as_user(&cred)
+        .exchange_authorization_code(CODE, "https://mcp.example.com/auth/callback", VERIFIER)
+        .await
+        .expect_err("400 should be an error");
+    let display = format!("{err}");
+    let debug = format!("{err:?}");
+    for secret in [CODE, VERIFIER] {
+        assert!(!display.contains(secret), "Display leaked: {display}");
+        assert!(!debug.contains(secret), "Debug leaked: {debug}");
+    }
+}
