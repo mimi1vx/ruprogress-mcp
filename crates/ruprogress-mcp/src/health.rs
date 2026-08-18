@@ -17,7 +17,6 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::auth::oauth::ProbeOutcome as IntrospectionOutcome;
-use crate::config::AuthMode;
 use crate::server::RedmineMcp;
 
 /// How long a single Redmine probe is allowed to take before `/readyz` calls
@@ -207,16 +206,17 @@ async fn run_probe(state: &HealthState) -> CachedProbe {
 }
 
 async fn probe(state: &HealthState) -> ProbeResult {
-    if let AuthMode::OAuth(_) = &state.server.inner.config.auth {
-        return ProbeResult::Introspection(probe_introspection(state).await);
+    if let Some(verifier) = state.server.verifier() {
+        return ProbeResult::Introspection(probe_introspection(&verifier).await);
     }
     ProbeResult::Redmine(probe_redmine(state).await)
 }
 
-async fn probe_introspection(state: &HealthState) -> IntrospectionOutcome {
-    let Some(verifier) = state.server.verifier() else {
-        unreachable!("verifier() is Some in AuthMode::OAuth");
-    };
+/// Routed to by any auth mode that owns a [`crate::auth::oauth::TokenVerifier`]
+/// (`server.verifier()` is `Some`), rather than by matching `AuthMode`
+/// directly — so a future mode sharing the same verifier is probed the same
+/// way with no new arm to remember.
+async fn probe_introspection(verifier: &crate::auth::oauth::TokenVerifier) -> IntrospectionOutcome {
     if let Ok(outcome) = tokio::time::timeout(PROBE_TIMEOUT, verifier.probe()).await {
         outcome
     } else {

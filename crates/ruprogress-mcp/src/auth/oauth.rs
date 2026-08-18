@@ -518,7 +518,11 @@ pub(crate) async fn require_bearer(
     }
 }
 
-fn challenge_response(challenge: &Challenge, error: Option<&str>) -> Response {
+/// `pub(crate)`: also used directly by `transport::http`'s `oauth-proxy`
+/// placeholder MCP-route middleware, which challenges unconditionally
+/// rather than attempting `require_bearer`'s verification (that mode has no
+/// token-store resolver to verify against yet).
+pub(crate) fn challenge_response(challenge: &Challenge, error: Option<&str>) -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     response
         .headers_mut()

@@ -296,6 +296,40 @@ async fn the_readyz_body_carries_exactly_three_readiness_keys_and_no_config() {
     assert!(!raw.contains("127.0.0.1"), "{raw}");
 }
 
+fn oauth_proxy_env(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![
+        ("REDMINE_AUTH_MODE", "oauth-proxy"),
+        ("REDMINE_MCP_BASE_URL", "http://localhost:3040"),
+        ("REDMINE_INTROSPECT_CLIENT_ID", "introspect-client"),
+        ("REDMINE_INTROSPECT_CLIENT_SECRET", "introspect-secret"),
+    ];
+    env.extend_from_slice(extra);
+    env
+}
+
+/// `oauth-proxy` shares `oauth`'s introspection-based readiness probe (step
+/// 8, P9): the verifier is built the same way regardless of which of the
+/// two modes owns it.
+#[tokio::test]
+async fn readyz_in_oauth_proxy_mode_is_ok_when_introspection_answers() {
+    let harness = support::http_harness(&oauth_proxy_env(&[])).await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": false
+            })),
+        )
+        .mount(&harness.redmine)
+        .await;
+
+    let response = get(&harness.url("/readyz")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["introspection"], "ok");
+}
+
 #[tokio::test]
 async fn all_three_endpoints_send_no_store() {
     let harness = support::http_harness(&[]).await;

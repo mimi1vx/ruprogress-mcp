@@ -33,9 +33,10 @@ use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
 use crate::auth::oauth::{self, TokenVerifier};
-use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig};
+use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig, OAuthConfig};
 use crate::health::{self, HealthState};
 use crate::oauth as oauth_docs;
+use crate::oauth::metadata::DiscoveryMode;
 use crate::server::RedmineMcp;
 
 /// The session manager in use. Swapping this for
@@ -69,20 +70,30 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 
     let attachments = server.attachments();
     let health_state = HealthState::new(server.clone(), cfg.health_ttl);
-    // Read before `server` moves into `mcp_service` below.
-    let discovery = server
-        .verifier()
-        .map(|verifier| (server.inner.config.clone(), server.client(), verifier));
-    let oauth_state = discovery.clone().map(|(config, _, verifier)| {
-        let AuthMode::OAuth(oauth_config) = &config.auth else {
-            unreachable!("verifier() is Some only in AuthMode::OAuth");
-        };
-        let challenge = Arc::new(oauth::Challenge::build(
-            &oauth_config.base_url,
-            &cfg.mcp_path,
-        ));
-        (verifier, challenge)
-    });
+    // Read before `server` moves into `mcp_service` below. `discovery_mode`
+    // and `verifier()` are set together by every mode that has either (see
+    // `RedmineMcp::new`), so zipping them here is what actually establishes
+    // "discovery exists" — no downstream site needs to re-derive it from
+    // `AuthMode` again.
+    let discovery_mode = DiscoveryMode::from_auth(&server.inner.config.auth).map(|(mode, _)| mode);
+    // `redirects` lives only on `OAuthProxyConfig`, not the shared
+    // `OAuthConfig` `from_auth` returns, so it needs its own look.
+    let redirects = match &server.inner.config.auth {
+        AuthMode::OAuthProxy(proxy) => Some(proxy.redirects.clone()),
+        AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
+    };
+    let discovery = discovery_mode
+        .zip(server.inner.config.oauth_resource().cloned())
+        .zip(server.verifier())
+        .map(|((mode, oauth), verifier)| {
+            (
+                server.inner.config.clone(),
+                server.client(),
+                verifier,
+                oauth,
+                mode,
+            )
+        });
     let mcp_service: StreamableHttpService<RedmineMcp, SessionManager> = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(SessionManager::default()),
@@ -117,14 +128,33 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         // rebinding check reads.
         .nest_service(&cfg.mcp_path, mcp_service);
 
-    // SECURITY: mounted on the MCP route only, and only in `oauth` mode.
-    // Every other route this router serves — `/livez`, `/readyz`, `/health`,
-    // `/files/{uuid}` (an unguessable, TTL-bounded capability URL), and every future
-    // `/.well-known/*` discovery document — must stay reachable with no
-    // bearer token: RFC 9728 metadata has to be fetchable *before* a client
-    // has a token, and probes must not need a credential (O8).
-    if let Some(state) = oauth_state {
-        mcp_route = mcp_route.layer(middleware::from_fn_with_state(state, oauth::require_bearer));
+    // SECURITY: mounted on the MCP route only, and only in a bearer-token
+    // auth mode. Every other route this router serves — `/livez`, `/readyz`,
+    // `/health`, `/files/{uuid}` (an unguessable, TTL-bounded capability
+    // URL), `/register`, and every `/.well-known/*` discovery document —
+    // must stay reachable with no bearer token: RFC 9728 metadata has to be
+    // fetchable *before* a client has a token, and probes must not need a
+    // credential (O8).
+    match &discovery {
+        Some((_, _, verifier, oauth, DiscoveryMode::Oauth)) => {
+            let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, &cfg.mcp_path));
+            mcp_route = mcp_route.layer(middleware::from_fn_with_state(
+                (verifier.clone(), challenge),
+                oauth::require_bearer,
+            ));
+        }
+        // `oauth-proxy`: no token-store resolver exists yet, so every
+        // request is challenged unconditionally rather than risking
+        // acceptance of a raw upstream Redmine token here, which would
+        // silently downgrade this mode into plain `oauth`.
+        Some((_, _, _, oauth, DiscoveryMode::OAuthProxy)) => {
+            let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, &cfg.mcp_path));
+            mcp_route = mcp_route.layer(middleware::from_fn_with_state(
+                challenge,
+                require_bearer_proxy_stub,
+            ));
+        }
+        None => {}
     }
 
     let mcp_route = mcp_route.layer(TraceLayer::new_for_http());
@@ -135,12 +165,21 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         .merge(files_route(attachments, cfg.allowed_hosts.clone()));
 
     // Merged outside `mcp_route`, so the bearer-auth layer above never sees
-    // these: RFC 9728/8414 metadata and `/revoke` must be reachable with no
-    // token (O8, D6).
-    if let Some((config, client, verifier)) = discovery {
-        router = router
-            .merge(well_known_routes(config, &cfg.mcp_path))
-            .merge(revoke_route(client, verifier));
+    // these: RFC 9728/8414 metadata must be reachable with no token (O8,
+    // D6), and `/revoke` (`oauth` mode only for now — `oauth-proxy` needs
+    // mode-specific semantics of its own before it can be mounted there)
+    // likewise authenticates its own caller rather than needing one.
+    if let Some((config, client, verifier, oauth, mode)) = discovery {
+        router = router.merge(well_known_routes(config, oauth, &cfg.mcp_path, mode));
+        if mode == DiscoveryMode::Oauth {
+            router = router.merge(revoke_route(client, verifier));
+        }
+    }
+    if let Some(redirects) = redirects {
+        router = router.merge(oauth_docs::proxy::endpoints::register_route(
+            Arc::new(oauth_docs::proxy::store::ClientRegistry::new()),
+            Arc::new(redirects),
+        ));
     }
 
     if let Some(cors) = cors_layer(cfg) {
@@ -154,16 +193,29 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 }
 
 #[derive(Clone)]
-struct DiscoveryState(Arc<Config>);
-
-async fn protected_resource_doc(State(DiscoveryState(config)): State<DiscoveryState>) -> Response {
-    axum::Json(oauth_docs::metadata::protected_resource(&config)).into_response()
+struct DiscoveryState {
+    config: Arc<Config>,
+    oauth: Arc<OAuthConfig>,
+    mcp_path: Arc<str>,
+    mode: DiscoveryMode,
 }
 
-async fn authorization_server_doc(
-    State(DiscoveryState(config)): State<DiscoveryState>,
-) -> Response {
-    axum::Json(oauth_docs::metadata::authorization_server(&config)).into_response()
+async fn protected_resource_doc(State(state): State<DiscoveryState>) -> Response {
+    axum::Json(oauth_docs::metadata::protected_resource(
+        &state.config,
+        &state.oauth,
+        &state.mcp_path,
+    ))
+    .into_response()
+}
+
+async fn authorization_server_doc(State(state): State<DiscoveryState>) -> Response {
+    axum::Json(oauth_docs::metadata::authorization_server(
+        &state.config,
+        &state.oauth,
+        state.mode,
+    ))
+    .into_response()
 }
 
 /// RFC 9728 protected-resource and RFC 8414 authorization-server metadata
@@ -171,17 +223,25 @@ async fn authorization_server_doc(
 /// (D8), and cached briefly at the edge so a client's own startup burst
 /// does not re-render them on every request.
 ///
-/// Only ever mounted in `AuthMode::OAuth` — see `router`.
-fn well_known_routes(config: Config, mcp_path: &str) -> Router {
-    let AuthMode::OAuth(oauth_config) = &config.auth else {
-        unreachable!("well_known_routes is only ever mounted in AuthMode::OAuth");
-    };
+/// `oauth`/`mode` are supplied by the caller (`router`, above) rather than
+/// re-derived from `config.auth` — this function has no way to fall back if
+/// they were absent. In `oauth-proxy` mode `oauth.discovery_as` is always
+/// `SelfHosted` (P12, enforced at config-parse time), so the AS document
+/// lands at the root well-known path exactly as `self` discovery mode does
+/// in `oauth` — no extra branch needed here for *where* it is served, only
+/// for *what* `authorization_server_doc` renders.
+fn well_known_routes(
+    config: Config,
+    oauth: OAuthConfig,
+    mcp_path: &str,
+    mode: DiscoveryMode,
+) -> Router {
     let protected_resource_path = format!("/.well-known/oauth-protected-resource{mcp_path}");
     // D3: the suffixed path serves the AS document in `redmine` mode; `self`
     // mode moves it to the root well-known location instead, so the
     // suffixed path 404s there (never registered) rather than serving a
     // second document with a different issuer.
-    let as_path = match oauth_config.discovery_as {
+    let as_path = match oauth.discovery_as {
         DiscoveryAs::Redmine => format!("/.well-known/oauth-authorization-server{mcp_path}"),
         DiscoveryAs::SelfHosted => "/.well-known/oauth-authorization-server".to_string(),
     };
@@ -192,7 +252,25 @@ fn well_known_routes(config: Config, mcp_path: &str) -> Router {
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static("public, max-age=300"),
         ))
-        .with_state(DiscoveryState(Arc::new(config)))
+        .with_state(DiscoveryState {
+            config: Arc::new(config),
+            oauth: Arc::new(oauth),
+            mcp_path: Arc::from(mcp_path),
+            mode,
+        })
+}
+
+/// `oauth-proxy`'s placeholder MCP-route middleware: the token-store
+/// resolver this mode needs does not exist yet, so every request is
+/// challenged unconditionally, regardless of whether it carries a bearer
+/// token at all — never `require_bearer`'s introspection path, which would
+/// otherwise accept a raw upstream Redmine token here.
+async fn require_bearer_proxy_stub(
+    State(challenge): State<Arc<oauth::Challenge>>,
+    _req: Request,
+    _next: Next,
+) -> Response {
+    oauth::challenge_response(&challenge, None)
 }
 
 /// Bytes cap for `POST /revoke`'s request body (D4): far above any real RFC

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `REDMINE_AUTH_MODE=oauth-proxy`: this server discovers as its own OAuth
+  authorization server and accepts RFC 7591 Dynamic Client Registration
+  (`POST /register`), for MCP clients that expect to register themselves
+  rather than being hand-added to Redmine's admin panel. The RFC 8414
+  authorization-server document is always served at the root well-known path
+  (`issuer = REDMINE_MCP_BASE_URL`), naming this server's own
+  `/authorize`/`/token`/`/register`/`/revoke`, `token_endpoint_auth_methods_supported:
+  ["none"]` (every DCR client is public — no secret is ever issued or
+  accepted), and `authorization_response_iss_parameter_supported: true`.
+  `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS` gates which redirect URIs a
+  client may register (component-matched, never a raw-string glob — a
+  pattern a glob would accept and this matcher rejects is a pattern nobody
+  should have written), defaulting to loopback-only. The introspection
+  credential, cache TTL, advertised scopes, and scope-enforcement flag are
+  shared verbatim with `oauth` mode, so `tools/list` filtering and
+  `INSUFFICIENT_SCOPE` denial apply identically once a caller holds a valid
+  bearer token. The authorization-code flow itself (`/authorize`, `/token`)
+  is not part of this change: until it lands, `/mcp` in this mode refuses
+  every request with a `401` regardless of what it is sent, including a raw
+  upstream Redmine token, which must never authenticate here.
 - Three tools for the RedmineUP Checklists Pro plugin, registered only when
   `REDMINE_CHECKLISTS_ENABLED=true`: `get_checklist`, `create_checklist_item`,
   `update_checklist_item`. With the flag off (the default) they are fully

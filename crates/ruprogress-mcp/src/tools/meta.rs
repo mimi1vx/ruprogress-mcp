@@ -6,7 +6,7 @@ use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::config::{AuthMode, PluginFlags};
+use crate::config::PluginFlags;
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::output;
@@ -76,10 +76,11 @@ impl RedmineMcp {
             transport: self.inner.config.transport.label().to_string(),
             current_user,
             plugin_flags: self.inner.config.plugins,
-            oauth_scope_enforcement: match &self.inner.config.auth {
-                AuthMode::OAuth(oauth) => Some(oauth.scope_enforcement),
-                AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
-            },
+            oauth_scope_enforcement: self
+                .inner
+                .config
+                .oauth_resource()
+                .map(|oauth| oauth.scope_enforcement),
             autofill_required_custom_fields: self.inner.config.custom_fields.autofill_required,
             required_custom_field_defaults_count: self.inner.config.custom_fields.defaults.len(),
         };

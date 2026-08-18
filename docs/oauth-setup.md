@@ -15,10 +15,18 @@ and per-tool scope enforcement: `tools/list` shows only the tools a token's
 scopes permit, and `tools/call` on a hidden tool is refused in-band with
 `INSUFFICIENT_SCOPE`.
 
-**Not live yet:**
+`REDMINE_AUTH_MODE=oauth-proxy` is the other bearer-token mode: this server
+*is* the authorization server MCP clients talk to, registering themselves
+with RFC 7591 Dynamic Client Registration rather than being hand-registered
+in Redmine's admin panel. See [oauth-proxy setup](#oauth-proxy-this-server-as-the-authorization-server)
+below.
 
-- `oauth-proxy` mode (this server acting as an authorization server with
-  Dynamic Client Registration) — out of scope for v1.0 entirely.
+**Not live yet (`oauth-proxy`):**
+
+- `/authorize`, `/token`, and the authorization-code + PKCE flow itself
+  (arriving in a follow-up release) — until then, discovery and DCR work,
+  but `/mcp` refuses every request with a `401`.
+- `refresh_token` handling and proxy-mode `/revoke` (also follow-up work).
 
 ## Scope enforcement
 
@@ -295,6 +303,101 @@ administrative access.
 | Server refuses to start naming `REDMINE_MCP_SCOPES` | An entry is not in the current mode's advertised set | Use one of the scopes the error message lists as accepted |
 | Server refuses to start with a `Conflict` naming the transport | `oauth` mode was requested on `stdio` | Use `--transport http` |
 | Token works directly against Redmine but not through this server | Wrong `REDMINE_URL`, or a proxy stripping the `Authorization` header | In Docker, use the internal hostname (e.g. `http://redmine:3000`); check for a proxy that drops `Authorization` |
+
+## oauth-proxy: this server as the authorization server
+
+Plain `oauth` mode requires every MCP client to be hand-registered in
+Redmine's admin panel with its exact redirect URI — fine for a known client
+list, awkward for a client that expects to discover and register itself.
+`REDMINE_AUTH_MODE=oauth-proxy` closes that gap: MCP clients discover *this*
+server as their authorization server, register via RFC 7591 Dynamic Client
+Registration, and (in a follow-up release) run authorization-code + PKCE
+against this server's own `/authorize` and `/token`, which in turn drive a
+second authorization-code flow against Redmine using one
+operator-registered upstream OAuth application.
+
+**Current status:** discovery documents and `POST /register` are live.
+`/authorize` and `/token` are not — `/mcp` challenges every request with a
+`401` regardless of what it's sent, including a raw Redmine token (a proxy
+token is never interchangeable with an upstream one; see the parent design
+doc). This section only covers what already works.
+
+### Configure
+
+```bash
+REDMINE_AUTH_MODE=oauth-proxy
+REDMINE_URL=https://redmine.example.com
+REDMINE_MCP_BASE_URL=https://mcp.example.com   # this server's own public URL
+
+# Introspection client — same requirements as oauth mode (see Steps 1-2
+# above): a confidential Redmine OAuth application with
+# allow_token_introspection enabled.
+REDMINE_INTROSPECT_CLIENT_ID=<Client ID from Redmine>
+REDMINE_INTROSPECT_CLIENT_SECRET=<Client Secret from Redmine>
+
+# Optional: a dedicated upstream OAuth application for the authorization-code
+# flow this server will run against Redmine on a client's behalf. Defaults to
+# the introspection client above when both are left unset; setting one
+# without the other is a startup Conflict. The application needs the
+# authorization-code grant and ${REDMINE_MCP_BASE_URL}/auth/callback
+# registered as its redirect URI (needed once /authorize exists), plus
+# use_refresh_token if you want refresh tokens to work.
+# REDMINE_OAUTH_CLIENT_ID=<upstream Client ID>
+# REDMINE_OAUTH_CLIENT_SECRET=<upstream Client Secret>
+
+# Optional: which redirect URIs a DCR client may register (comma/whitespace
+# separated scheme://host[:port]/path* patterns, or the literal "*" for no
+# restriction beyond http(s)-only). Default: loopback only
+# (http://localhost:*, http://127.0.0.1:*) — the right choice for CLI/desktop
+# MCP clients and the only setting that needs no further thought.
+# REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS=https://your-hosted-client.example.com/callback
+```
+
+`REDMINE_OAUTH_DISCOVERY_AS` does not apply here: this server always
+advertises itself as the authorization server in `oauth-proxy` mode, at the
+root well-known path. Explicitly setting it to `redmine` is a startup
+`Conflict`. `REDMINE_MCP_JWT_SIGNING_KEY`/`_FILE`, if set, is accepted and
+ignored with a startup `WARN` — proxy tokens here are opaque server-side
+handles, never signed JWTs, so there is nothing for a signing key to do.
+
+`oauth-proxy`, like `oauth`, requires `--transport http`.
+
+### Register a client and verify discovery
+
+```bash
+cargo run -- --transport http
+```
+
+```bash
+# RFC 8414 authorization-server metadata, at the root path (not the
+# /mcp-suffixed one — that 404s in this mode).
+curl http://127.0.0.1:8000/.well-known/oauth-authorization-server
+# {"issuer":"...","authorization_endpoint":"...../authorize",
+#  "token_endpoint":"...../token","registration_endpoint":"...../register",
+#  "token_endpoint_auth_methods_supported":["none"], ...}
+
+# RFC 7591 Dynamic Client Registration — no credential needed.
+curl -X POST http://127.0.0.1:8000/register \
+  -H 'content-type: application/json' \
+  -d '{"redirect_uris": ["http://localhost:4000/callback"]}'
+# {"client_id":"...","token_endpoint_auth_method":"none",
+#  "redirect_uris":["http://localhost:4000/callback"], ...}
+# Note: no client_secret is ever issued — every client registered here is
+# public (PKCE plus the redirect allowlist is the real control).
+```
+
+A redirect URI outside the allowlist is rejected with
+`{"error": "invalid_redirect_uri"}`; malformed or unsupported client
+metadata (e.g. `"token_endpoint_auth_method": "client_secret_post"`, which
+this server never accepts) is `{"error": "invalid_client_metadata"}`.
+
+### Endpoints exposed in `oauth-proxy` mode
+
+| Endpoint | Standard | Purpose |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource{mcp_path}` | RFC 9728 §3.1 | Names this server as the resource **and** points at itself as the authorization server |
+| `GET /.well-known/oauth-authorization-server` (root only) | RFC 8414 | Advertises this server's own `/authorize`, `/token`, `/register`, `/revoke` |
+| `POST /register` | RFC 7591 | Dynamic Client Registration — open, no initial access token, every client public |
 
 ## Known limitation: no audience binding
 

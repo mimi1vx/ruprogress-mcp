@@ -79,6 +79,11 @@ pub enum AuthMode {
     /// `Authorization: Bearer` token, validated by RFC 7662 introspection —
     /// see `auth::oauth`.
     OAuth(OAuthConfig),
+    /// This server is itself an OAuth authorization server: MCP clients
+    /// register via DCR and run authorization-code + PKCE against *this*
+    /// server, which in turn runs its own authorization-code + PKCE flow
+    /// against Redmine — see `oauth::proxy`.
+    OAuthProxy(OAuthProxyConfig),
 }
 
 /// OAuth settings.
@@ -108,6 +113,26 @@ pub struct OAuthConfig {
     /// the documented migration escape hatch for tokens minted before the
     /// OAuth application advertised scopes (O11).
     pub scope_enforcement: bool,
+}
+
+/// `oauth-proxy` mode settings (P1). Wraps the same [`OAuthConfig`] `oauth`
+/// mode uses — the introspection credential, cache TTL, advertised scopes,
+/// and scope-enforcement flag have exactly one definition, shared by both
+/// modes (C2) — plus the upstream OAuth client this server authenticates
+/// *itself* to Redmine's authorization-code flow with, and the redirect-URI
+/// policy DCR clients are checked against.
+#[derive(Debug, Clone)]
+pub struct OAuthProxyConfig {
+    /// The bearer-token resource config shared with `oauth` mode.
+    pub resource: OAuthConfig,
+    /// `REDMINE_OAUTH_CLIENT_ID`: the upstream OAuth application's client
+    /// id. Defaults to `resource.introspect_client_id`.
+    pub upstream_client_id: String,
+    /// `REDMINE_OAUTH_CLIENT_SECRET`/`_FILE`. Defaults to
+    /// `resource.introspect_client_secret`.
+    pub upstream_client_secret: SecretString,
+    /// `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS` (P7).
+    pub redirects: crate::oauth::proxy::redirect::RedirectPolicy,
 }
 
 /// `REDMINE_OAUTH_DISCOVERY_AS` (D3): which authorization server this
@@ -998,50 +1023,181 @@ fn parse_auth(
                 audit_identity,
             })
         }
-        "oauth" => {
-            let base_url = parse_oauth_base_url(vars)?;
-            let introspect_client_id = required(
-                vars,
-                "REDMINE_INTROSPECT_CLIENT_ID",
-                "oauth auth mode requires the OAuth client credentials used to introspect \
-                 bearer tokens",
-            )?;
-            let introspect_client_secret = secret(vars, "REDMINE_INTROSPECT_CLIENT_SECRET")?
-                .ok_or(ConfigError::Missing {
-                    var: "REDMINE_INTROSPECT_CLIENT_SECRET",
-                    because: "oauth auth mode requires the OAuth client credentials used to \
-                              introspect bearer tokens (REDMINE_INTROSPECT_CLIENT_SECRET or \
-                              REDMINE_INTROSPECT_CLIENT_SECRET_FILE)",
-                })?;
-            if transport == TransportKind::Stdio {
+        "oauth" => Ok(AuthMode::OAuth(parse_oauth_resource(
+            vars, transport, read_only, plugins,
+        )?)),
+        "oauth-proxy" => {
+            let mut resource = parse_oauth_resource(vars, transport, read_only, plugins)?;
+            // P12: this server IS the authorization server in this mode, so
+            // an explicit "redmine" is contradictory rather than something
+            // to silently override.
+            if optional(vars, "REDMINE_OAUTH_DISCOVERY_AS").as_deref() == Some("redmine") {
                 return Err(ConfigError::Conflict {
-                    because: "oauth auth requires per-request bearer tokens and a 401 challenge \
-                              to discover them, neither of which the stdio transport has"
+                    because: "REDMINE_OAUTH_DISCOVERY_AS=redmine conflicts with oauth-proxy \
+                              mode: this server is the authorization server in this mode, so \
+                              its metadata document cannot name Redmine's endpoints instead"
                         .to_string(),
                 });
             }
-            let token_cache_ttl = parse_token_cache_ttl(vars)?;
-            let discovery_as = parse_discovery_as(vars)?;
-            let full_scopes =
-                crate::oauth::scopes::advertised(read_only, plugins.agile, plugins.tags);
-            let scopes = parse_scopes(vars, full_scopes)?;
-            let scope_enforcement = parse_scope_enforcement(vars)?;
-            Ok(AuthMode::OAuth(OAuthConfig {
-                base_url,
-                introspect_client_id,
-                introspect_client_secret,
-                token_cache_ttl,
-                discovery_as,
-                scopes,
-                scope_enforcement,
+            resource.discovery_as = DiscoveryAs::SelfHosted;
+
+            // P3: accepted for `.env`-ports-unchanged compatibility with the
+            // reference, and warned about once rather than silently ignored.
+            if optional(vars, "REDMINE_MCP_JWT_SIGNING_KEY").is_some()
+                || optional(vars, "REDMINE_MCP_JWT_SIGNING_KEY_FILE").is_some()
+            {
+                tracing::warn!(
+                    "REDMINE_MCP_JWT_SIGNING_KEY(_FILE) is set but unused: oauth-proxy mode \
+                     issues opaque reference tokens (P2), never signed JWTs"
+                );
+            }
+
+            let (upstream_client_id, upstream_client_secret) =
+                parse_upstream_client(vars, &resource)?;
+            let redirects = parse_redirect_policy(vars)?;
+
+            Ok(AuthMode::OAuthProxy(OAuthProxyConfig {
+                resource,
+                upstream_client_id,
+                upstream_client_secret,
+                redirects,
             }))
         }
         other => Err(ConfigError::Invalid {
             var: "REDMINE_AUTH_MODE",
-            expected: "one of \"legacy\", \"legacy-per-user\", \"oauth\"",
+            expected: "one of \"legacy\", \"legacy-per-user\", \"oauth\", \"oauth-proxy\"",
             because: format!("got {other:?}"),
         }),
     }
+}
+
+/// The `OAuthConfig` shared by `oauth` and `oauth-proxy` modes (C2): the
+/// introspection credential, cache TTL, advertised scopes, and
+/// scope-enforcement flag have exactly one parse path, so the two modes
+/// cannot drift.
+fn parse_oauth_resource(
+    vars: &EnvMap,
+    transport: TransportKind,
+    read_only: bool,
+    plugins: PluginFlags,
+) -> Result<OAuthConfig, ConfigError> {
+    let base_url = parse_oauth_base_url(vars)?;
+    let introspect_client_id = required(
+        vars,
+        "REDMINE_INTROSPECT_CLIENT_ID",
+        "oauth auth mode requires the OAuth client credentials used to introspect \
+         bearer tokens",
+    )?;
+    let introspect_client_secret =
+        secret(vars, "REDMINE_INTROSPECT_CLIENT_SECRET")?.ok_or(ConfigError::Missing {
+            var: "REDMINE_INTROSPECT_CLIENT_SECRET",
+            because: "oauth auth mode requires the OAuth client credentials used to \
+                      introspect bearer tokens (REDMINE_INTROSPECT_CLIENT_SECRET or \
+                      REDMINE_INTROSPECT_CLIENT_SECRET_FILE)",
+        })?;
+    if transport == TransportKind::Stdio {
+        return Err(ConfigError::Conflict {
+            because: "oauth auth requires per-request bearer tokens and a 401 challenge \
+                      to discover them, neither of which the stdio transport has"
+                .to_string(),
+        });
+    }
+    let token_cache_ttl = parse_token_cache_ttl(vars)?;
+    let discovery_as = parse_discovery_as(vars)?;
+    let full_scopes = crate::oauth::scopes::advertised(read_only, plugins.agile, plugins.tags);
+    let scopes = parse_scopes(vars, full_scopes)?;
+    let scope_enforcement = parse_scope_enforcement(vars)?;
+    Ok(OAuthConfig {
+        base_url,
+        introspect_client_id,
+        introspect_client_secret,
+        token_cache_ttl,
+        discovery_as,
+        scopes,
+        scope_enforcement,
+    })
+}
+
+/// `REDMINE_OAUTH_CLIENT_ID`/`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`): the
+/// upstream OAuth application `oauth-proxy` mode runs its own
+/// authorization-code flow against. Defaults to `resource`'s introspection
+/// client when neither is set; setting exactly one of the pair is a
+/// `Conflict` rather than a silent partial fallback.
+fn parse_upstream_client(
+    vars: &EnvMap,
+    resource: &OAuthConfig,
+) -> Result<(String, SecretString), ConfigError> {
+    let id = optional(vars, "REDMINE_OAUTH_CLIENT_ID");
+    let client_secret = secret(vars, "REDMINE_OAUTH_CLIENT_SECRET")?;
+    match (id, client_secret) {
+        (Some(id), Some(secret)) => Ok((id, secret)),
+        (None, None) => Ok((
+            resource.introspect_client_id.clone(),
+            resource.introspect_client_secret.clone(),
+        )),
+        (Some(_), None) => Err(ConfigError::Conflict {
+            because: "REDMINE_OAUTH_CLIENT_ID is set without REDMINE_OAUTH_CLIENT_SECRET (or \
+                      _FILE); set both to use a dedicated upstream client, or neither to fall \
+                      back to the introspection client"
+                .to_string(),
+        }),
+        (None, Some(_)) => Err(ConfigError::Conflict {
+            because: "REDMINE_OAUTH_CLIENT_SECRET (or _FILE) is set without \
+                      REDMINE_OAUTH_CLIENT_ID; set both to use a dedicated upstream client, or \
+                      neither to fall back to the introspection client"
+                .to_string(),
+        }),
+    }
+}
+
+/// `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS` (C3): unset/blank →
+/// [`RedirectPolicy::Loopback`]; the literal `*` → [`RedirectPolicy::Any`]
+/// (warned about, since it is a deliberate widening); otherwise a
+/// comma/whitespace-separated list of patterns, each parsed by
+/// [`RedirectPattern::parse`].
+fn parse_redirect_policy(
+    vars: &EnvMap,
+) -> Result<crate::oauth::proxy::redirect::RedirectPolicy, ConfigError> {
+    use crate::oauth::proxy::redirect::{RedirectPattern, RedirectPolicy};
+
+    const VAR: &str = "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS";
+    let Some(raw) = optional(vars, VAR) else {
+        return Ok(RedirectPolicy::Loopback);
+    };
+    if raw == "*" {
+        tracing::warn!(
+            "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS=*: any https redirect URI (and http on a \
+             loopback host) is accepted from any DCR client; only safe when every client that \
+             can reach POST /register is already trusted"
+        );
+        return Ok(RedirectPolicy::Any);
+    }
+    let entries: Vec<&str> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Err(ConfigError::Invalid {
+            var: VAR,
+            expected: "a comma/whitespace-separated list of scheme://host[:port]/path* \
+                       patterns, or the literal \"*\"",
+            because: "the value contains only separators and whitespace; unset the variable \
+                      instead of setting it empty"
+                .to_string(),
+        });
+    }
+    let patterns = entries
+        .into_iter()
+        .map(|raw_pattern| {
+            RedirectPattern::parse(raw_pattern).map_err(|because| ConfigError::Invalid {
+                var: VAR,
+                expected: "a comma/whitespace-separated list of scheme://host[:port]/path* \
+                           patterns, or the literal \"*\"",
+                because,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RedirectPolicy::Patterns(patterns))
 }
 
 fn parse_schema_dialect(vars: &EnvMap) -> Result<SchemaDialect, ConfigError> {
@@ -1291,6 +1447,24 @@ impl Config {
             AuthMode::Legacy { .. } => "legacy",
             AuthMode::LegacyPerUser { .. } => "legacy-per-user",
             AuthMode::OAuth(_) => "oauth",
+            AuthMode::OAuthProxy(_) => "oauth-proxy",
+        }
+    }
+
+    /// The shared `OAuthConfig` (introspection credential, cache TTL,
+    /// advertised scopes, scope-enforcement flag) underlying whichever auth
+    /// mode owns one. `None` in `legacy`/`legacy-per-user`, which have no
+    /// bearer-token verifier to speak of.
+    ///
+    /// The one place every call site that needs "am I in a bearer-token
+    /// auth mode, and if so what is its resource config" asks the question,
+    /// instead of matching on `AuthMode` (and risking an `unreachable!()`)
+    /// at each use.
+    pub(crate) fn oauth_resource(&self) -> Option<&OAuthConfig> {
+        match &self.auth {
+            AuthMode::OAuth(oauth) => Some(oauth),
+            AuthMode::OAuthProxy(proxy) => Some(&proxy.resource),
+            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         }
     }
 
@@ -1343,6 +1517,16 @@ impl Config {
                 "discovery_as": cfg.discovery_as.label(),
                 "scopes": cfg.scopes,
                 "scope_enforcement": cfg.scope_enforcement,
+            })),
+            AuthMode::OAuthProxy(cfg) => Some(json!({
+                "base_url": cfg.resource.base_url.as_str(),
+                "introspect_client_id": cfg.resource.introspect_client_id,
+                "token_cache_ttl_seconds": cfg.resource.token_cache_ttl.as_secs(),
+                "discovery_as": cfg.resource.discovery_as.label(),
+                "scopes": cfg.resource.scopes,
+                "scope_enforcement": cfg.resource.scope_enforcement,
+                "upstream_client_id": cfg.upstream_client_id,
+                "redirect_policy": cfg.redirects.summary_label(),
             })),
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         };
@@ -1904,6 +2088,276 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- oauth-proxy ------------------------------------------------------
+
+    fn valid_oauth_proxy() -> EnvMap {
+        let mut vars = valid_oauth();
+        vars.insert("REDMINE_AUTH_MODE".to_string(), "oauth-proxy".to_string());
+        vars
+    }
+
+    fn as_oauth_proxy(config: &Config) -> &OAuthProxyConfig {
+        let AuthMode::OAuthProxy(proxy) = &config.auth else {
+            panic!("expected oauth-proxy mode, got {config:?}");
+        };
+        proxy
+    }
+
+    #[test]
+    fn oauth_proxy_with_valid_config_succeeds_on_http() {
+        let config =
+            Config::from_map(&valid_oauth_proxy(), TransportKind::Http).expect("should be valid");
+        assert_eq!(config.auth_mode_label(), "oauth-proxy");
+    }
+
+    /// Inventory B1: `scope_enforcement_active()` reads this flag off
+    /// `Config::oauth_resource()`, so proxy mode getting a default of `true`
+    /// here is what makes that positive, asserted (not panic-absence)
+    /// behaviour.
+    #[test]
+    fn oauth_proxy_scope_enforcement_defaults_to_on() {
+        let config =
+            Config::from_map(&valid_oauth_proxy(), TransportKind::Http).expect("should be valid");
+        assert!(as_oauth_proxy(&config).resource.scope_enforcement);
+        assert!(config.oauth_resource().is_some_and(|o| o.scope_enforcement));
+    }
+
+    #[test]
+    fn oauth_proxy_on_stdio_is_conflict() {
+        let err = Config::from_map(&valid_oauth_proxy(), TransportKind::Stdio).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_proxy_without_base_url_is_missing() {
+        let mut vars = valid_oauth_proxy();
+        vars.remove("REDMINE_MCP_BASE_URL");
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "REDMINE_MCP_BASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_proxy_without_introspection_credentials_is_missing() {
+        let mut vars = valid_oauth_proxy();
+        vars.remove("REDMINE_INTROSPECT_CLIENT_SECRET");
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "REDMINE_INTROSPECT_CLIENT_SECRET",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_proxy_discovery_as_defaults_to_self_hosted_even_though_unset() {
+        let config =
+            Config::from_map(&valid_oauth_proxy(), TransportKind::Http).expect("should be valid");
+        assert_eq!(
+            as_oauth_proxy(&config).resource.discovery_as,
+            DiscoveryAs::SelfHosted
+        );
+    }
+
+    #[test]
+    fn oauth_proxy_explicit_self_discovery_is_accepted() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert("REDMINE_OAUTH_DISCOVERY_AS".to_string(), "self".to_string());
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        assert_eq!(
+            as_oauth_proxy(&config).resource.discovery_as,
+            DiscoveryAs::SelfHosted
+        );
+    }
+
+    #[test]
+    fn oauth_proxy_explicit_redmine_discovery_is_conflict() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_OAUTH_DISCOVERY_AS".to_string(),
+            "redmine".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_proxy_upstream_client_defaults_to_the_introspection_client() {
+        let config =
+            Config::from_map(&valid_oauth_proxy(), TransportKind::Http).expect("should be valid");
+        let proxy = as_oauth_proxy(&config);
+        assert_eq!(proxy.upstream_client_id, "introspect-client");
+    }
+
+    #[test]
+    fn oauth_proxy_explicit_upstream_client_overrides_the_default() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_ID".to_string(),
+            "upstream-client".to_string(),
+        );
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_SECRET".to_string(),
+            "upstream-secret".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        assert_eq!(
+            as_oauth_proxy(&config).upstream_client_id,
+            "upstream-client"
+        );
+    }
+
+    #[test]
+    fn oauth_proxy_upstream_client_id_without_secret_is_conflict() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_ID".to_string(),
+            "upstream-client".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_proxy_upstream_client_secret_without_id_is_conflict() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_SECRET".to_string(),
+            "upstream-secret".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(err, ConfigError::Conflict { .. }));
+    }
+
+    #[test]
+    fn oauth_proxy_redirects_default_to_loopback() {
+        let config =
+            Config::from_map(&valid_oauth_proxy(), TransportKind::Http).expect("should be valid");
+        assert_eq!(
+            as_oauth_proxy(&config).redirects.summary_label(),
+            "loopback"
+        );
+    }
+
+    #[test]
+    fn oauth_proxy_redirects_star_is_any_and_warns() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS".to_string(),
+            "*".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        assert_eq!(as_oauth_proxy(&config).redirects.summary_label(), "any");
+    }
+
+    #[test]
+    fn oauth_proxy_redirects_parse_a_pattern_list() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS".to_string(),
+            "https://app.example.com/*, https://*.example.org/*".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        assert_eq!(
+            as_oauth_proxy(&config).redirects.summary_label(),
+            "2 pattern(s)"
+        );
+    }
+
+    #[test]
+    fn oauth_proxy_redirects_rejects_an_unparseable_pattern() {
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS".to_string(),
+            "not-a-pattern".to_string(),
+        );
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_proxy_jwt_signing_key_is_accepted_and_warns() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_MCP_JWT_SIGNING_KEY".to_string(),
+            "unused-value".to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        drop(guard);
+
+        assert_eq!(config.auth_mode_label(), "oauth-proxy");
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("REDMINE_MCP_JWT_SIGNING_KEY"));
+    }
+
+    #[test]
+    fn oauth_proxy_redacted_summary_includes_upstream_client_id_but_no_secret() {
+        const SECRET: &str = "super-secret-upstream-value";
+        let mut vars = valid_oauth_proxy();
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_ID".to_string(),
+            "upstream-client".to_string(),
+        );
+        vars.insert(
+            "REDMINE_OAUTH_CLIENT_SECRET".to_string(),
+            SECRET.to_string(),
+        );
+        let config = Config::from_map(&vars, TransportKind::Http).expect("should be valid");
+        let summary = config.redacted_summary();
+        assert_eq!(summary["auth_mode"], "oauth-proxy");
+        assert_eq!(summary["oauth"]["upstream_client_id"], "upstream-client");
+        assert_eq!(summary["oauth"]["redirect_policy"], "loopback");
+        let rendered = summary.to_string();
+        assert!(!rendered.contains(SECRET));
+    }
+
+    #[test]
+    fn unknown_auth_mode_message_lists_oauth_proxy() {
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_AUTH_MODE".to_string(), "bogus".to_string());
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(format!("{err}").contains("oauth-proxy"));
     }
 
     #[test]

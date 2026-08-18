@@ -135,6 +135,11 @@ async fn stop_sweeper(sweeper: Option<(TaskTracker, CancellationToken)>) {
     }
 }
 
+/// Only `AuthMode::Legacy` attaches an ambient credential here: every other
+/// mode's credential arrives per request (`legacy-per-user`'s header,
+/// `oauth`/`oauth-proxy`'s bearer token), so the client this server owns
+/// must stay anonymous or every request would silently ride on whichever
+/// credential happened to be built in.
 fn build_redmine_client(config: &Config) -> anyhow::Result<RedmineClient> {
     let mut builder = RedmineClientBuilder::new(config.redmine.url.clone())
         .danger_accept_invalid_certs(!config.redmine.ssl_verify);

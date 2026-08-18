@@ -4,4 +4,5 @@
 //! knowledge of requests or tokens, only of `Config`.
 
 pub(crate) mod metadata;
+pub(crate) mod proxy;
 pub(crate) mod scopes;

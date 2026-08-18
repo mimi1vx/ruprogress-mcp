@@ -99,6 +99,10 @@ impl RedmineMcp {
         }
         let oauth_verifier = match &config.auth {
             AuthMode::OAuth(oauth) => Some(Arc::new(TokenVerifier::new(client.clone(), oauth))),
+            AuthMode::OAuthProxy(proxy) => Some(Arc::new(TokenVerifier::new(
+                client.clone(),
+                &proxy.resource,
+            ))),
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         };
         Self {
@@ -154,7 +158,13 @@ impl RedmineMcp {
             AuthMode::LegacyPerUser { audit_identity, .. } => {
                 crate::auth::per_user::scoped(&self.inner.client, ctx, *audit_identity)
             }
-            AuthMode::OAuth(_) => crate::auth::oauth::scoped(&self.inner.client, ctx),
+            // P9: proxy mode's middleware inserts the same `AuthContext`
+            // `oauth` mode's does (a token-store lookup swapped in ahead of
+            // it), so the two modes share this arm rather than a second
+            // near-identical one.
+            AuthMode::OAuth(_) | AuthMode::OAuthProxy(_) => {
+                crate::auth::oauth::scoped(&self.inner.client, ctx)
+            }
         }
     }
 
@@ -170,7 +180,7 @@ impl RedmineMcp {
     pub(crate) fn server_scoped(&self) -> Option<Result<Scoped<'_>, McpError>> {
         match &self.inner.config.auth {
             AuthMode::Legacy { .. } => Some(crate::auth::legacy::scoped(&self.inner.client)),
-            AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
+            AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) | AuthMode::OAuthProxy(_) => None,
         }
     }
 
@@ -193,12 +203,17 @@ impl RedmineMcp {
         )
     }
 
-    /// `true` only in `oauth` mode with `REDMINE_OAUTH_SCOPE_ENFORCEMENT=on`
-    /// (the default) — the one condition under which `list_tools`/
-    /// `call_tool` below deviate from what `#[tool_handler]` would have
-    /// generated (S7).
+    /// `true` only in a bearer-token auth mode with
+    /// `REDMINE_OAUTH_SCOPE_ENFORCEMENT=on` (the default) — the one
+    /// condition under which `list_tools`/`call_tool` below deviate from
+    /// what `#[tool_handler]` would have generated (S7). Reads the flag off
+    /// `Config::oauth_resource()` rather than matching `AuthMode` directly,
+    /// so every mode that shares an `OAuthConfig` shares this decision too.
     fn scope_enforcement_active(&self) -> bool {
-        matches!(&self.inner.config.auth, AuthMode::OAuth(oauth) if oauth.scope_enforcement)
+        self.inner
+            .config
+            .oauth_resource()
+            .is_some_and(|oauth| oauth.scope_enforcement)
     }
 }
 

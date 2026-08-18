@@ -14,7 +14,7 @@ real process environment.
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `REDMINE_URL` | yes | — | Must be `http`/`https` and must not contain userinfo (`https://user:pass@host` is rejected — credentials belong in `REDMINE_API_KEY`, not the URL). |
-| `REDMINE_AUTH_MODE` | no | `legacy` | One of `legacy`, `legacy-per-user`, `oauth`. Any other value is `Invalid`. |
+| `REDMINE_AUTH_MODE` | no | `legacy` | One of `legacy`, `legacy-per-user`, `oauth`, `oauth-proxy`. Any other value is `Invalid`. |
 | `REDMINE_API_KEY` | yes, in `legacy` mode | — | The API key sent as `X-Redmine-API-Key`. Mutually exclusive with `REDMINE_API_KEY_FILE`. |
 | `REDMINE_API_KEY_FILE` | yes, in `legacy` mode (alternative) | — | Path to a file containing the key (Docker/K8s secret mount). Exactly one trailing newline is trimmed. Setting both this and `REDMINE_API_KEY` is a `Conflict`. |
 | `REDMINE_PER_USER_TRUST_PROXY` | yes, in `legacy-per-user` mode | — | Must be exactly `true`. Absent/false refuses to start (`Missing`) — this is the operator's explicit attestation that a TLS-terminating proxy sits in front and does not forward client `X-Forwarded-Proto`. `legacy-per-user` is additionally rejected outright on the `stdio` transport (`Conflict`): there is no per-request header to carry a credential over stdio. Startup logs a `WARN` naming this assumption every time the mode is enabled. See `docs/legacy-per-user-auth.md`. |
@@ -24,9 +24,14 @@ real process environment.
 | `REDMINE_INTROSPECT_CLIENT_SECRET` | yes, in `oauth` mode | — | Mutually exclusive with `REDMINE_INTROSPECT_CLIENT_SECRET_FILE`. |
 | `REDMINE_INTROSPECT_CLIENT_SECRET_FILE` | yes, in `oauth` mode (alternative) | — | Path to a file containing the secret (Docker/K8s secret mount). Setting both this and `REDMINE_INTROSPECT_CLIENT_SECRET` is a `Conflict`. |
 | `REDMINE_OAUTH_TOKEN_CACHE_TTL_SECONDS` | no | `60` | 0–3600. How long a positive introspection result is cached, further capped by the token's own `exp`. `0` disables caching entirely. See `docs/oauth-setup.md`. |
-| `REDMINE_OAUTH_DISCOVERY_AS` | no, `oauth` mode only | `redmine` | `redmine` or `self`. `self` serves the RFC 8414 authorization-server document at the root well-known path with `issuer = REDMINE_MCP_BASE_URL` (and 404s the suffixed path) instead of the default — see `docs/oauth-setup.md`. |
+| `REDMINE_OAUTH_DISCOVERY_AS` | no, `oauth`/`oauth-proxy` modes only | `redmine` (`oauth`), forced `self` (`oauth-proxy`) | `redmine` or `self`. In `oauth` mode, `self` serves the RFC 8414 authorization-server document at the root well-known path with `issuer = REDMINE_MCP_BASE_URL` (and 404s the suffixed path) instead of the default — see `docs/oauth-setup.md`. In `oauth-proxy` mode this server always advertises itself as the authorization server regardless of this variable; explicitly setting `redmine` there is a startup `Conflict`. |
 | `REDMINE_MCP_SCOPES` | no, `oauth` mode only | the full advertised set | Whitespace-separated subset of the scopes this server advertises in its OAuth discovery documents. Every entry must already be advertised in the current mode (respecting `REDMINE_MCP_READ_ONLY`/agile/tags gating); an out-of-set entry refuses to boot, listing the accepted set. Narrows advertisement; enforcement is `REDMINE_OAUTH_SCOPE_ENFORCEMENT` below. |
-| `REDMINE_OAUTH_SCOPE_ENFORCEMENT` | no, `oauth` mode only | `on` | `on` or `off`. `off` disables both `tools/list` filtering and `tools/call` scope denial, restoring unfiltered behaviour, and logs a startup `WARN` — intended only for tokens minted before the OAuth application advertised scopes. See `docs/oauth-setup.md`. |
+| `REDMINE_OAUTH_SCOPE_ENFORCEMENT` | no, `oauth`/`oauth-proxy` modes only | `on` | `on` or `off`. `off` disables both `tools/list` filtering and `tools/call` scope denial, restoring unfiltered behaviour, and logs a startup `WARN` — intended only for tokens minted before the OAuth application advertised scopes. See `docs/oauth-setup.md`. |
+| `REDMINE_OAUTH_CLIENT_ID` | no, `oauth-proxy` mode only | `REDMINE_INTROSPECT_CLIENT_ID` | The upstream OAuth application `oauth-proxy` mode will run its own authorization-code flow against Redmine with. Setting this without `REDMINE_OAUTH_CLIENT_SECRET` (or vice versa) is a `Conflict`. |
+| `REDMINE_OAUTH_CLIENT_SECRET` | no, `oauth-proxy` mode only | `REDMINE_INTROSPECT_CLIENT_SECRET` | Mutually exclusive with `REDMINE_OAUTH_CLIENT_SECRET_FILE`. |
+| `REDMINE_OAUTH_CLIENT_SECRET_FILE` | no, `oauth-proxy` mode only (alternative) | — | Path to a file containing the secret. Setting both this and `REDMINE_OAUTH_CLIENT_SECRET` is a `Conflict`. |
+| `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS` | no, `oauth-proxy` mode only | loopback only | Comma/whitespace-separated `scheme://host[:port]/path*` patterns a DCR-registered client's `redirect_uris` are checked against (a single leading `*.` host label is the only wildcard form), or the literal `*` for no restriction beyond `http`/`https`-only, no userinfo, no fragment, and `http` restricted to loopback hosts (logs a startup `WARN`). Default: `http://localhost:*` and `http://127.0.0.1:*`. See `docs/oauth-setup.md`. |
+| `REDMINE_MCP_JWT_SIGNING_KEY`/`_FILE` | no | — | Accepted in `oauth-proxy` mode for compatibility with the reference server's config surface, but unused: proxy tokens here are opaque server-side handles (never signed JWTs), so setting either logs a startup `WARN` naming it as ignored. Outside `oauth-proxy` mode it is still recognised-but-unread (see "Not yet implemented"). |
 | `REDMINE_SSL_VERIFY` | no | `true` | `false` is accepted but logs a `WARN` — never silently downgrades without a trace. |
 | `REDMINE_MCP_READ_ONLY` | no | `false` | Removes every tool in `readonly::write_tools::ALL` from the router (hides from `tools/list` **and** rejects `tools/call`). |
 | `REDMINE_MCP_SCHEMA_DIALECT` | no | `strict` | One of `strict`, `portable`. `portable` inlines every `inputSchema`'s `$ref`/`$defs` and collapses `{"type":["T","null"]}` to `{"type":"T"}`, for clients (Google Vertex/Gemini) whose function-calling schema validator rejects the rich JSON Schema 2020-12 form. `outputSchema` is unaffected either way — see ADR 0007. |
@@ -96,10 +101,11 @@ These are recognised names that `ruprogress-mcp` does not read yet; setting
 them today has no effect.
 
 `REDMINE_USERNAME`, `REDMINE_PASSWORD`,
-`REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`,
-`REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `FASTMCP_HOME`,
-`REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `REDMINE_OAUTH_CLIENT_ID`,
-`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`).
+`REDMINE_SSL_CERT`, `REDMINE_SSL_CLIENT_CERT`, `FASTMCP_HOME`.
+
+(`REDMINE_MCP_JWT_SIGNING_KEY`(`_FILE`), `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`,
+and `REDMINE_OAUTH_CLIENT_ID`/`REDMINE_OAUTH_CLIENT_SECRET`(`_FILE`) moved to
+the main table above once `oauth-proxy` mode existed to read them.)
 
 The 8 attachment-related variables are validated and read (see "Attachment
 store" below). `get_redmine_attachment`
@@ -227,7 +233,7 @@ Served on the HTTP transport only.
 | Path | Checks | Codes |
 |---|---|---|
 | `/livez` | The process, and nothing else. | Always `200` |
-| `/readyz` | A TTL-cached probe: `GET /my/account.json` in `legacy` mode, RFC 7662 introspection with a synthetic token in `oauth` mode, none in `legacy-per-user`. | `200` ready, `503` not ready |
+| `/readyz` | A TTL-cached probe: `GET /my/account.json` in `legacy` mode, RFC 7662 introspection with a synthetic token in `oauth`/`oauth-proxy` modes, none in `legacy-per-user`. | `200` ready, `503` not ready |
 | `/health` | Alias for `/readyz`. | as `/readyz` |
 
 `/livez` deliberately never touches Redmine: wired to a Kubernetes
@@ -248,7 +254,7 @@ The body is readiness facts only, `legacy`/`legacy-per-user`:
 mode, where the server owns no credential to probe with; reporting "down"
 there would take the instance out of rotation permanently.
 
-`oauth` mode probes introspection instead (bypassing the token cache — the
+`oauth`/`oauth-proxy` modes probe introspection instead (bypassing the token cache — the
 probe uses a synthetic token no real Doorkeeper token matches) and gains a
 `checks` field:
 

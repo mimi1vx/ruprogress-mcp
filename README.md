@@ -1,7 +1,7 @@
 # ruprogress-mcp
 
 A Redmine MCP server in Rust. It exposes Redmine's REST API to MCP clients as
-41 tools over stdio and streamable HTTP, with three authentication modes, a
+41 tools over stdio and streamable HTTP, with four authentication modes, a
 read-only mode, bounded responses, and a local attachment store.
 
 ## Quick start
@@ -83,13 +83,14 @@ full JSON Schema 2020-12 form. The default `strict` keeps the rich form. See
 
 ## Authentication
 
-`REDMINE_AUTH_MODE` selects one of three modes:
+`REDMINE_AUTH_MODE` selects one of four modes:
 
 | Mode | Credential | Transport |
 |---|---|---|
 | `legacy` (default) | One `REDMINE_API_KEY` shared by every client. | stdio, http |
 | `legacy-per-user` | Each request carries its caller's own `X-Redmine-API-Key`. | http only |
 | `oauth` | Each client presents a Redmine Doorkeeper bearer token, validated by RFC 7662 introspection and forwarded upstream verbatim. | http only |
+| `oauth-proxy` | This server is itself an authorization server: clients register via RFC 7591 DCR. Discovery and registration are live; the authorization-code flow itself (`/authorize`, `/token`) is a follow-up release. | http only |
 
 `legacy-per-user` requires the operator to attest to a TLS-terminating proxy
 via `REDMINE_PER_USER_TRUST_PROXY=true` — see
@@ -116,6 +117,7 @@ router entirely and makes the write actions of `manage_issue_relation`,
 | `/health` | Alias for `/readyz`. |
 | `/files/{uuid}` | Downloads a staged attachment. |
 | `/.well-known/oauth-protected-resource…`, `/.well-known/oauth-authorization-server…`, `/revoke` | `oauth` mode only. |
+| `/register` | RFC 7591 Dynamic Client Registration, `oauth-proxy` mode only. |
 
 The edge is hardened: a `Host` allowlist against DNS rebinding (applied to both
 `/mcp` and `/files`), exact-match CORS only when origins are configured, a
@@ -150,8 +152,9 @@ rewrites every emitted `content_url` to a client-reachable origin.
 
 - Interactive Apps tools (drag-and-drop dashboards) — deferred until `rmcp`
   supports the MCP Apps extension.
-- `oauth-proxy` mode, with this server acting as an authorization server doing
-  Dynamic Client Registration.
+- `oauth-proxy`'s authorization-code flow (`/authorize`, `/token`) — discovery
+  and DCR (`POST /register`) are implemented; the flow itself is a follow-up
+  release.
 - Plugin tool families (checklists, products, CRM contacts, DMSF documents);
   their `REDMINE_*_ENABLED` flags are reported by `get_mcp_server_info` only.
 - Horizontal scaling / shared auth state — single-process only.
