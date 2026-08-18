@@ -72,7 +72,23 @@ fn build_server(
 pub(crate) async fn harness(env: &[(&str, &str)]) -> Harness {
     let redmine = wiremock::MockServer::start().await;
     let (server, _) = build_server(&redmine, env, TransportKind::Stdio);
+    serve_over_duplex(redmine, server).await
+}
 
+/// Like [`harness`], but registers `route` on the server before it starts
+/// serving — for tests that need a handler `build_server`'s fixed tool
+/// routers don't provide (`tests/panic_containment.rs`'s panicking tool).
+pub(crate) async fn harness_with_route(
+    env: &[(&str, &str)],
+    route: rmcp::handler::server::router::tool::ToolRoute<RedmineMcp>,
+) -> Harness {
+    let redmine = wiremock::MockServer::start().await;
+    let (mut server, _) = build_server(&redmine, env, TransportKind::Stdio);
+    server.add_test_route(route);
+    serve_over_duplex(redmine, server).await
+}
+
+async fn serve_over_duplex(redmine: wiremock::MockServer, server: RedmineMcp) -> Harness {
     let (server_transport, client_transport) = tokio::io::duplex(4096);
     tokio::spawn(async move {
         let running = server

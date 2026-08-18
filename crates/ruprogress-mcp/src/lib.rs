@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 mod health;
 mod oauth;
+mod panic_guard;
 pub mod readonly;
 pub mod render;
 pub mod server;

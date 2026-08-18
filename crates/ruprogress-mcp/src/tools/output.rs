@@ -225,6 +225,10 @@ impl<'a> ContentUrlRewrite<'a> {
 /// `InsufficientScope` (`auth::scope`, `oauth` mode only) is the in-band
 /// denial for a `tools/call` whose bearer token lacks a required scope,
 /// naming the missing scope(s) in the error message.
+///
+/// `Internal` means a bug in this server — a tool handler panicked — not a
+/// problem with Redmine or with the caller's arguments (`panic_guard.rs`).
+/// Not retryable: the same call will panic again.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -247,6 +251,7 @@ pub(crate) enum ErrorCode {
     UnsupportedSource,
     PathNotAllowed,
     InsufficientScope,
+    Internal,
 }
 
 impl ErrorCode {

@@ -127,6 +127,15 @@ impl RedmineMcp {
         Arc::clone(&self.inner.attachments)
     }
 
+    /// Test-only seam: inject an extra tool route after construction. Exists
+    /// so `tests/panic_containment.rs` can register a handler that panics on
+    /// purpose, without a production code path ever needing to add a route
+    /// post-`new`. Must not be called from `main.rs`.
+    #[doc(hidden)]
+    pub fn add_test_route(&mut self, route: rmcp::handler::server::router::tool::ToolRoute<Self>) {
+        self.tool_router.add_route(route);
+    }
+
     /// The underlying `RedmineClient`, for `transport::http::router` to hand
     /// to the `POST /revoke` route: that route scopes each request to the
     /// *caller's own* client authentication (D4), not this server's, so it
@@ -261,53 +270,69 @@ impl ServerHandler for RedmineMcp {
     /// version. Active, it resolves the call's scope requirement (S1–S5)
     /// and returns the S6 in-band `INSUFFICIENT_SCOPE` envelope on denial —
     /// never an `McpError`, and never before checking `admin` (S2).
+    ///
+    /// The whole body runs under `panic_guard::catch_tool_panic` — scope
+    /// resolution above is caller-controlled parsing too, not just the
+    /// dispatch it guards.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if self.scope_enforcement_active() {
-            let auth = crate::auth::oauth::auth_context(&context)?;
-            if !scope::is_admin(&auth.scopes) {
-                match scope::required_for_call(&request.name, request.arguments.as_ref()) {
-                    scope::Requirement::Unchecked => {}
-                    scope::Requirement::Scopes(required) => {
-                        let missing = scope::missing(required, &auth.scopes);
-                        if !missing.is_empty() {
-                            return Ok(
-                                scope::insufficient_scope_result(&request.name, &missing).into()
+        let tool_name = request.name.to_string();
+        crate::panic_guard::catch_tool_panic(&tool_name, async move {
+            if self.scope_enforcement_active() {
+                let auth = crate::auth::oauth::auth_context(&context)?;
+                if !scope::is_admin(&auth.scopes) {
+                    match scope::required_for_call(&request.name, request.arguments.as_ref()) {
+                        scope::Requirement::Unchecked => {}
+                        scope::Requirement::Scopes(required) => {
+                            let missing = scope::missing(required, &auth.scopes);
+                            if !missing.is_empty() {
+                                return Ok(scope::insufficient_scope_result(
+                                    &request.name,
+                                    &missing,
+                                )
+                                .into());
+                            }
+                        }
+                        scope::Requirement::AnyOf(any) => {
+                            if !scope::any_held(any, &auth.scopes) {
+                                return Ok(
+                                    scope::insufficient_any_of_result(&request.name, any).into()
+                                );
+                            }
+                        }
+                        scope::Requirement::ScopesWithAnyOf { all, any } => {
+                            let missing = scope::missing(all, &auth.scopes);
+                            if !missing.is_empty() {
+                                return Ok(scope::insufficient_scope_result(
+                                    &request.name,
+                                    &missing,
+                                )
+                                .into());
+                            }
+                            if !scope::any_held(any, &auth.scopes) {
+                                return Ok(
+                                    scope::insufficient_any_of_result(&request.name, any).into()
+                                );
+                            }
+                        }
+                        scope::Requirement::Unmapped => {
+                            tracing::error!(
+                                tool = %request.name,
+                                "tool has no TOOL_SCOPES entry; denying by default"
                             );
+                            return Ok(scope::insufficient_scope_result(&request.name, &[]).into());
                         }
-                    }
-                    scope::Requirement::AnyOf(any) => {
-                        if !scope::any_held(any, &auth.scopes) {
-                            return Ok(scope::insufficient_any_of_result(&request.name, any).into());
-                        }
-                    }
-                    scope::Requirement::ScopesWithAnyOf { all, any } => {
-                        let missing = scope::missing(all, &auth.scopes);
-                        if !missing.is_empty() {
-                            return Ok(
-                                scope::insufficient_scope_result(&request.name, &missing).into()
-                            );
-                        }
-                        if !scope::any_held(any, &auth.scopes) {
-                            return Ok(scope::insufficient_any_of_result(&request.name, any).into());
-                        }
-                    }
-                    scope::Requirement::Unmapped => {
-                        tracing::error!(
-                            tool = %request.name,
-                            "tool has no TOOL_SCOPES entry; denying by default"
-                        );
-                        return Ok(scope::insufficient_scope_result(&request.name, &[]).into());
                     }
                 }
             }
-        }
 
-        let tcc = ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+            let tcc = ToolCallContext::new(self, request, context);
+            self.tool_router.call(tcc).await
+        })
+        .await
     }
 }
 

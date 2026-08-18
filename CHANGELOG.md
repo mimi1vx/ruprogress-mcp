@@ -280,6 +280,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integer `format` values `schemars` emits for `u32`/`u64` fields, which made
   strict JSON Schema clients (e.g. opencode's Ajv-based validator) log an
   "unknown format" warning per field on every `tools/list`.
+- A panicking tool handler used to hang the caller's request forever (the
+  panic was caught by the tokio runtime, but nothing ever answered the
+  client). `call_tool` now catches the panic and returns an in-band
+  `{error, code: "INTERNAL", retryable: false, hint}` result instead; the
+  session and every other in-flight request are unaffected.
 
 ### Changed
 
@@ -298,3 +303,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Host` validation silently disabled. Porting an upstream `.env` that sets
   only `SERVER_HOST=0.0.0.0` needs one added variable; the error message names
   both options and the `*` opt-out.
+- The release build now sets `lto = "thin"`, `codegen-units = 1`, and
+  `strip = "debuginfo"` explicitly, shrinking the binary by roughly a
+  quarter; `panic = "unwind"` is pinned (it was already the default) since
+  the panic containment above depends on it.

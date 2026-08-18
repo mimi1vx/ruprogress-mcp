@@ -40,6 +40,14 @@ see and call is governed by `TOOL_SCOPES` in
 `crates/ruprogress-mcp/src/auth/scope.rs` — every tool implemented above must
 have an entry there; see `docs/oauth-setup.md`'s "Scope enforcement" section.
 
+Every tool's failures come back in-band as `{error, code, retryable, hint}`
+rather than as MCP protocol errors — see `ErrorCode` in
+`crates/ruprogress-mcp/src/tools/output.rs` for the closed set of `code`
+values, most of which are tool-specific (`NOT_FOUND`, `VALIDATION_FAILED`,
+`RATE_LIMITED`, `READ_ONLY`, `INSUFFICIENT_SCOPE`, …). One code applies to
+every tool: `INTERNAL` means a tool handler panicked — a bug in this server,
+not in Redmine or in the caller's arguments — and is never retryable.
+
 ## Project Management
 
 ### `list_redmine_projects`

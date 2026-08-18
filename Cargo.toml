@@ -2,6 +2,16 @@
 members  = ["crates/*"]
 resolver = "3"
 
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "debuginfo"
+# Explicit, not just the default: `panic_guard.rs`'s `catch_unwind` around
+# `call_tool` is a no-op under `panic = "abort"`, and abort would turn a
+# contained tool panic into a process kill. Do not change this without
+# removing that containment too.
+panic         = "unwind"
+
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"

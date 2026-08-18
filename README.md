@@ -61,8 +61,9 @@ impact preview first, `delete_file` requires
 Every tool returns structured JSON content with a declared `outputSchema`.
 Failures come back in-band as `{error, code, retryable, hint}` with a stable
 `code` (`NOT_FOUND`, `VALIDATION_FAILED`, `RATE_LIMITED`, `READ_ONLY`,
-`CONFIRMATION_REQUIRED`, `INSUFFICIENT_SCOPE`, …) rather than as MCP protocol
-errors, so a model can act on them.
+`CONFIRMATION_REQUIRED`, `INSUFFICIENT_SCOPE`, `INTERNAL`, …) rather than as
+MCP protocol errors, so a model can act on them. A panicking tool handler is
+caught and answered with `code: "INTERNAL"` rather than left hanging.
 
 List responses are capped by `REDMINE_MCP_MAX_RESPONSE_ITEMS` (200) and
 `REDMINE_MCP_MAX_RESPONSE_BYTES` (256 KiB); a truncated payload says so via
