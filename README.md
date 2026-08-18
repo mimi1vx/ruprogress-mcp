@@ -116,8 +116,9 @@ router entirely and makes the write actions of `manage_issue_relation`,
 | `/readyz` | TTL-cached Redmine reachability probe. |
 | `/health` | Alias for `/readyz`. |
 | `/files/{uuid}` | Downloads a staged attachment. |
-| `/.well-known/oauth-protected-resource…`, `/.well-known/oauth-authorization-server…`, `/revoke` | `oauth` mode only. |
-| `/register`, `/authorize`, `/auth/callback`, `/token` | `oauth-proxy` mode only: RFC 7591 DCR and the authorization-code + PKCE flow. |
+| `/.well-known/oauth-protected-resource…`, `/.well-known/oauth-authorization-server…` | `oauth`/`oauth-proxy` modes only. |
+| `/revoke` | `oauth`/`oauth-proxy` modes only, with mode-specific semantics — see `docs/oauth-setup.md`. |
+| `/register`, `/authorize`, `/auth/callback`, `/token` | `oauth-proxy` mode only: RFC 7591 DCR, the authorization-code + PKCE flow, and the `refresh_token` grant. |
 
 The edge is hardened: a `Host` allowlist against DNS rebinding (applied to both
 `/mcp` and `/files`), exact-match CORS only when origins are configured, a
@@ -152,8 +153,6 @@ rewrites every emitted `content_url` to a client-reachable origin.
 
 - Interactive Apps tools (drag-and-drop dashboards) — deferred until `rmcp`
   supports the MCP Apps extension.
-- `oauth-proxy`'s `refresh_token` grant and proxy-mode `/revoke` — the
-  authorization-code + PKCE flow itself is implemented.
 - Plugin tool families (checklists, products, CRM contacts, DMSF documents);
   their `REDMINE_*_ENABLED` flags are reported by `get_mcp_server_info` only.
 - Horizontal scaling / shared auth state — single-process only.

@@ -21,11 +21,6 @@ with RFC 7591 Dynamic Client Registration rather than being hand-registered
 in Redmine's admin panel. See [oauth-proxy setup](#oauth-proxy-this-server-as-the-authorization-server)
 below.
 
-**Not live yet (`oauth-proxy`):** `refresh_token` handling and proxy-mode
-`/revoke` (follow-up work) — until then, an expired proxy access token
-means re-authorizing from `/authorize` again, and there is no way to
-revoke one early.
-
 ## Scope enforcement
 
 Every tool call is checked against a hand-maintained map from tool name to
@@ -341,8 +336,10 @@ REDMINE_INTROSPECT_CLIENT_SECRET=<Client Secret from Redmine>
 # the introspection client above when both are left unset; setting one
 # without the other is a startup Conflict. The application needs the
 # authorization-code grant and ${REDMINE_MCP_BASE_URL}/auth/callback
-# registered as its redirect URI, plus use_refresh_token if you want refresh
-# tokens to work (refresh support in this server itself is follow-up work).
+# registered as its redirect URI. Also enable use_refresh_token on this
+# application if you want a session to survive the upstream access token's
+# expiry without a browser — see "Refresh, revocation, and no-refresh-token
+# deployments" below.
 # REDMINE_OAUTH_CLIENT_ID=<upstream Client ID>
 # REDMINE_OAUTH_CLIENT_SECRET=<upstream Client Secret>
 
@@ -401,7 +398,34 @@ this server never accepts) is `{"error": "invalid_client_metadata"}`.
 | `POST /register` | RFC 7591 | Dynamic Client Registration — open, no initial access token, every client public |
 | `GET /authorize` | RFC 6749 §3.1 | Validates the client/redirect URI/PKCE, then redirects to Redmine's own `/oauth/authorize` behind a second, independently generated upstream PKCE pair |
 | `GET /auth/callback` | — (this server's own) | Where Redmine redirects back to; exchanges Redmine's code for an upstream token and redirects to the client with this server's own code |
-| `POST /token` | RFC 6749 §4.1.3 | Redeems that code (mandatory S256 PKCE) for a `rup_at_` proxy access token — never the upstream Redmine token |
+| `POST /token` (`grant_type=authorization_code`) | RFC 6749 §4.1.3 | Redeems that code (mandatory S256 PKCE) for a `rup_at_` proxy access token — and a `rup_rt_` proxy refresh token, if the upstream application issued one |
+| `POST /token` (`grant_type=refresh_token`) | RFC 6749 §6 | Rotates: refreshes upstream and returns a brand-new `rup_at_`/`rup_rt_` pair, invalidating the presented refresh token |
+| `POST /revoke` | RFC 7009 | Accepts a `rup_at_`/`rup_rt_` token, deletes it (and its sibling) locally first, then revokes the upstream Redmine token — no client authentication, since every client here is public |
+
+## Refresh, revocation, and no-refresh-token deployments
+
+A `rup_at_` proxy access token never outlives the upstream Redmine token it
+resolves to. When the authorization-code exchange or a refresh grants one, a
+`rup_rt_` proxy refresh token comes with it — present that at `/token` with
+`grant_type=refresh_token` and `client_id` before the access token expires to
+get a new pair without a browser. Refresh tokens rotate: each one works
+exactly once, and presenting an already-rotated one again is treated as a
+stolen credential — the whole session (including the newest pair) is killed
+and revoked upstream immediately.
+
+**If your Redmine OAuth application does not have `use_refresh_token`
+enabled**, Doorkeeper never issues a refresh token, `/token`'s response has
+no `refresh_token` field, and this server logs one `WARN` per process saying
+so. The proxy access token still works — for as long as Redmine's own
+(typically 2 hour) access-token lifetime — but once it expires the client
+must send its user through `/authorize` again, in a browser, exactly as if
+this were the first sign-in. Enable `use_refresh_token` on the upstream
+application to avoid that.
+
+`POST /revoke` in this mode always answers `200`, per RFC 7009, whether the
+token was ours, already gone, or never issued. A revoked access token stops
+authenticating on the very next request; a revoked refresh token also kills
+the access token it was issued alongside.
 
 ## Known limitation: in-memory, single-replica state
 

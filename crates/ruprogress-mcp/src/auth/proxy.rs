@@ -12,7 +12,7 @@ use axum::response::Response;
 use secrecy::ExposeSecret as _;
 
 use crate::auth::oauth::{self, AuthError, BearerError, Challenge, TokenVerifier};
-use crate::oauth::proxy::store::{TokenStore, UpstreamStore};
+use crate::oauth::proxy::store::ProxyState;
 
 /// Prefix every minted proxy access token carries (P2, F9). Anything else
 /// presented here — including a raw upstream Redmine token — is
@@ -25,8 +25,7 @@ const ACCESS_TOKEN_PREFIX: &str = "rup_at_";
 /// bumps), which is what `axum::middleware::from_fn_with_state` requires.
 #[derive(Clone)]
 pub(crate) struct ProxyAuthState {
-    pub(crate) tokens: Arc<TokenStore>,
-    pub(crate) upstream_tokens: Arc<UpstreamStore>,
+    pub(crate) proxy: Arc<ProxyState>,
     pub(crate) verifier: Arc<TokenVerifier>,
     pub(crate) challenge: Arc<Challenge>,
 }
@@ -57,10 +56,10 @@ pub(crate) async fn require_proxy_bearer(
         return oauth::challenge_response(&state.challenge, Some("invalid_token"));
     }
 
-    let Some(entry) = state.tokens.resolve(token.expose_secret()) else {
+    let Some(entry) = state.proxy.tokens.resolve(token.expose_secret()) else {
         return oauth::challenge_response(&state.challenge, Some("invalid_token"));
     };
-    let Some(upstream_access) = state.upstream_tokens.access_token(&entry.upstream_id) else {
+    let Some(upstream_access) = state.proxy.upstream_tokens.access_token(&entry.upstream_id) else {
         return oauth::challenge_response(&state.challenge, Some("invalid_token"));
     };
 

@@ -282,3 +282,115 @@ async fn exchange_error_never_contains_the_code_or_verifier() {
         assert!(!debug.contains(secret), "Debug leaked: {debug}");
     }
 }
+
+// --- refresh_access_token (R1) ------------------------------------------
+
+#[tokio::test]
+async fn refresh_sends_basic_auth_and_the_exact_form_body_with_no_client_id() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(basic_auth("upstream-client", "upstream-secret"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=the-refresh-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "new-upstream-access-token",
+            "refresh_token": "new-upstream-refresh-token",
+            "expires_in": 7200,
+            "scope": "view_issues",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::Basic {
+        user: "upstream-client".to_string(),
+        pass: SecretString::from("upstream-secret"),
+    };
+    let token = client
+        .as_user(&cred)
+        .refresh_access_token(&SecretString::from("the-refresh-token"))
+        .await
+        .expect("refresh should succeed");
+
+    use secrecy::ExposeSecret;
+    assert_eq!(
+        token.access_token.expose_secret(),
+        "new-upstream-access-token"
+    );
+    assert_eq!(
+        token
+            .refresh_token
+            .as_ref()
+            .map(ExposeSecret::expose_secret),
+        Some("new-upstream-refresh-token")
+    );
+
+    // Never sent as a form field: the Basic-auth header already
+    // authenticates the client per RFC 6749 §3.2.1.
+    let requests = server.received_requests().await.expect("requests recorded");
+    let request = requests.first().expect("one request recorded");
+    let body = String::from_utf8(request.body.clone()).expect("utf8 body");
+    assert!(!body.contains("client_id="));
+}
+
+#[tokio::test]
+async fn refresh_maps_a_400_invalid_grant_body_to_error_oauth() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "the refresh token has been revoked",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = client_credential();
+    let err = client
+        .as_user(&cred)
+        .refresh_access_token(&SecretString::from("stale-refresh-token"))
+        .await
+        .expect_err("400 should be an error");
+    match err {
+        Error::OAuth {
+            status,
+            error,
+            description,
+        } => {
+            assert_eq!(status, 400);
+            assert_eq!(error, "invalid_grant");
+            assert_eq!(
+                description.as_deref(),
+                Some("the refresh token has been revoked")
+            );
+        }
+        other => panic!("expected Error::OAuth, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn refresh_error_never_contains_the_refresh_token() {
+    let (server, client) = support::mock_redmine().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+        })))
+        .mount(&server)
+        .await;
+
+    let cred = client_credential();
+    const REFRESH_TOKEN: &str = "super-secret-refresh-token-xyz";
+    let err = client
+        .as_user(&cred)
+        .refresh_access_token(&SecretString::from(REFRESH_TOKEN))
+        .await
+        .expect_err("400 should be an error");
+    let display = format!("{err}");
+    let debug = format!("{err:?}");
+    assert!(
+        !display.contains(REFRESH_TOKEN),
+        "Display leaked: {display}"
+    );
+    assert!(!debug.contains(REFRESH_TOKEN), "Debug leaked: {debug}");
+}

@@ -132,6 +132,11 @@ impl ClientRegistry {
             .map(|(client_id, _)| client_id.clone());
         if let Some(client_id) = victim {
             inner.remove(&client_id);
+            tracing::debug!(
+                len = inner.len(),
+                capacity = MAX_CLIENTS,
+                "evicted an idle DCR client registration to make room"
+            );
         }
     }
 
@@ -160,8 +165,9 @@ impl ClientRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// Live registration count, for `get_mcp_server_info`'s
+    /// `registered_clients` (R7) — a count only, never a client id or name.
+    pub(crate) fn len(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -216,7 +222,15 @@ fn sweep_and_check_capacity<K: std::hash::Hash + Eq, V>(
 ) -> bool {
     let now = Instant::now();
     map.retain(|_, (_, expires_at)| *expires_at > now);
-    map.len() < MAX_ENTRIES || map.contains_key(key)
+    let has_room = map.len() < MAX_ENTRIES || map.contains_key(key);
+    if !has_room {
+        tracing::debug!(
+            len = map.len(),
+            capacity = MAX_ENTRIES,
+            "store at capacity; rejecting a new entry"
+        );
+    }
+    has_room
 }
 
 // --- in-flight authorization transactions (F2) ------------------------------
@@ -296,11 +310,7 @@ impl TransactionStore {
 /// proxy access token authenticates.
 pub(crate) struct UpstreamTokenSet {
     pub(crate) access: SecretString,
-    #[allow(
-        dead_code,
-        reason = "populated now so 6c3's refresh grant has no store schema to migrate; not read \
-                  until that lands"
-    )]
+    /// Present only when Doorkeeper's `use_refresh_token` is enabled (R4).
     pub(crate) refresh: Option<SecretString>,
     pub(crate) granted_scopes: Vec<String>,
     pub(crate) expires_at: Instant,
@@ -360,11 +370,59 @@ impl UpstreamStore {
             .map(|set| set.access.clone())
     }
 
-    pub(crate) fn remove(&self, id: &str) {
+    /// A clone of the stored refresh token, if Doorkeeper issued one (R4),
+    /// for the `/token` refresh grant to present upstream.
+    pub(crate) fn refresh_token(&self, id: &str) -> Option<SecretString> {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(id);
+            .get(id)
+            .and_then(|set| set.refresh.clone())
+    }
+
+    /// A clone of the stored granted scopes, for the `/token` refresh grant
+    /// to fall back to when Doorkeeper's refresh response omits `scope`
+    /// (RFC 6749 §6: absent means unchanged).
+    pub(crate) fn granted_scopes(&self, id: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|set| set.granted_scopes.clone())
+    }
+
+    pub(crate) fn remove(&self, id: &str) {
+        self.take(id);
+    }
+
+    /// Removes and returns the stored set, for a caller that needs the
+    /// access token it held to revoke it upstream (R5's `/revoke`, R2's
+    /// reuse containment).
+    pub(crate) fn take(&self, id: &str) -> Option<UpstreamTokenSet> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+    }
+
+    /// Replaces the stored set in place, keeping `id` stable across a
+    /// refresh (R1): the proxy access/refresh tokens minted before the
+    /// refresh, and any bookkeeping keyed on `id`, all still resolve to the
+    /// same session afterward.
+    pub(crate) fn replace(&self, id: &str, set: UpstreamTokenSet) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string(), set);
+    }
+
+    /// Live upstream-session count, for `get_mcp_server_info`'s
+    /// `active_sessions` (R7).
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -384,6 +442,7 @@ struct PendingCode {
 /// (F8) rather than just bouncing off "not found".
 struct ConsumedRecord {
     minted_token_digest: [u8; 32],
+    minted_refresh_digest: Option<[u8; 32]>,
     upstream_id: String,
 }
 
@@ -401,6 +460,7 @@ pub(crate) enum RedeemOutcome {
     /// redemption minted so the caller can revoke it (F8).
     Replayed {
         minted_token_digest: [u8; 32],
+        minted_refresh_digest: Option<[u8; 32]>,
         upstream_id: String,
     },
     /// First, successful redemption: the code is now consumed. The caller
@@ -508,6 +568,7 @@ impl CodeStore {
                 Some((record, expires_at)) if *expires_at > Instant::now() => {
                     RedeemOutcome::Replayed {
                         minted_token_digest: record.minted_token_digest,
+                        minted_refresh_digest: record.minted_refresh_digest,
                         upstream_id: record.upstream_id.clone(),
                     }
                 }
@@ -547,6 +608,7 @@ impl CodeStore {
         &self,
         code: &str,
         minted_token_digest: [u8; 32],
+        minted_refresh_digest: Option<[u8; 32]>,
         upstream_id: String,
     ) {
         let key = digest(code);
@@ -557,6 +619,7 @@ impl CodeStore {
                 (
                     ConsumedRecord {
                         minted_token_digest,
+                        minted_refresh_digest,
                         upstream_id,
                     },
                     expires_after(CODE_TTL),
@@ -650,12 +713,233 @@ impl TokenStore {
     }
 
     /// Deletes a proxy access token by its digest (F8's replay containment;
-    /// 6c3's `/revoke`).
+    /// R5's `/revoke`).
     pub(crate) fn delete_by_digest(&self, digest: [u8; 32]) {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&digest);
+    }
+
+    /// Removes and returns the entry for a presented `rup_at_...` token,
+    /// regardless of expiry (R5's `/revoke`): unlike [`Self::resolve`], an
+    /// already-expired entry is still removed and returned rather than
+    /// treated as absent.
+    pub(crate) fn take(&self, token: &str) -> Option<TokenEntry> {
+        let key = digest(token);
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key)
+            .map(|(entry, _)| entry)
+    }
+}
+
+// --- proxy refresh tokens (R1, R2) ---------------------------------------
+
+/// A memory-bound safety net (P4), not a real credential lifetime: upstream
+/// is authoritative for whether a refresh token is still honoured, so this
+/// only bounds how long an *abandoned* one occupies the store.
+const REFRESH_TTL: Duration = Duration::from_hours(720);
+
+/// How long a retired (already-rotated) refresh-token digest is remembered
+/// so a later replay of it is caught as reuse (R2) rather than merely
+/// unrecognised.
+const RETIRED_REFRESH_TTL: Duration = Duration::from_hours(24);
+
+struct RefreshOwner {
+    client_id: String,
+    upstream_id: String,
+}
+
+/// Outcome of [`RefreshStore::redeem`].
+pub(crate) enum RefreshOutcome {
+    /// Unknown, expired, or never issued — indistinguishable by design,
+    /// same reasoning as [`CodeStore`]'s `Invalid` (F7).
+    Invalid,
+    /// This digest was already rotated away: a replay (R2). `upstream_id`
+    /// is the session's stable identifier across every rotation in its
+    /// chain (see [`UpstreamStore::replace`]), so the caller can revoke
+    /// whatever is *currently* live for it, however many rotations ago
+    /// this particular token was current.
+    Reused { upstream_id: String },
+    /// A live, not-yet-rotated refresh token bound to `client_id` and
+    /// `upstream_id`.
+    Ok {
+        client_id: String,
+        upstream_id: String,
+    },
+}
+
+/// Digest-keyed (P2), two maps: `current` is the one active refresh token
+/// per session, `retired` is what [`Self::retire`] moves a rotated-away
+/// digest into so [`Self::redeem`] can tell a replay apart from "unknown".
+#[derive(Default)]
+pub(crate) struct RefreshStore {
+    current: Mutex<HashMap<[u8; 32], (RefreshOwner, Instant)>>,
+    retired: Mutex<HashMap<[u8; 32], (String, Instant)>>,
+}
+
+impl std::fmt::Debug for RefreshStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("RefreshStore")
+            .field("current", &current)
+            .field("retired", &retired)
+            .finish()
+    }
+}
+
+impl RefreshStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mints a `rup_rt_`-prefixed proxy refresh token bound to `client_id` +
+    /// `upstream_id`. Returns the raw token and its digest — the caller
+    /// needs the digest to hand to [`CodeStore::mark_consumed`] for F8's
+    /// replay containment. `None` means the store is full or `OsRng`
+    /// failed (C8).
+    pub(crate) fn mint(
+        &self,
+        client_id: String,
+        upstream_id: String,
+    ) -> Option<(String, [u8; 32])> {
+        let token = mint_opaque_token("rup_rt_")?;
+        let key = digest(&token);
+        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sweep_and_check_capacity(&mut current, &key) {
+            return None;
+        }
+        current.insert(
+            key,
+            (
+                RefreshOwner {
+                    client_id,
+                    upstream_id,
+                },
+                expires_after(REFRESH_TTL),
+            ),
+        );
+        Some((token, key))
+    }
+
+    /// Looks up `token` without consuming it — the caller mints the new
+    /// pair and confirms it is durable *before* calling [`Self::retire`]
+    /// (risk 1: the new pair must work before the old one stops).
+    pub(crate) fn redeem(&self, token: &str) -> RefreshOutcome {
+        let key = digest(token);
+        {
+            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            match current.get(&key) {
+                Some((_, expires_at)) if *expires_at <= Instant::now() => {
+                    current.remove(&key);
+                }
+                Some((owner, _)) => {
+                    return RefreshOutcome::Ok {
+                        client_id: owner.client_id.clone(),
+                        upstream_id: owner.upstream_id.clone(),
+                    };
+                }
+                None => {}
+            }
+        }
+        let retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        match retired.get(&key) {
+            Some((upstream_id, expires_at)) if *expires_at > Instant::now() => {
+                RefreshOutcome::Reused {
+                    upstream_id: upstream_id.clone(),
+                }
+            }
+            _ => RefreshOutcome::Invalid,
+        }
+    }
+
+    /// Rotation (R1): `old_token` is removed from the active set and
+    /// remembered in the retired set for [`RETIRED_REFRESH_TTL`], so a
+    /// later replay of it is caught rather than bouncing off "not found".
+    pub(crate) fn retire(&self, old_token: &str, upstream_id: String) {
+        let key = digest(old_token);
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        if sweep_and_check_capacity(&mut retired, &key) {
+            retired.insert(key, (upstream_id, expires_after(RETIRED_REFRESH_TTL)));
+        }
+    }
+
+    /// Removes `old_token` from the active set with no reuse tracking: for
+    /// a refresh that upstream itself rejected, where there is no
+    /// legitimate rotation to protect against replay of.
+    pub(crate) fn discard(&self, old_token: &str) {
+        let key = digest(old_token);
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
+
+    /// Removes and returns the owner of a presented `rup_rt_...` token, for
+    /// `/revoke` (R5). A retired or unknown token resolves to `None` —
+    /// revoking either is a no-op per RFC 7009, not a reuse signal (that
+    /// containment is `/token`'s alone, see [`Self::redeem`]).
+    pub(crate) fn take(&self, token: &str) -> Option<(String, String)> {
+        let key = digest(token);
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key)
+            .map(|(owner, _)| (owner.client_id, owner.upstream_id))
+    }
+
+    /// Deletes an active refresh token by its digest (F8's replay
+    /// containment extended to whatever refresh token an authorization-code
+    /// redemption also minted).
+    pub(crate) fn delete_by_digest(&self, digest: [u8; 32]) {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&digest);
+    }
+}
+
+// --- the bundle shared by every oauth-proxy route and `get_mcp_server_info` (R7) ---
+
+/// Every oauth-proxy store, constructed once by `RedmineMcp::new` so
+/// `transport::http::router`'s route/middleware wiring and
+/// `tools::meta::get_mcp_server_info`'s session counts read the very same
+/// instances rather than two independent copies.
+#[derive(Debug)]
+pub(crate) struct ProxyState {
+    pub(crate) registry: ClientRegistry,
+    pub(crate) transactions: TransactionStore,
+    pub(crate) codes: CodeStore,
+    pub(crate) tokens: TokenStore,
+    pub(crate) upstream_tokens: UpstreamStore,
+    pub(crate) refresh_tokens: RefreshStore,
+}
+
+impl ProxyState {
+    pub(crate) fn new() -> Self {
+        Self {
+            registry: ClientRegistry::new(),
+            transactions: TransactionStore::new(),
+            codes: CodeStore::new(),
+            tokens: TokenStore::new(),
+            upstream_tokens: UpstreamStore::new(),
+            refresh_tokens: RefreshStore::new(),
+        }
     }
 }
 
@@ -769,5 +1053,181 @@ mod tests {
             registry.set_live(&registration.client_id, true);
         }
         assert!(registry.register(vec![], None).is_none());
+    }
+
+    /// The caps every store above degrades under, reviewable together
+    /// rather than scattered across the file.
+    #[test]
+    fn every_store_cap_is_documented_here() {
+        assert_eq!(MAX_CLIENTS, 1000);
+        assert_eq!(MAX_ENTRIES, 10_000);
+        assert_eq!(REFRESH_TTL, Duration::from_hours(720));
+        assert_eq!(RETIRED_REFRESH_TTL, Duration::from_hours(24));
+    }
+
+    /// Driving 2x `MAX_ENTRIES` through `TokenStore` stays bounded and keeps
+    /// the most recently minted entries alive.
+    #[test]
+    fn token_store_stays_bounded_under_pressure_and_keeps_live_entries() {
+        let store = TokenStore::new();
+        let mut survivors = Vec::new();
+        for i in 0..MAX_ENTRIES * 2 {
+            if let Some((token, _)) = store.mint(
+                format!("client-{i}"),
+                format!("upstream-{i}"),
+                Duration::from_mins(5),
+            ) {
+                survivors.push(token);
+            }
+        }
+        // At least the last mint (well within capacity by then) must have
+        // succeeded and still resolve.
+        let last = survivors.last().expect("at least one mint should succeed");
+        assert!(store.resolve(last).is_some());
+    }
+
+    /// Same shape for `CodeStore`.
+    #[test]
+    fn code_store_stays_bounded_under_pressure_and_keeps_live_entries() {
+        let store = CodeStore::new();
+        let mut last_code = None;
+        for i in 0..MAX_ENTRIES * 2 {
+            let upstream = UpstreamTokenSet {
+                access: SecretString::from(format!("access-{i}")),
+                refresh: None,
+                granted_scopes: vec![],
+                expires_at: expires_after(Duration::from_mins(5)),
+            };
+            if let Some(code) = store.mint(
+                format!("client-{i}"),
+                "http://localhost/cb".to_string(),
+                "challenge".to_string(),
+                upstream,
+            ) {
+                last_code = Some(code);
+            }
+        }
+        let code = last_code.expect("at least one mint should succeed");
+        // A wrong redirect_uri is a `Mismatch`, not `Invalid`: the surviving
+        // code is still present and bound, just not redeemed with these
+        // (deliberately wrong) checks.
+        assert!(matches!(
+            store.redeem(&code, "client-x", "http://localhost/wrong", "v"),
+            RedeemOutcome::Mismatch
+        ));
+    }
+
+    /// Same shape for `TransactionStore`.
+    #[test]
+    fn transaction_store_stays_bounded_under_pressure_and_keeps_live_entries() {
+        let store = TransactionStore::new();
+        let mut last_id = None;
+        for _ in 0..MAX_ENTRIES * 2 {
+            if let Some(id) = store.create(Transaction {
+                client_id: "client".to_string(),
+                redirect_uri: "http://localhost/cb".to_string(),
+                code_challenge: "challenge".to_string(),
+                scopes: vec![],
+                client_state: None,
+                upstream_code_verifier: "verifier".to_string(),
+            }) {
+                last_id = Some(id);
+            }
+        }
+        let id = last_id.expect("at least one create should succeed");
+        assert!(store.take(&id).is_some());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod refresh_store_tests {
+    use super::*;
+
+    #[test]
+    fn mint_then_redeem_returns_the_bound_client_and_upstream_id() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        match store.redeem(&token) {
+            RefreshOutcome::Ok {
+                client_id,
+                upstream_id,
+            } => {
+                assert_eq!(client_id, "client-a");
+                assert_eq!(upstream_id, "upstream-1");
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn unknown_token_is_invalid() {
+        let store = RefreshStore::new();
+        assert!(matches!(
+            store.redeem("rup_rt_never-issued"),
+            RefreshOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn a_retired_token_is_still_redeemable_as_reused_not_invalid() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        store.retire(&token, "upstream-1".to_string());
+        match store.redeem(&token) {
+            RefreshOutcome::Reused { upstream_id } => assert_eq!(upstream_id, "upstream-1"),
+            _ => panic!("expected Reused"),
+        }
+    }
+
+    #[test]
+    fn a_retired_token_no_longer_redeems_as_ok() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        store.retire(&token, "upstream-1".to_string());
+        assert!(!matches!(store.redeem(&token), RefreshOutcome::Ok { .. }));
+    }
+
+    #[test]
+    fn discard_removes_the_active_token_with_no_reuse_tracking() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        store.discard(&token);
+        assert!(matches!(store.redeem(&token), RefreshOutcome::Invalid));
+    }
+
+    #[test]
+    fn take_removes_and_returns_the_active_owner() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        let (client_id, upstream_id) = store.take(&token).expect("should be active");
+        assert_eq!(client_id, "client-a");
+        assert_eq!(upstream_id, "upstream-1");
+        assert!(store.take(&token).is_none());
+    }
+
+    #[test]
+    fn take_does_not_resolve_a_retired_token() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        store.retire(&token, "upstream-1".to_string());
+        assert!(store.take(&token).is_none());
     }
 }

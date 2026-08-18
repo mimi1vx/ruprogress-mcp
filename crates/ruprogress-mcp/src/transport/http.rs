@@ -78,14 +78,8 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
     // "discovery exists" — no downstream site needs to re-derive it from
     // `AuthMode` again.
     let discovery_mode = DiscoveryMode::from_auth(&server.inner.config.auth).map(|(mode, _)| mode);
-    // The upstream client, redirect policy, etc. live only on
-    // `OAuthProxyConfig`, not the shared `OAuthConfig` `from_auth` returns,
-    // so proxy mode needs its own look. Cloned once here, before `server`
-    // moves into `mcp_service` below.
-    let proxy_config: Option<OAuthProxyConfig> = match &server.inner.config.auth {
-        AuthMode::OAuthProxy(proxy) => Some(proxy.clone()),
-        AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
-    };
+    // Cloned/read once here, before `server` moves into `mcp_service` below.
+    let (proxy_config, proxy_state) = proxy_mode_state(&server);
     let redmine_base = server.inner.config.redmine.url.clone();
     let discovery = discovery_mode
         .zip(server.inner.config.oauth_resource().cloned())
@@ -155,7 +149,8 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
             // `mcp_service` above, so they always agree; a graceful skip
             // (never a panic) is the fail-closed response to that
             // invariant somehow not holding.
-            if let Some(proxy) = proxy_config.as_ref() {
+            if let (Some(proxy), Some(proxy_state)) = (proxy_config.as_ref(), proxy_state.as_ref())
+            {
                 let (route, flow) = mount_oauth_proxy(
                     mcp_route,
                     proxy,
@@ -164,13 +159,14 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
                     client,
                     &redmine_base,
                     &cfg.mcp_path,
+                    proxy_state,
                 );
                 mcp_route = route;
                 proxy_flow_routes = Some(flow);
             } else {
                 tracing::error!(
-                    "oauth-proxy discovery mode selected without an OAuthProxyConfig; refusing \
-                     to mount its routes"
+                    "oauth-proxy discovery mode selected without an OAuthProxyConfig/ProxyState; \
+                     refusing to mount its routes"
                 );
             }
         }
@@ -209,12 +205,32 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
     ))
 }
 
-/// Builds `oauth-proxy` mode's state (the client registry, redirect policy,
-/// and F2/F6/F9's transaction/code/token stores), layers the proxy-bearer
-/// middleware onto `mcp_route`, and returns it alongside the stand-alone
-/// router for `/register`, `/authorize`, `/auth/callback`, and `/token`.
-/// Split out of `router` to keep that function under clippy's line-count
-/// pedantic threshold.
+/// `AuthMode::OAuthProxy`'s config, and the store bundle `RedmineMcp::new`
+/// built alongside `oauth_verifier` (R7) — shared with
+/// `tools::meta::get_mcp_server_info` rather than a second, router-local
+/// set of stores it could never see. The upstream client, redirect policy,
+/// etc. live only on `OAuthProxyConfig`, not the shared `OAuthConfig`
+/// `DiscoveryMode::from_auth` returns, so proxy mode needs its own look.
+fn proxy_mode_state(
+    server: &RedmineMcp,
+) -> (
+    Option<OAuthProxyConfig>,
+    Option<Arc<oauth_docs::proxy::store::ProxyState>>,
+) {
+    let proxy_config = match &server.inner.config.auth {
+        AuthMode::OAuthProxy(proxy) => Some(proxy.clone()),
+        AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
+    };
+    (proxy_config, server.oauth_proxy_state())
+}
+
+/// Layers the proxy-bearer middleware onto `mcp_route` and returns it
+/// alongside the stand-alone router for `/register`, `/authorize`,
+/// `/auth/callback`, `/token`, and `/revoke` — all sharing `proxy_state`,
+/// the same store bundle `get_mcp_server_info` reads its session counts
+/// from (R7). Split out of `router` to keep that function under clippy's
+/// line-count pedantic threshold.
+#[allow(clippy::too_many_arguments)]
 fn mount_oauth_proxy(
     mcp_route: Router,
     proxy: &OAuthProxyConfig,
@@ -223,21 +239,16 @@ fn mount_oauth_proxy(
     client: &RedmineClient,
     redmine_base: &Url,
     mcp_path: &str,
+    proxy_state: &Arc<oauth_docs::proxy::store::ProxyState>,
 ) -> (Router, Router) {
     let challenge = Arc::new(oauth::Challenge::build(&oauth.base_url, mcp_path));
-    let registry = Arc::new(oauth_docs::proxy::store::ClientRegistry::new());
     let redirects = Arc::new(proxy.redirects.clone());
-    let tokens = Arc::new(oauth_docs::proxy::store::TokenStore::new());
-    let upstream_tokens = Arc::new(oauth_docs::proxy::store::UpstreamStore::new());
-    let transactions = Arc::new(oauth_docs::proxy::store::TransactionStore::new());
-    let codes = Arc::new(oauth_docs::proxy::store::CodeStore::new());
 
     // P9: a token-store lookup ahead of the same `TokenVerifier` `oauth`
     // mode uses — never a fallback to accepting a raw upstream token here.
     let mcp_route = mcp_route.layer(middleware::from_fn_with_state(
         ProxyAuthState {
-            tokens: tokens.clone(),
-            upstream_tokens: upstream_tokens.clone(),
+            proxy: proxy_state.clone(),
             verifier: verifier.clone(),
             challenge,
         },
@@ -246,21 +257,18 @@ fn mount_oauth_proxy(
 
     let flow_routes = Router::new()
         .merge(oauth_docs::proxy::endpoints::register_route(
-            registry.clone(),
+            proxy_state.clone(),
             redirects.clone(),
         ))
         .merge(oauth_docs::proxy::endpoints::flow_routes(
-            registry,
+            proxy_state.clone(),
             redirects,
             Arc::new(oauth.clone()),
             redmine_base.clone(),
             proxy.upstream_client_id.clone(),
             proxy.upstream_client_secret.clone(),
             client.clone(),
-            transactions,
-            codes,
-            tokens,
-            upstream_tokens,
+            verifier.clone(),
         ));
 
     (mcp_route, flow_routes)

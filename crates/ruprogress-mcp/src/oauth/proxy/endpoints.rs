@@ -28,9 +28,9 @@ use url::Url;
 use super::pkce;
 use super::redirect::RedirectPolicy;
 use super::store::{
-    ClientRegistry, CodeStore, RedeemOutcome, TokenStore, Transaction, TransactionStore,
-    UpstreamStore, UpstreamTokenSet, expires_after,
+    ProxyState, RedeemOutcome, RefreshOutcome, Transaction, UpstreamTokenSet, expires_after,
 };
+use crate::auth::oauth::TokenVerifier;
 use crate::config::OAuthConfig;
 use crate::oauth::scopes;
 
@@ -84,22 +84,16 @@ struct RegisterRequest {
 
 #[derive(Clone)]
 struct RegisterState {
-    registry: Arc<ClientRegistry>,
+    proxy: Arc<ProxyState>,
     redirects: Arc<RedirectPolicy>,
 }
 
 /// Mounts `POST /register`. Only ever called for `AuthMode::OAuthProxy` —
 /// see `transport::http::router`.
-pub(crate) fn register_route(
-    registry: Arc<ClientRegistry>,
-    redirects: Arc<RedirectPolicy>,
-) -> Router {
+pub(crate) fn register_route(proxy: Arc<ProxyState>, redirects: Arc<RedirectPolicy>) -> Router {
     Router::new()
         .route("/register", post(register))
-        .with_state(RegisterState {
-            registry,
-            redirects,
-        })
+        .with_state(RegisterState { proxy, redirects })
 }
 
 fn content_type_is_json(request: &Request) -> bool {
@@ -223,6 +217,7 @@ async fn register(State(state): State<RegisterState>, request: Request) -> Respo
     }
 
     let Some(registration) = state
+        .proxy
         .registry
         .register(payload.redirect_uris.clone(), payload.client_name.clone())
     else {
@@ -263,57 +258,53 @@ async fn register(State(state): State<RegisterState>, request: Request) -> Respo
 
 // --- shared flow state and helpers (F1–F9) ----------------------------------
 
-/// Shared by `/authorize`, `/auth/callback`, and `/token`. `tokens` and
-/// `upstream_tokens` are also handed to `auth::proxy`'s middleware by
+/// Shared by `/authorize`, `/auth/callback`, `/token`, and `/revoke`.
+/// `proxy` is also handed to `auth::proxy`'s middleware by
 /// `transport::http::router`, so a token minted here is resolvable there
 /// without a second store.
 #[derive(Clone)]
 struct FlowState {
-    registry: Arc<ClientRegistry>,
+    proxy: Arc<ProxyState>,
     redirects: Arc<RedirectPolicy>,
     oauth: Arc<OAuthConfig>,
     redmine_base: Url,
     upstream_client_id: String,
     upstream_client_secret: SecretString,
     redmine: RedmineClient,
-    transactions: Arc<TransactionStore>,
-    codes: Arc<CodeStore>,
-    tokens: Arc<TokenStore>,
-    upstream_tokens: Arc<UpstreamStore>,
+    /// The same introspection verifier `auth::proxy`'s middleware uses, so
+    /// killing an upstream token here (rotation reuse, upstream refresh
+    /// failure, `/revoke`) also purges it from that cache (R6).
+    verifier: Arc<TokenVerifier>,
 }
 
-/// Mounts `GET /authorize`, `GET /auth/callback`, and `POST /token`. Only
-/// ever called for `AuthMode::OAuthProxy` — see `transport::http::router`.
+/// Mounts `GET /authorize`, `GET /auth/callback`, `POST /token`, and `POST
+/// /revoke`. Only ever called for `AuthMode::OAuthProxy` — see
+/// `transport::http::router`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flow_routes(
-    registry: Arc<ClientRegistry>,
+    proxy: Arc<ProxyState>,
     redirects: Arc<RedirectPolicy>,
     oauth: Arc<OAuthConfig>,
     redmine_base: Url,
     upstream_client_id: String,
     upstream_client_secret: SecretString,
     redmine: RedmineClient,
-    transactions: Arc<TransactionStore>,
-    codes: Arc<CodeStore>,
-    tokens: Arc<TokenStore>,
-    upstream_tokens: Arc<UpstreamStore>,
+    verifier: Arc<TokenVerifier>,
 ) -> Router {
     Router::new()
         .route("/authorize", get(authorize))
         .route("/auth/callback", get(auth_callback))
         .route("/token", post(token))
+        .route("/revoke", post(revoke))
         .with_state(FlowState {
-            registry,
+            proxy,
             redirects,
             oauth,
             redmine_base,
             upstream_client_id,
             upstream_client_secret,
             redmine,
-            transactions,
-            codes,
-            tokens,
-            upstream_tokens,
+            verifier,
         })
 }
 
@@ -393,6 +384,7 @@ fn authorize_phase_a(
         .filter(|s| !s.is_empty())
         .ok_or("client_id is required")?;
     let registration = state
+        .proxy
         .registry
         .get(&client_id)
         .ok_or("client_id is not a registered client")?;
@@ -499,7 +491,7 @@ fn authorize_phase_b(
         client_state: query.state.clone(),
         upstream_code_verifier: upstream_verifier,
     };
-    let Some(transaction_id) = state.transactions.create(transaction) else {
+    let Some(transaction_id) = state.proxy.transactions.create(transaction) else {
         return redirect_error(
             redirect_uri,
             query.state.as_deref(),
@@ -564,7 +556,7 @@ async fn auth_callback(
     // F4: the transaction lookup itself has no redirect target to fail
     // toward — an unknown, expired, or already-used state cannot redirect
     // anywhere, by construction.
-    let Some(transaction) = state.transactions.take(&raw_state) else {
+    let Some(transaction) = state.proxy.transactions.take(&raw_state) else {
         return plain_400("state is unknown, expired, or already used");
     };
 
@@ -639,7 +631,7 @@ async fn auth_callback(
         expires_at,
     };
 
-    let Some(code_value) = state.codes.mint(
+    let Some(code_value) = state.proxy.codes.mint(
         transaction.client_id.clone(),
         transaction.redirect_uri.clone(),
         transaction.code_challenge.clone(),
@@ -679,6 +671,79 @@ fn token_error(status: StatusCode, error: &str) -> Response {
     no_store(status, json!({ "error": error }))
 }
 
+/// Logged once per process, the first time an upstream token response omits
+/// `refresh_token` (R4): the operator-facing signal that Doorkeeper's
+/// `use_refresh_token` setting is off, rather than a silent per-request
+/// downgrade to shorter, browser-driven sessions.
+static NO_UPSTREAM_REFRESH_TOKEN_WARNED: std::sync::Once = std::sync::Once::new();
+
+fn warn_no_upstream_refresh_token_once() {
+    NO_UPSTREAM_REFRESH_TOKEN_WARNED.call_once(|| {
+        tracing::warn!(
+            "the upstream OAuth application never returns a refresh_token; enable Doorkeeper's \
+             use_refresh_token setting, or clients must re-authorize in a browser every time \
+             their access token expires"
+        );
+    });
+}
+
+/// What a successful (re)mint hands back to a `/token` caller. `*_digest`
+/// let the `authorization_code` grant record exactly what it minted (F8),
+/// so a later replay of the same code can revoke precisely those entries.
+struct MintedPair {
+    access_token: String,
+    access_digest: [u8; 32],
+    refresh_token: Option<String>,
+    refresh_digest: Option<[u8; 32]>,
+    ttl: Duration,
+}
+
+/// Mints a fresh proxy access token, plus a fresh proxy refresh token when
+/// `wants_refresh` is true (R1, R4). `None` means a store was full or
+/// `OsRng` failed (C8); the caller turns that into a `server_error`. Shared
+/// by the `authorization_code` and `refresh_token` grants so the two mint
+/// exactly the same shape of pair.
+fn mint_token_pair(
+    proxy: &ProxyState,
+    client_id: &str,
+    upstream_id: &str,
+    ttl: Duration,
+    wants_refresh: bool,
+) -> Option<MintedPair> {
+    let (access_token, access_digest) =
+        proxy
+            .tokens
+            .mint(client_id.to_string(), upstream_id.to_string(), ttl)?;
+    let (refresh_token, refresh_digest) = if wants_refresh {
+        let (refresh_token, refresh_digest) = proxy
+            .refresh_tokens
+            .mint(client_id.to_string(), upstream_id.to_string())?;
+        (Some(refresh_token), Some(refresh_digest))
+    } else {
+        warn_no_upstream_refresh_token_once();
+        (None, None)
+    };
+    Some(MintedPair {
+        access_token,
+        access_digest,
+        refresh_token,
+        refresh_digest,
+        ttl,
+    })
+}
+
+fn token_response(pair: &MintedPair, scope: &str) -> Response {
+    let mut fields = serde_json::Map::new();
+    fields.insert("access_token".to_string(), json!(pair.access_token));
+    fields.insert("token_type".to_string(), json!("Bearer"));
+    fields.insert("expires_in".to_string(), json!(pair.ttl.as_secs()));
+    fields.insert("scope".to_string(), json!(scope));
+    if let Some(refresh_token) = &pair.refresh_token {
+        fields.insert("refresh_token".to_string(), json!(refresh_token));
+    }
+    no_store(StatusCode::OK, serde_json::Value::Object(fields))
+}
+
 async fn token(State(state): State<FlowState>, request: Request) -> Response {
     if !content_type_is_form(&request) {
         let mut response = (
@@ -705,11 +770,15 @@ async fn token(State(state): State<FlowState>, request: Request) -> Response {
         .collect();
 
     match fields.get("grant_type").map(String::as_str) {
-        Some("authorization_code") => {}
-        Some(_) => return token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
-        None => return token_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        Some("authorization_code") => authorization_code_grant(&state, &fields),
+        Some("refresh_token") => refresh_token_grant(&state, &fields).await,
+        Some(_) => token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
+        None => token_error(StatusCode::BAD_REQUEST, "invalid_request"),
     }
+}
 
+/// `grant_type=authorization_code` (F7–F9, R1, R4, R6).
+fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>) -> Response {
     let (Some(code), Some(redirect_uri), Some(client_id), Some(code_verifier)) = (
         fields.get("code"),
         fields.get("redirect_uri"),
@@ -720,6 +789,7 @@ async fn token(State(state): State<FlowState>, request: Request) -> Response {
     };
 
     match state
+        .proxy
         .codes
         .redeem(code, client_id, redirect_uri, code_verifier)
     {
@@ -728,10 +798,16 @@ async fn token(State(state): State<FlowState>, request: Request) -> Response {
         }
         RedeemOutcome::Replayed {
             minted_token_digest,
+            minted_refresh_digest,
             upstream_id,
         } => {
-            state.tokens.delete_by_digest(minted_token_digest);
-            state.upstream_tokens.remove(&upstream_id);
+            state.proxy.tokens.delete_by_digest(minted_token_digest);
+            if let Some(refresh_digest) = minted_refresh_digest {
+                state.proxy.refresh_tokens.delete_by_digest(refresh_digest);
+            }
+            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+                state.verifier.purge(&upstream.access);
+            }
             tracing::warn!(
                 client_id,
                 "authorization code replay detected; revoked the tokens it minted"
@@ -742,30 +818,218 @@ async fn token(State(state): State<FlowState>, request: Request) -> Response {
             let ttl = upstream
                 .expires_at
                 .saturating_duration_since(Instant::now());
+            let wants_refresh = upstream.refresh.is_some();
             let granted_scope = upstream.granted_scopes.join(" ");
-            let Some(upstream_id) = state.upstream_tokens.insert(upstream) else {
+            let Some(upstream_id) = state.proxy.upstream_tokens.insert(upstream) else {
                 return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
             };
-            let Some((access_token, digest)) =
-                state
-                    .tokens
-                    .mint(client_id.clone(), upstream_id.clone(), ttl)
+            let Some(pair) =
+                mint_token_pair(&state.proxy, client_id, &upstream_id, ttl, wants_refresh)
             else {
-                state.upstream_tokens.remove(&upstream_id);
+                state.proxy.upstream_tokens.remove(&upstream_id);
                 return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
             };
-            state.codes.mark_consumed(code, digest, upstream_id);
-            no_store(
-                StatusCode::OK,
-                json!({
-                    "access_token": access_token,
-                    "token_type": "Bearer",
-                    "expires_in": ttl.as_secs(),
-                    "scope": granted_scope,
-                }),
-            )
+            state.proxy.codes.mark_consumed(
+                code,
+                pair.access_digest,
+                pair.refresh_digest,
+                upstream_id,
+            );
+            token_response(&pair, &granted_scope)
         }
     }
+}
+
+/// `grant_type=refresh_token` (R1, R2, R4, R6). Rotates on success: a new
+/// access/refresh pair is stored *before* the presented refresh token is
+/// retired (risk 1), and upstream is refreshed with the confidential
+/// upstream client, never the requesting (public) one.
+async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>) -> Response {
+    let (Some(refresh_token), Some(requested_client_id)) =
+        (fields.get("refresh_token"), fields.get("client_id"))
+    else {
+        return token_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+
+    let (bound_client_id, upstream_id) = match state.proxy.refresh_tokens.redeem(refresh_token) {
+        RefreshOutcome::Invalid => return token_error(StatusCode::BAD_REQUEST, "invalid_grant"),
+        RefreshOutcome::Reused { upstream_id } => {
+            // R2: a replayed (already-rotated) refresh token kills whatever
+            // is currently live for its session, however many rotations
+            // ago it was current, and — unlike code-replay containment —
+            // is revoked upstream too, since a leaked refresh token is a
+            // far longer-lived threat than a leaked authorization code.
+            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+                revoke_upstream_and_purge(state, &upstream.access).await;
+            }
+            tracing::warn!("refresh token reuse detected; revoked the session");
+            return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+        RefreshOutcome::Ok {
+            client_id,
+            upstream_id,
+        } => (client_id, upstream_id),
+    };
+    if &bound_client_id != requested_client_id {
+        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    let Some(old_refresh_secret) = state.proxy.upstream_tokens.refresh_token(&upstream_id) else {
+        // The session died between `redeem` and here (e.g. a concurrent
+        // revoke) — clean up this now-orphaned refresh token and fail
+        // uniformly (R1).
+        state.proxy.refresh_tokens.discard(refresh_token);
+        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    let old_granted_scopes = state
+        .proxy
+        .upstream_tokens
+        .granted_scopes(&upstream_id)
+        .unwrap_or_default();
+
+    let credential = Credential::Basic {
+        user: state.upstream_client_id.clone(),
+        pass: state.upstream_client_secret.clone(),
+    };
+    let refreshed = state
+        .redmine
+        .as_user(&credential)
+        .refresh_access_token(&old_refresh_secret)
+        .await;
+
+    let new_upstream = match refreshed {
+        Err(error) => {
+            tracing::warn!(%error, "upstream refresh failed; the session has been cleaned up");
+            state.proxy.refresh_tokens.discard(refresh_token);
+            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+                state.verifier.purge(&upstream.access);
+            }
+            return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+        Ok(token) => token,
+    };
+
+    let granted_scopes = new_upstream.scope.as_deref().map_or_else(
+        || old_granted_scopes.clone(),
+        |raw| {
+            raw.split_ascii_whitespace()
+                .map(ToString::to_string)
+                .collect()
+        },
+    );
+    let expires_at = expires_after(Duration::from_secs(new_upstream.expires_in.unwrap_or(3600)));
+    let ttl = expires_at.saturating_duration_since(Instant::now());
+    let wants_refresh = new_upstream.refresh_token.is_some();
+    let granted_scope = granted_scopes.join(" ");
+    state.proxy.upstream_tokens.replace(
+        &upstream_id,
+        UpstreamTokenSet {
+            access: new_upstream.access_token,
+            refresh: new_upstream.refresh_token,
+            granted_scopes,
+            expires_at,
+        },
+    );
+
+    let Some(pair) = mint_token_pair(
+        &state.proxy,
+        &bound_client_id,
+        &upstream_id,
+        ttl,
+        wants_refresh,
+    ) else {
+        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    };
+    state
+        .proxy
+        .refresh_tokens
+        .retire(refresh_token, upstream_id);
+    token_response(&pair, &granted_scope)
+}
+
+// --- POST /revoke (R5, R6) ---------------------------------------------------
+
+/// The prefixes minted by [`super::store::TokenStore`] and
+/// [`super::store::RefreshStore`] respectively (P2).
+const ACCESS_TOKEN_PREFIX: &str = "rup_at_";
+const REFRESH_TOKEN_PREFIX: &str = "rup_rt_";
+
+/// Revokes `access` upstream with the confidential upstream client
+/// credential, then purges it from the introspection cache (R6). Logs
+/// rather than fails on an upstream error: local state is already gone by
+/// the time this runs, and RFC 7009 requires `/revoke` to answer `200`
+/// regardless.
+async fn revoke_upstream_and_purge(state: &FlowState, access: &SecretString) {
+    let credential = Credential::Basic {
+        user: state.upstream_client_id.clone(),
+        pass: state.upstream_client_secret.clone(),
+    };
+    if let Err(error) = state
+        .redmine
+        .as_user(&credential)
+        .revoke_token(access, Some("access_token"))
+        .await
+    {
+        tracing::warn!(%error, "upstream revocation failed; local state was already removed");
+    }
+    state.verifier.purge(access);
+}
+
+/// `POST /revoke` in `oauth-proxy` mode (R5): accepts a `rup_at_`/`rup_rt_`
+/// token, deletes the pair and the upstream token set *first* — so our
+/// revocation holds even if Redmine is unreachable — then revokes upstream.
+/// No client authentication: every client in this mode is public (P8), and
+/// possession of the token is the only credential RFC 7009 needs from one.
+/// A token that is not ours, or is unrecognised, is a `200` no-op.
+async fn revoke(State(state): State<FlowState>, request: Request) -> Response {
+    if !content_type_is_form(&request) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported media type: expected application/x-www-form-urlencoded",
+        )
+            .into_response();
+    }
+
+    let Ok(bytes) = axum::body::to_bytes(request.into_body(), MAX_TOKEN_BODY_BYTES).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "payload too large").into_response();
+    };
+
+    let fields: HashMap<String, String> = url::form_urlencoded::parse(&bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let Some(token) = fields.get("token").filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "invalid_request",
+                "error_description": "token is required",
+            })),
+        )
+            .into_response();
+    };
+
+    let upstream = if token.starts_with(ACCESS_TOKEN_PREFIX) {
+        state
+            .proxy
+            .tokens
+            .take(token)
+            .and_then(|entry| state.proxy.upstream_tokens.take(&entry.upstream_id))
+    } else if token.starts_with(REFRESH_TOKEN_PREFIX) {
+        state
+            .proxy
+            .refresh_tokens
+            .take(token)
+            .and_then(|(_client_id, upstream_id)| state.proxy.upstream_tokens.take(&upstream_id))
+    } else {
+        None
+    };
+
+    if let Some(upstream) = upstream {
+        revoke_upstream_and_purge(&state, &upstream.access).await;
+    }
+
+    StatusCode::OK.into_response()
 }
 
 #[cfg(test)]
@@ -782,7 +1046,7 @@ mod tests {
 
     fn state() -> RegisterState {
         RegisterState {
-            registry: Arc::new(ClientRegistry::new()),
+            proxy: Arc::new(ProxyState::new()),
             redirects: Arc::new(RedirectPolicy::Loopback),
         }
     }
@@ -832,7 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_loopback_uri_is_accepted_once_the_policy_allows_it() {
         let state = RegisterState {
-            registry: Arc::new(ClientRegistry::new()),
+            proxy: Arc::new(ProxyState::new()),
             redirects: Arc::new(RedirectPolicy::Patterns(vec![
                 super::super::redirect::RedirectPattern::parse("https://app.example.com/*")
                     .expect("valid pattern"),

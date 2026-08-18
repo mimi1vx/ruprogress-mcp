@@ -41,8 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy token resolves it to the stored upstream token and verifies that via
   the same introspection path `oauth` mode uses, so scope enforcement and
   `INSUFFICIENT_SCOPE` denial are unchanged. A replayed authorization code is
-  `invalid_grant` and revokes the session it minted; `refresh_token` and
-  `/revoke` in this mode are follow-up work.
+  `invalid_grant` and revokes the session it minted.
+- `oauth-proxy` mode's `refresh_token` grant and mode-specific `POST
+  /revoke`: a `rup_rt_`-prefixed proxy refresh token is minted alongside the
+  access token whenever the upstream OAuth application issues one, and
+  redeeming it at `/token` rotates both — a new pair is issued and the
+  presented refresh token stops working. Replaying an already-rotated
+  refresh token is treated as theft: the whole session is killed and
+  revoked upstream immediately, not just the reused token. Upstream
+  applications without `use_refresh_token` enabled still work access-only,
+  with one process-wide `WARN` naming the missing setting. `POST /revoke`
+  now has proxy-mode semantics: it accepts a `rup_at_`/`rup_rt_` token,
+  deletes the pair and the upstream token set locally first (so revocation
+  holds even if Redmine is unreachable), then revokes the upstream token,
+  and always answers `200` per RFC 7009 — `oauth` mode's `/revoke` is
+  unchanged. `get_mcp_server_info` reports `registered_clients` and
+  `active_sessions` counts in this mode (`null` elsewhere) — no client
+  identifiers, ever.
 - Three tools for the RedmineUP Checklists Pro plugin, registered only when
   `REDMINE_CHECKLISTS_ENABLED=true`: `get_checklist`, `create_checklist_item`,
   `update_checklist_item`. With the flag off (the default) they are fully

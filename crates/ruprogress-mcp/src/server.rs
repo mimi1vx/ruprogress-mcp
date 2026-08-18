@@ -56,6 +56,12 @@ pub(crate) struct ServerInner {
     /// `transport::http::router`'s middleware and `health`'s future
     /// introspection probe share one verifier — and therefore one cache.
     pub(crate) oauth_verifier: Option<Arc<TokenVerifier>>,
+    /// `Some` only in `AuthMode::OAuthProxy`, built once here so
+    /// `transport::http::router`'s route/middleware wiring and
+    /// `tools::meta::get_mcp_server_info`'s session counts (R7) read the
+    /// same client registry and token stores rather than two independent
+    /// copies.
+    pub(crate) oauth_proxy_state: Option<Arc<crate::oauth::proxy::store::ProxyState>>,
 }
 
 impl RedmineMcp {
@@ -105,12 +111,19 @@ impl RedmineMcp {
             ))),
             AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } => None,
         };
+        let oauth_proxy_state = match &config.auth {
+            AuthMode::OAuthProxy(_) => {
+                Some(Arc::new(crate::oauth::proxy::store::ProxyState::new()))
+            }
+            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => None,
+        };
         Self {
             inner: Arc::new(ServerInner {
                 client,
                 config,
                 attachments,
                 oauth_verifier,
+                oauth_proxy_state,
             }),
             tool_router: router,
         }
@@ -122,6 +135,14 @@ impl RedmineMcp {
     #[must_use]
     pub(crate) fn verifier(&self) -> Option<Arc<TokenVerifier>> {
         self.inner.oauth_verifier.clone()
+    }
+
+    /// The `oauth-proxy`-mode store bundle (client registry, transaction,
+    /// code, and token stores), for `transport::http::router` to mount its
+    /// routes/middleware with. `None` in every other auth mode.
+    #[must_use]
+    pub(crate) fn oauth_proxy_state(&self) -> Option<Arc<crate::oauth::proxy::store::ProxyState>> {
+        self.inner.oauth_proxy_state.clone()
     }
 
     /// The attachment store handle, for `transport::http::router` to hand to

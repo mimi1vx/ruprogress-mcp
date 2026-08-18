@@ -872,6 +872,43 @@ impl Scoped<'_> {
         }
     }
 
+    /// `POST /oauth/token`, `grant_type=refresh_token` (RFC 6749 §6). Same
+    /// scoping-credential requirement and client-authentication shape as
+    /// [`Self::exchange_authorization_code`] — the confidential upstream
+    /// OAuth application, authenticated via HTTP Basic per RFC 6749 §3.2.1.
+    /// `oauth-proxy` mode's `/token` refresh grant is the only caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuth`] for a non-2xx RFC 6749 §5.2 error response
+    /// (e.g. `invalid_grant`), or a transport/decode error otherwise.
+    pub async fn refresh_access_token(
+        &self,
+        refresh_token: &SecretString,
+    ) -> crate::Result<oauth_token::OAuthToken> {
+        #[derive(Serialize)]
+        struct Form<'a> {
+            grant_type: &'a str,
+            refresh_token: &'a str,
+        }
+        let url = self.build_url("oauth/token", None)?;
+        let template = self
+            .credential
+            .apply(self.inner.http.post(url))
+            .form(&Form {
+                grant_type: "refresh_token",
+                refresh_token: refresh_token.expose_secret(),
+            });
+        let resp = template.send().await.map_err(Error::transport)?;
+        if resp.status().is_success() {
+            self.read_json(resp, "oauth token response").await
+        } else {
+            let status = resp.status();
+            let bytes = resp.bytes().await.map_err(Error::transport)?;
+            Err(crate::error::oauth_error_from_status(status, &bytes))
+        }
+    }
+
     /// `GET /projects.json`.
     ///
     /// # Errors

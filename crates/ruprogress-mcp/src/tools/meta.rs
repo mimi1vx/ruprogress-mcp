@@ -6,7 +6,7 @@ use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::config::PluginFlags;
+use crate::config::{AuthMode, PluginFlags};
 use crate::render::Boundary;
 use crate::server::RedmineMcp;
 use crate::tools::output;
@@ -38,6 +38,11 @@ pub(crate) struct ServerInfoOutput {
     /// never the field names or values themselves, which can be
     /// business-sensitive.
     pub(crate) required_custom_field_defaults_count: usize,
+    /// Live DCR client registrations; `null` outside `oauth-proxy` mode.
+    pub(crate) registered_clients: Option<usize>,
+    /// Live upstream sessions (proxy access tokens minted for a user);
+    /// `null` outside `oauth-proxy` mode.
+    pub(crate) active_sessions: Option<usize>,
 }
 
 #[tool_router(router = meta_tool_router, vis = "pub(crate)")]
@@ -66,6 +71,22 @@ impl RedmineMcp {
             name: boundary.wrap("user.name", &format!("{} {}", u.firstname, u.lastname)),
         });
 
+        // R7: counts only, never a client id/name/subject — and a
+        // wildcard-free match so a fifth `AuthMode` variant fails to
+        // compile here rather than silently reporting `null`.
+        let (registered_clients, active_sessions) = match &self.inner.config.auth {
+            AuthMode::OAuthProxy(_) => {
+                let proxy = self.inner.oauth_proxy_state.as_deref();
+                (
+                    proxy.map(|state| state.registry.len()),
+                    proxy.map(|state| state.upstream_tokens.len()),
+                )
+            }
+            AuthMode::Legacy { .. } | AuthMode::LegacyPerUser { .. } | AuthMode::OAuth(_) => {
+                (None, None)
+            }
+        };
+
         let output = ServerInfoOutput {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             read_only_mode: self.inner.config.read_only,
@@ -83,6 +104,8 @@ impl RedmineMcp {
                 .map(|oauth| oauth.scope_enforcement),
             autofill_required_custom_fields: self.inner.config.custom_fields.autofill_required,
             required_custom_field_defaults_count: self.inner.config.custom_fields.defaults.len(),
+            registered_clients,
+            active_sessions,
         };
         Ok(output::ok(&output, self.output_caps()))
     }
