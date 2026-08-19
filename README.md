@@ -1,8 +1,9 @@
 # ruprogress-mcp
 
 A Redmine MCP server in Rust. It exposes Redmine's REST API to MCP clients as
-41 tools over stdio and streamable HTTP, with four authentication modes, a
-read-only mode, bounded responses, and a local attachment store.
+41 tools over stdio and streamable HTTP (47 with every plugin flag on), with
+four authentication modes, a read-only mode, bounded responses, and a local
+attachment store.
 
 ## Quick start
 
@@ -33,9 +34,15 @@ Everything else is environment-driven — see [docs/configuration.md](docs/confi
 
 ## Tools
 
-41 tools are registered by default; `cleanup_attachment_files` brings the
-total to 42 when `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`. Parameters and return
-shapes are in [docs/tool-contract.md](docs/tool-contract.md).
+41 tools are registered by default. `cleanup_attachment_files`
+(`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) and the plugin-gated families below
+add more on top, each independently: `REDMINE_CHECKLISTS_ENABLED` adds 3,
+`REDMINE_PRODUCTS_ENABLED`/`REDMINE_CRM_ENABLED`/`REDMINE_DMSF_ENABLED` add
+one each. `REDMINE_AGILE_ENABLED`/`REDMINE_TAGS_ENABLED` add no new tools —
+they unlock extra parameters on the existing issue tools instead. See
+[docs/tool-reference.md](docs/tool-reference.md) (generated, always current)
+for every tool's parameters, and
+[docs/tool-contract.md](docs/tool-contract.md) for the narrative contract.
 
 | Family | Tools |
 |---|---|
@@ -49,6 +56,7 @@ shapes are in [docs/tool-contract.md](docs/tool-contract.md).
 | Search & wiki | `search_entire_redmine`, `manage_redmine_wiki_page` |
 | Gantt | `get_gantt_chart` |
 | Files | `get_redmine_attachment`, `list_files`, `upload_file`, `delete_file`, `cleanup_attachment_files` (admin-gated) |
+| Plugins (flag-gated) | `get_checklist`, `create_checklist_item`, `update_checklist_item` (`REDMINE_CHECKLISTS_ENABLED`), `manage_product` (`REDMINE_PRODUCTS_ENABLED`), `manage_contact` (`REDMINE_CRM_ENABLED`), `manage_document` (`REDMINE_DMSF_ENABLED`) |
 
 Destructive tools are guarded rather than merely annotated:
 `delete_redmine_issue` refuses without `confirm_delete=true` and returns an
@@ -102,10 +110,10 @@ enforces per-tool scopes: `tools/list` shows only what a token's scopes permit
 and `tools/call` on anything else is refused with `INSUFFICIENT_SCOPE`. See
 [docs/oauth-setup.md](docs/oauth-setup.md).
 
-Setting `REDMINE_MCP_READ_ONLY=true` removes the 12 write-only tools from the
+Setting `REDMINE_MCP_READ_ONLY=true` removes the always-write tools from the
 router entirely and makes the write actions of `manage_issue_relation`,
-`manage_issue_category`, and `manage_redmine_wiki_page` refuse with
-`code: "READ_ONLY"`.
+`manage_issue_category`, `manage_redmine_wiki_page`, `manage_product`,
+`manage_contact`, and `manage_document` refuse with `code: "READ_ONLY"`.
 
 ## HTTP transport
 
@@ -127,6 +135,21 @@ streamed request-body cap, and `X-Content-Type-Options: nosniff` everywhere.
 It binds loopback by default; read
 [Exposing the server on a network](docs/configuration.md#exposing-the-server-on-a-network)
 before changing `SERVER_HOST`.
+
+### Rate limiting
+
+`REDMINE_MCP_RATE_LIMIT_ENABLED` (default `true`) applies a token bucket per
+class: a standard class on `/mcp`/`/files/{uuid}` (`REDMINE_MCP_RATE_LIMIT_RPS`/
+`_BURST`, default 10 rps / burst 40), and a stricter class on the
+`oauth-proxy` flow routes (`REDMINE_MCP_RATE_LIMIT_AUTH_RPS`/`_BURST`,
+default 1 rps / burst 10). Both key by peer IP — never `X-Forwarded-For`/
+`X-Real-IP`, which a client could set itself — except the standard class,
+which keys `/mcp` by bearer-token digest instead when a token is present, so
+distinct users behind one NAT or proxy don't share a bucket. A rejected
+request gets `429 {"error": "rate_limited"}` with `Retry-After`; `/livez`,
+`/readyz`, and `/health` are never rate limited. See
+[docs/troubleshooting.md](docs/troubleshooting.md) for the reverse-proxy
+caveat this IP-keying implies.
 
 ## Docker
 
@@ -170,6 +193,26 @@ The image's own `HEALTHCHECK` runs `ruprogress-mcp --healthcheck` against
 `/readyz` — a Redmine outage must not turn into a container restart loop. Point
 an orchestrator's own readiness probe at `/readyz` separately.
 
+## Logging
+
+`--log-level` (falling back to `RUST_LOG`, default `info`) is a standard
+`tracing_subscriber::EnvFilter` string, written to stderr — stdout is
+reserved for the JSON-RPC stream on the `stdio` transport, enforced by a
+deny-level clippy lint and an end-to-end test that parses every stdout line
+as JSON. Whatever is requested is combined with a **payload-safety floor**
+that caps `rmcp`/`hyper`/`h2`/`reqwest`/`rustls`/`wiremock` at `info` (this
+server's own code is never floored), since those dependencies' own
+`DEBUG`/`TRACE` output can include a full tool call's arguments or wire-level
+bodies. `REDMINE_MCP_LOG_FORMAT` (`text`, default, or `json`) only changes
+how a line is written, never what is in it.
+
+Every `tools/call`, on both transports, opens one span and closes it with a
+single event carrying the tool name, a process-local `request_id`, `outcome`
+(`ok`/`error`/`denied`/`panic`), a `code` when not `ok`, and `duration_ms` —
+never an argument value or key. See
+[docs/configuration.md](docs/configuration.md#logging) for the full
+rationale, including what "redaction" does and does not mean here.
+
 ## Attachments
 
 Downloaded attachments are staged in a local store (`ATTACHMENTS_DIR`, created
@@ -195,8 +238,8 @@ rewrites every emitted `content_url` to a client-reachable origin.
 
 - Interactive Apps tools (drag-and-drop dashboards) — deferred until `rmcp`
   supports the MCP Apps extension.
-- Plugin tool families (checklists, products, CRM contacts, DMSF documents);
-  their `REDMINE_*_ENABLED` flags are reported by `get_mcp_server_info` only.
+- `upload_file`/`manage_document`'s `source_url`: fetching a caller-supplied
+  URL server-side, pending a decision on the SSRF exposure it would add.
 - Horizontal scaling / shared auth state — single-process only.
 
 ## Development

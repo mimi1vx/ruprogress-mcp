@@ -1,15 +1,22 @@
 # Tool contract
 
-The full tool surface `ruprogress-mcp` targets: 52 tools, of which 41 are
-always registered plus 3 more (the Checklist family) when
-`REDMINE_CHECKLISTS_ENABLED=true`. For each tool: name, parameter names +
-types + required-ness, and a one-line return shape.
+The full tool surface `ruprogress-mcp` targets: 52 tools. 41 are always
+registered; 3 more (the Checklist family) join when
+`REDMINE_CHECKLISTS_ENABLED=true` (44); `manage_product`, `manage_contact`,
+and `manage_document` each join independently under their own plugin flag,
+for 47 when every plugin flag implemented so far is on. The remaining 4 (MCP
+Apps) are not implemented — see below. For each tool: name, parameter names +
+types + required-ness, and a one-line return shape; for the exact schema
+(including nested parameter shapes, required OAuth scopes, and whether read-only
+mode hides it) see the generated `docs/tool-reference.md` instead of
+duplicating that detail here.
 
 Tools currently implemented (the non-app core tools plus the
 attachment-related `get_redmine_attachment`, `list_files`, `delete_file`,
-`upload_file`, the admin-gated `cleanup_attachment_files`, and the
-plugin-gated Checklist tools below; kept in sync with `IMPLEMENTED_TOOLS`
-in `crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
+`upload_file`, the admin-gated `cleanup_attachment_files`, the
+plugin-gated Checklist tools, and the plugin-gated Products/CRM/DMSF tools
+below; kept in sync with `IMPLEMENTED_TOOLS` in
+`crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
 `get_mcp_server_info`, `get_current_user`, `list_redmine_projects`,
 `list_redmine_trackers`, `list_project_trackers`,
 `list_redmine_issue_statuses`, `list_redmine_issue_priorities`,
@@ -25,15 +32,22 @@ in `crates/ruprogress-mcp/tests/tools_basic.rs`, which fails CI on drift):
 `manage_issue_note`, `manage_issue_category`, `search_entire_redmine`,
 `manage_redmine_wiki_page`, `get_gantt_chart`, `get_redmine_attachment`,
 `list_files`, `delete_file`, `upload_file`, (only with
-`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`, and
+`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) `cleanup_attachment_files`,
 (only with `REDMINE_CHECKLISTS_ENABLED=true`) `get_checklist`,
-`create_checklist_item`, `update_checklist_item`.
+`create_checklist_item`, `update_checklist_item`, (only with
+`REDMINE_PRODUCTS_ENABLED=true`) `manage_product`, (only with
+`REDMINE_CRM_ENABLED=true`) `manage_contact`, and (only with
+`REDMINE_DMSF_ENABLED=true`) `manage_document`.
 `upload_file` accepts `content_base64`/`file_path` only — `source_url` is
-recognised as a parameter but always refused with `UNSUPPORTED_SOURCE`,
-deferred to a future release. All remaining sections below (MCP Apps, the
-rest of File Operations, Products/Contacts/Documents plugin families) are
-recorded for reference as app-plugin tools that are out of scope for this
-implementation.
+recognised as a parameter but always refused with `UNSUPPORTED_SOURCE`;
+fetching a caller-supplied URL server-side is out of scope for this release
+pending a decision on SSRF exposure. `manage_document`'s DMSF plugin has the
+same `source_url` limitation on its `create` action. The only section below
+that remains genuinely out of scope for this implementation is MCP Apps: it
+requires an interactive UI-resource client capability this server does not
+implement, so `show_triage_board`, `get_triage_board_data`,
+`show_project_dashboard`, and `get_project_dashboard_data` are not
+registered and have no plugin flag.
 
 In `REDMINE_AUTH_MODE=oauth`, which of these tools a given bearer token can
 see and call is governed by `TOOL_SCOPES` in

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-08-19
 
 ### Added
 
@@ -322,6 +322,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include=trackers` was requested), and `Scoped::list_trackers`/
   `list_issue_statuses`/`list_issue_priorities`/`list_users`/
   `list_saved_queries`.
+- A **payload-safety logging floor**: whatever `--log-level`/`RUST_LOG`
+  requests is combined with a fixed cap on `rmcp`, `hyper`, `hyper_util`,
+  `h2`, `reqwest`, `rustls`, and `wiremock` at `info` (and `tower_http::trace`
+  at `debug`, metadata only) — the dependencies whose own `DEBUG`/`TRACE`
+  output would otherwise include a tool call's arguments or a whole
+  JSON-RPC envelope, nothing this server's own code can redact after the
+  fact. This server's own code is never floored; naming a floored target
+  explicitly (`RUST_LOG=trace,rmcp=trace`) still lifts it, logging a startup
+  `WARN` naming the override.
+- Rate limiting on the HTTP transport, on by default
+  (`REDMINE_MCP_RATE_LIMIT_ENABLED`): a **standard** token-bucket class on
+  `/mcp`/`/files/{uuid}` (`REDMINE_MCP_RATE_LIMIT_RPS`/`_BURST`, default 10
+  rps / burst 40) and a stricter **strict** class on the `oauth-proxy` flow
+  routes (`REDMINE_MCP_RATE_LIMIT_AUTH_RPS`/`_BURST`, default 1 rps / burst
+  10, since those routes are attacker-attractive). Both key by peer IP —
+  never `X-Forwarded-For`/`X-Real-IP`, which a client could set itself to
+  bypass the limiter — except the standard class, which keys `/mcp` by a
+  bearer token's digest instead of IP when one is present, so distinct
+  users behind one NAT or proxy don't share a bucket.
+  `REDMINE_MCP_RATE_LIMIT_MAX_KEYS` bounds each class's bucket map, evicting
+  the least-recently-touched key at capacity. A rejected request gets `429
+  {"error": "rate_limited"}` with `Retry-After` and `Cache-Control: no-store`;
+  `/livez`, `/readyz`, and `/health` are never rate limited.
+- One `tool_call` span per `tools/call`, on both transports, closed by a
+  single event carrying the tool name, a process-local `request_id` (not a
+  client-supplied or W3C trace id — nothing propagates it over the wire),
+  `outcome` (`ok`/`error`/`denied`/`panic`) plus `code` when not `ok`, and
+  `duration_ms` — never an argument value or key.
+  `REDMINE_MCP_LOG_FORMAT` (`text`, default, or `json`, one object per line)
+  changes only how a line is written, never what is in it.
+- A distroless, non-root (`Dockerfile`), locally-built container image
+  (`docker build --platform linux/arm64 …`; no registry push, no multi-arch
+  matrix), plus a `docker-compose.yml` for a locked-down run with a
+  read-only root filesystem and a named volume for the attachments
+  directory. A new `--healthcheck` CLI flag GETs `/livez` and exits
+  `0`/`1` (distroless has no shell or `curl` for a `HEALTHCHECK` to invoke
+  another way); the image's own `HEALTHCHECK` runs it, deliberately never
+  probing `/readyz`, so a Redmine outage cannot turn into a container
+  restart loop.
 
 ### Fixed
 
@@ -356,3 +395,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `strip = "debuginfo"` explicitly, shrinking the binary by roughly a
   quarter; `panic = "unwind"` is pinned (it was already the default) since
   the panic containment above depends on it.
+
+### Security
+
+- Bumped `h2` to 0.4.16, fixing an advisory where empty `DATA` frames were
+  accepted and queued without limit (unbounded memory, or a panic on length
+  overflow) — pulled in transitively through `axum`, `reqwest`, `rmcp`, and
+  `wiremock` alike.
