@@ -1,10 +1,20 @@
 [package]
-name         = "redmine-client"
-version      = { workspace = true }
-edition      = { workspace = true }
-rust-version = { workspace = true }
-license      = { workspace = true }
-repository   = { workspace = true }
+name          = "redmine-client"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+description   = "A pure Redmine REST client: no MCP, no LLM shaping — just typed requests and responses."
+readme        = "README.md"
+homepage      = "https://github.com/mimi1vx/ruprogress-mcp/tree/main/crates/redmine-client"
+documentation = "https://docs.rs/redmine-client"
+keywords      = ["redmine", "rest-client", "http-client"]
+categories    = ["web-programming::http-client", "api-bindings"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
