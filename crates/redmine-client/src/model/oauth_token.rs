@@ -36,7 +36,7 @@ pub struct OAuthToken {
     /// The upstream access token to store and later present to Redmine.
     pub access_token: SecretString,
     /// The upstream refresh token, if Doorkeeper's `use_refresh_token`
-    /// setting is enabled (risk 3 in the umbrella plan).
+    /// setting is enabled.
     pub refresh_token: Option<SecretString>,
     /// Upstream lifetime in seconds, if reported.
     pub expires_in: Option<u64>,

@@ -139,7 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived from the reference implementation's handling of the plugin rather
   than a live capture — see `crates/redmine-client/tests/fixtures/README.md`.
 - `create_redmine_issue`/`update_redmine_issue` gain a `custom_fields`
-  parameter — core Redmine, not plugin-gated, paying off phase 4b's
+  parameter — core Redmine, not plugin-gated, paying off a previously
   deferred decision (G8). Each entry gives exactly one of `id` (free) or
   `name` (matched case- and punctuation-insensitively via a project lookup,
   e.g. `"Story Points"` ≡ `"story_points"`; costs one extra request on

@@ -111,10 +111,9 @@ fn document_not_found() -> CallToolResult {
 
 // --- manage_document ---
 
-/// DMSF exposes no delete action from this tool — matching the reference,
-/// see the sub-phase's alternatives-considered note on DMSF deletion
-/// semantics (revision vs. file vs. folder, recycle bin) being a design
-/// question, not an omission.
+/// DMSF exposes no delete action from this tool — matching the reference.
+/// Deletion semantics (revision vs. file vs. folder, recycle bin) are a
+/// design question, not an omission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ManageDocumentAction {

@@ -1,5 +1,5 @@
-//! Rate limiting (phase 9.2): burst rejection with `Retry-After`, the health
-//! exemption, per-key isolation, the strict/standard class split, and the
+//! Rate limiting: burst rejection with `Retry-After`, the health exemption,
+//! per-key isolation, the strict/standard class split, and the
 //! `REDMINE_MCP_RATE_LIMIT_ENABLED=false` escape hatch.
 //!
 //! Goes through `transport::http::router`, so the real middleware stack —

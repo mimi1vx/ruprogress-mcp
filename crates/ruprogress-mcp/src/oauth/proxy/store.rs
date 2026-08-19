@@ -293,8 +293,7 @@ impl TransactionStore {
 
     /// Consumes the transaction named by `state`, if it exists and has not
     /// expired. Single-use: a second call with the same `state` returns
-    /// `None`, closing off transaction replay (risk 4 in the sub-phase
-    /// plan).
+    /// `None`, closing off transaction replay.
     pub(crate) fn take(&self, state: &str) -> Option<Transaction> {
         let key = digest(state);
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);

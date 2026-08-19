@@ -15,6 +15,8 @@ use secrecy::SecretString;
 use serde_json::json;
 use url::Url;
 
+use crate::logging::LogFormat;
+
 /// The injected source of configuration: everything `from_map` reads from.
 pub type EnvMap = BTreeMap<String, String>;
 
@@ -41,6 +43,13 @@ pub struct Config {
     /// `REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS` /
     /// `REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS`.
     pub custom_fields: CustomFieldConfig,
+    /// `REDMINE_MCP_LOG_FORMAT`, default `text`. `main.rs` reads this
+    /// straight off the process environment (mirroring `RUST_LOG`/
+    /// `--log-level`, both of which also predate `Config`) since tracing
+    /// must be initialized before `Config::from_map` runs — its own startup
+    /// warnings depend on that order. This field exists so the value is
+    /// still validated, documented, and visible in `--print-config`.
+    pub log_format: LogFormat,
 }
 
 /// Which JSON Schema dialect served `inputSchema`s use. `outputSchema` is
@@ -236,7 +245,7 @@ pub struct HttpConfig {
     pub rate_limit: RateLimitConfig,
 }
 
-/// `crate::ratelimit`'s per-key token-bucket settings (phase 9.2, RL2/RL4).
+/// `crate::ratelimit`'s per-key token-bucket settings (RL2/RL4).
 /// Two classes: **standard** (`/mcp`, `/files/{uuid}`) and **strict** (the
 /// unauthenticated, state-allocating `oauth-proxy` endpoints). Ignored
 /// entirely on `stdio` (Z3).
@@ -1246,6 +1255,17 @@ fn parse_schema_dialect(vars: &EnvMap) -> Result<SchemaDialect, ConfigError> {
     }
 }
 
+fn parse_log_format(vars: &EnvMap) -> Result<LogFormat, ConfigError> {
+    match optional(vars, "REDMINE_MCP_LOG_FORMAT").as_deref() {
+        None => Ok(LogFormat::Text),
+        Some(other) => LogFormat::parse(other).ok_or_else(|| ConfigError::Invalid {
+            var: "REDMINE_MCP_LOG_FORMAT",
+            expected: "one of \"text\", \"json\"",
+            because: format!("got {other:?}"),
+        }),
+    }
+}
+
 fn parse_plugins(vars: &EnvMap) -> Result<PluginFlags, ConfigError> {
     Ok(PluginFlags {
         agile: optional_bool(vars, "REDMINE_AGILE_ENABLED", false)?,
@@ -1534,6 +1554,7 @@ impl Config {
             )?,
             schema_dialect: parse_schema_dialect(vars)?,
             custom_fields: parse_custom_fields(vars)?,
+            log_format: parse_log_format(vars)?,
         })
     }
 
@@ -1646,6 +1667,7 @@ impl Config {
             "read_only_mode": self.read_only,
             "plugin_flags": self.plugin_flags_json(),
             "schema_dialect": self.schema_dialect_label(),
+            "log_format": self.log_format.label(),
             "autofill_required_custom_fields": self.custom_fields.autofill_required,
             "required_custom_field_defaults_count": self.custom_fields.defaults.len(),
         })
@@ -2580,6 +2602,35 @@ mod tests {
             err,
             ConfigError::Invalid {
                 var: "REDMINE_MCP_SCHEMA_DIALECT",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        let config =
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.log_format, LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_parses_json() {
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_MCP_LOG_FORMAT".to_string(), "json".to_string());
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_rejects_unknown_values() {
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_MCP_LOG_FORMAT".to_string(), "bogus".to_string());
+        let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_LOG_FORMAT",
                 ..
             }
         ));

@@ -1,4 +1,4 @@
-//! A hand-rolled, keyed token-bucket rate limiter (phase 9.2, RL1/RL2).
+//! A hand-rolled, keyed token-bucket rate limiter (RL1/RL2).
 //!
 //! Deliberately dependency-free and free of any axum types, so this module
 //! is testable in complete isolation from the HTTP transport — see

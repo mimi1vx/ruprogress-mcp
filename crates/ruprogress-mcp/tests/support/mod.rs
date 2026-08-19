@@ -328,6 +328,7 @@ pub(crate) async fn capture(requested_level: &str) -> Capture {
         .with_writer(buf.clone())
         .with_env_filter(filter)
         .without_time()
+        .with_ansi(false)
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
     tokio::spawn(async { tracing::info!("{CAPTURE_CANARY}") })

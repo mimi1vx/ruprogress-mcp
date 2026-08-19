@@ -52,17 +52,26 @@ impl From<CliTransport> for TransportKind {
     }
 }
 
-fn init_tracing(log_level: Option<&str>) {
+/// `format` is read straight off the process environment by the caller
+/// (mirroring `log_level`, both of which must run before `Config::from_map`
+/// so its own startup warnings land under the installed subscriber) — see
+/// `Config::log_format`'s doc comment.
+fn init_tracing(log_level: Option<&str>, format: ruprogress_mcp::logging::LogFormat) {
+    use ruprogress_mcp::logging::LogFormat;
+
     let requested = log_level.map_or_else(
         || std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         std::string::ToString::to_string,
     );
     let (filter, overridden_floors) = ruprogress_mcp::logging::env_filter(&requested);
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+        .with_ansi(false);
+    match format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
     for target in overridden_floors {
         tracing::warn!(
             "RUST_LOG enables `{target}` above the payload-safety floor; request and response \
@@ -247,7 +256,11 @@ async fn run_http(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.log_level.as_deref());
+    let log_format = std::env::var("REDMINE_MCP_LOG_FORMAT")
+        .ok()
+        .and_then(|value| ruprogress_mcp::logging::LogFormat::parse(&value))
+        .unwrap_or_default();
+    init_tracing(cli.log_level.as_deref(), log_format);
 
     let vars = load_env_map(cli.env_file.as_deref())?;
     let config = Config::from_map(&vars, TransportKind::from(cli.transport))?;

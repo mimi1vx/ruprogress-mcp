@@ -12,6 +12,9 @@
 //! gets exactly that — [`env_filter`] reports the override so the caller can
 //! warn about it.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tracing_subscriber::EnvFilter;
 
 /// `(target, level)`: crates whose default `DEBUG`/`TRACE` output can
@@ -57,12 +60,102 @@ pub fn env_filter(requested: &str) -> (EnvFilter, Vec<&'static str>) {
     (EnvFilter::new(spec), overridden)
 }
 
+/// Correlates the tracing lines of one `tools/call` (`server.rs`'s
+/// `call_tool`, which opens the `tool_call` span this formats into):
+/// an 8-hex-digit random prefix, stable for the process's life, plus a
+/// 16-hex-digit call counter. **Not** a client-supplied or W3C trace id
+/// (OB2) — nothing propagates it over the wire, and it exists only to tie
+/// one call's lines together and to tell two processes' logs apart in an
+/// aggregator.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestId {
+    counter: u64,
+}
+
+impl RequestId {
+    /// Atomically advances `counter` (owned by the caller — `RedmineMcp`'s
+    /// inner state, so every call through one server shares a sequence) and
+    /// returns the id for the value it held before the increment.
+    #[must_use]
+    pub fn next(counter: &AtomicU64) -> Self {
+        Self {
+            counter: counter.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{:016x}", process_prefix(), self.counter)
+    }
+}
+
+fn process_prefix() -> &'static str {
+    static PREFIX: OnceLock<String> = OnceLock::new();
+    PREFIX.get_or_init(|| format!("{:08x}", rand::random::<u32>()))
+}
+
+/// `REDMINE_MCP_LOG_FORMAT`: cosmetic only, does not change what is logged
+/// (OB8). `Json` is one `tracing_subscriber` JSON object per line, for a log
+/// aggregator; `Text` (default) is the existing human-readable format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    /// Parses `REDMINE_MCP_LOG_FORMAT`'s two accepted values. `None` for
+    /// anything else, including an empty string — the caller decides what
+    /// that means (an unset var vs. a rejected one).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{FLOORS, env_filter};
+    use super::{FLOORS, LogFormat, RequestId, env_filter};
 
     fn rendered(requested: &str) -> String {
         env_filter(requested).0.to_string()
+    }
+
+    #[test]
+    fn two_ids_share_the_process_prefix_and_differ_in_the_counter() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let a = RequestId::next(&counter).to_string();
+        let b = RequestId::next(&counter).to_string();
+        let (prefix_a, suffix_a) = a.split_once('-').expect("id has a prefix-counter shape");
+        let (prefix_b, suffix_b) = b.split_once('-').expect("id has a prefix-counter shape");
+        assert_eq!(prefix_a, prefix_b, "same process must share a prefix");
+        assert_ne!(suffix_a, suffix_b, "the counter must differ");
+        assert_eq!(prefix_a.len(), 8);
+        assert_eq!(suffix_a.len(), 16);
+    }
+
+    #[test]
+    fn log_format_parses_its_two_values_and_rejects_anything_else() {
+        assert_eq!(LogFormat::parse("text"), Some(LogFormat::Text));
+        assert_eq!(LogFormat::parse("json"), Some(LogFormat::Json));
+        assert_eq!(LogFormat::parse("JSON"), None);
+        assert_eq!(LogFormat::parse(""), None);
+        assert_eq!(LogFormat::default(), LogFormat::Text);
     }
 
     #[test]

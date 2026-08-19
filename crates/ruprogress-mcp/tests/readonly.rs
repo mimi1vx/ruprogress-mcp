@@ -67,9 +67,9 @@ async fn no_write_tool_name_exists_in_a_read_only_router() {
 async fn calling_an_unregistered_tool_returns_a_clean_error_not_a_panic() {
     let h = support::harness(&[]).await;
     // `show_triage_board` is a real future tool name (see
-    // docs/tool-contract.md, Phase 8, deferred) that does not exist in the
-    // router yet — the router's response to it is identical to what it
-    // will return for a route removed by read-only mode.
+    // docs/tool-contract.md; deferred, not yet implemented) that does not
+    // exist in the router yet — the router's response to it is identical to
+    // what it will return for a route removed by read-only mode.
     let result = h
         .client
         .call_tool(CallToolRequestParams::new("show_triage_board"))

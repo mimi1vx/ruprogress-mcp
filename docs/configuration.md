@@ -309,6 +309,47 @@ Naming a floored target explicitly wins: `RUST_LOG=trace,rmcp=trace` logs
 `rmcp` at `trace` — including tool payloads — and a startup `WARN` names the
 override, since that is a real trade a protocol-bug hunt sometimes needs.
 
+## Observability
+
+Every `tools/call`, on both transports, opens one `tool_call` span and closes
+it with a single `INFO` event carrying:
+
+- `tool` — the tool name
+- `request_id` — an 8-hex-digit process prefix (random at startup, stable
+  for the process's life) plus a 16-hex-digit per-server call counter, e.g.
+  `9f3ac210-0000000000000042`. This is **not** a client-supplied or W3C
+  trace id — nothing propagates it over the wire. It exists only to tie one
+  call's log lines together and to tell two processes' logs apart in an
+  aggregator; do not plumb it into a header expecting distributed tracing.
+- `outcome` — one of `ok`, `error`, `denied` (a scope or read-only refusal),
+  or `panic`, plus `code` (the tool's own in-band `ErrorCode`, e.g.
+  `NOT_FOUND`) when `outcome` is not `ok`
+- `duration_ms` — wall-clock time of the guarded call body
+
+The span deliberately carries **only** the tool name and the request id —
+never an argument value, and never an argument *key* either. Some tools'
+argument keys are themselves sensitive (Redmine custom-field names, CRM
+contact-field names), and there is no per-tool review budget for "which of
+this tool's keys are safe to log" — the rule is simply: log the call, never
+its content.
+
+`REDMINE_MCP_LOG_FORMAT` (`text`, default, or `json` — one JSON object per
+line, for a log aggregator) only changes how a line is written, never what is
+in it.
+
+**What "redaction" does and does not mean here.** There is no `tracing`
+layer that scrubs credentials or PII out of formatted log output, and there
+will not be one: a layer like that can only remove strings it has already
+been told about, so it protects nothing new and would advertise a guarantee
+this server cannot keep. What actually holds the line is two things working
+together: the payload-safety floor above (dependencies that would otherwise
+print a tool's arguments or a whole JSON-RPC envelope are capped below the
+level that does so) and this server's own code never logging tool argument
+values or response PII in the first place (this section, plus the per-mode
+tests that assert it). "Redaction" in this codebase means *the sites that
+would print a secret are not enabled and are not written*, not *a filter
+removes secrets after the fact*.
+
 ## `--print-config`
 
 `ruprogress-mcp --print-config` resolves the config and prints

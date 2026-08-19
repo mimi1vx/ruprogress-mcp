@@ -29,7 +29,7 @@ schemars    = "1.2"
 thiserror   = "2"
 anyhow      = "1"
 tracing     = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 axum        = "0.8"
 # Held at 0.6 deliberately: reqwest 0.13 depends on `tower-http ^0.6.8`, so
 # asking for 0.7 here resolves to two copies of the crate in every build.

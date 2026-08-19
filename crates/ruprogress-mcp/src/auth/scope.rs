@@ -204,7 +204,7 @@ pub static TOOL_SCOPES: &[(&str, ScopeRule)] = &[
     ("update_checklist_item", ScopeRule::Fixed(&[])),
     // RedmineUP Products/CRM plugins: same reasoning as Checklists above —
     // no scope advertised for any action, Redmine's own in-band 403 is the
-    // authorization decision (parent plan P6).
+    // authorization decision.
     ("manage_product", ScopeRule::Fixed(&[])),
     ("manage_contact", ScopeRule::Fixed(&[])),
     // DMSF plugin: unlike the three families above, its scopes were already

@@ -50,7 +50,7 @@ use crate::server::RedmineMcp;
 /// turn up that hard-requires an `Mcp-Session-Id`.
 type SessionManager = NeverSessionManager;
 
-// --- Rate limiting (phase 9.2) ---------------------------------------------
+// --- Rate limiting -----------------------------------------------------
 
 /// A rate-limit bucket key. `Fallback` is reserved for the programming-error
 /// case where `ConnectInfo` is unexpectedly absent (RL10) — never a real

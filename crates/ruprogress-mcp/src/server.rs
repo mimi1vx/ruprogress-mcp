@@ -2,6 +2,8 @@
 //! credential choke point every tool starts with.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 
 use redmine_client::{RedmineClient, Scoped};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -12,11 +14,13 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
+use tracing::Instrument as _;
 
 use crate::attachments::AttachmentStore;
 use crate::auth::oauth::TokenVerifier;
 use crate::auth::scope;
 use crate::config::{AuthMode, Config, PluginFlags, SchemaDialect};
+use crate::logging::RequestId;
 use crate::readonly::write_tools;
 use crate::tools::schema;
 
@@ -62,6 +66,10 @@ pub(crate) struct ServerInner {
     /// same client registry and token stores rather than two independent
     /// copies.
     pub(crate) oauth_proxy_state: Option<Arc<crate::oauth::proxy::store::ProxyState>>,
+    /// Backs the `request_id` half of `call_tool`'s `tool_call` span (OB2):
+    /// one shared, monotonic counter per server so every call through it
+    /// gets a distinct id.
+    request_counter: AtomicU64,
 }
 
 impl RedmineMcp {
@@ -124,6 +132,7 @@ impl RedmineMcp {
                 attachments,
                 oauth_verifier,
                 oauth_proxy_state,
+                request_counter: AtomicU64::new(0),
             }),
             tool_router: router,
         }
@@ -238,6 +247,42 @@ impl RedmineMcp {
     }
 }
 
+/// Classifies a finished `call_tool` result into the bounded outcome set
+/// (OB6) the `tool_call` span's closing event records: `"ok"`, `"panic"`,
+/// `"denied"` (a scope or read-only refusal), or `"error"` for everything
+/// else, each paired with the in-band `ErrorCode` string when the result
+/// carries one. Never inspects `request`/argument data — only the
+/// already-built response's `is_error`/`structured_content.code`, which are
+/// never an argument value (OB3).
+///
+/// `ErrorCode::Internal` (`"INTERNAL"`) is produced exclusively by
+/// `panic_guard::catch_tool_panic` (see `tools/output.rs`'s doc comment on
+/// the variant), so it doubles safely as the panic signal here without
+/// `dispatch_tool_call` having to thread one through separately.
+fn tool_call_outcome(
+    result: &Result<CallToolResponse, McpError>,
+) -> (&'static str, Option<String>) {
+    let response = match result {
+        Err(_) => return ("error", None),
+        Ok(CallToolResponse::Complete(response)) => response,
+        Ok(_) => return ("ok", None),
+    };
+    if response.is_error != Some(true) {
+        return ("ok", None);
+    }
+    let code = response
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match code.as_deref() {
+        Some("INTERNAL") => ("panic", code),
+        Some("READ_ONLY" | "INSUFFICIENT_SCOPE") => ("denied", code),
+        _ => ("error", code),
+    }
+}
+
 /// Explains the prompt-injection delimiter scheme once per session,
 /// rather than repeating a preamble content block on every tool response.
 /// Every wrapped field uses a random nonce generated per response, so this
@@ -310,13 +355,46 @@ impl ServerHandler for RedmineMcp {
     /// The whole body runs under `panic_guard::catch_tool_panic` — scope
     /// resolution above is caller-controlled parsing too, not just the
     /// dispatch it guards.
+    ///
+    /// Wrapped in one `tool_call` span (OB1) carrying only `tool` and
+    /// `request_id` — never an argument, and never an argument *key*
+    /// either (OB3) — closed by a single `outcome`/`duration_ms` event
+    /// once the guarded body finishes, including the panic path.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let tool_name = request.name.to_string();
-        crate::panic_guard::catch_tool_panic(&tool_name, async move {
+        let request_id = RequestId::next(&self.inner.request_counter);
+        let span = tracing::info_span!("tool_call", tool = %tool_name, request_id = %request_id);
+        async move {
+            let start = Instant::now();
+            let result = self.dispatch_tool_call(request, context, &tool_name).await;
+            #[allow(clippy::cast_possible_truncation)]
+            let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let (outcome, code) = tool_call_outcome(&result);
+            tracing::info!(
+                outcome,
+                code = code.as_deref().unwrap_or(""),
+                duration_ms,
+                "tool call finished"
+            );
+            result
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+impl RedmineMcp {
+    async fn dispatch_tool_call(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        tool_name: &str,
+    ) -> Result<CallToolResponse, McpError> {
+        crate::panic_guard::catch_tool_panic(tool_name, async move {
             if self.scope_enforcement_active() {
                 let auth = crate::auth::oauth::auth_context(&context)?;
                 if !scope::is_admin(&auth.scopes) {

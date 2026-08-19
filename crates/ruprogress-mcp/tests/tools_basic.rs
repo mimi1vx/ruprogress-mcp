@@ -200,9 +200,9 @@ async fn tools_list_returns_exactly_the_implemented_tools() {
 }
 
 /// Plugin-gated tools implemented so far (`RedmineUP` Checklists Pro), added
-/// to [`IMPLEMENTED_TOOLS`] only when their flag is on. As later sub-phases
-/// implement the remaining plugin families this list grows towards the
-/// parent plan's full 47.
+/// to [`IMPLEMENTED_TOOLS`] only when their flag is on. As the remaining
+/// plugin families are implemented this list grows towards the full set of
+/// plugin-gated tools this server supports.
 const CHECKLIST_TOOLS: &[&str] = &[
     "get_checklist",
     "create_checklist_item",
@@ -276,8 +276,7 @@ async fn tools_list_with_products_and_crm_enabled_adds_exactly_those_tools() {
     );
 }
 
-/// Every plugin flag implemented so far, all at once — the parent plan's
-/// full 47.
+/// Every plugin flag implemented so far, all at once.
 #[tokio::test]
 async fn tools_list_with_every_implemented_plugin_flag_enabled() {
     let h = support::harness(&[
@@ -835,8 +834,8 @@ async fn tools_list_serialized_size_with_every_plugin_enabled_stays_under_a_wide
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     // `manage_product`/`manage_contact` are the two widest schemas in the
-    // server (parent plan Risk 1); `manage_document` adds a third
-    // action-dispatched schema. Threshold raised from 160 000 to fit it —
+    // server; `manage_document` adds a third action-dispatched schema.
+    // Threshold raised from 160 000 to fit it —
     // re-measure and adjust here if a future change is a real regression.
     assert!(
         bytes.len() < 170_000,
