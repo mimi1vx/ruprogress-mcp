@@ -232,6 +232,31 @@ pub struct HttpConfig {
     /// `PUBLIC_PORT`/`PUBLIC_SCHEME` when `PUBLIC_HOST` is set, or from the
     /// bind address for a loopback bind — see `parse_public_base`.
     pub public_base: Url,
+    /// See [`RateLimitConfig`].
+    pub rate_limit: RateLimitConfig,
+}
+
+/// `crate::ratelimit`'s per-key token-bucket settings (phase 9.2, RL2/RL4).
+/// Two classes: **standard** (`/mcp`, `/files/{uuid}`) and **strict** (the
+/// unauthenticated, state-allocating `oauth-proxy` endpoints). Ignored
+/// entirely on `stdio` (Z3).
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitConfig {
+    /// `REDMINE_MCP_RATE_LIMIT_ENABLED`. `false` restores pre-9.2 behaviour
+    /// exactly — no limiter is constructed at all (RL9).
+    pub enabled: bool,
+    /// `REDMINE_MCP_RATE_LIMIT_RPS`: the standard class's refill rate.
+    pub standard_rps: u32,
+    /// `REDMINE_MCP_RATE_LIMIT_BURST`: the standard class's bucket capacity.
+    pub standard_burst: u32,
+    /// `REDMINE_MCP_RATE_LIMIT_AUTH_RPS`: the strict class's refill rate.
+    pub strict_rps: u32,
+    /// `REDMINE_MCP_RATE_LIMIT_AUTH_BURST`: the strict class's bucket
+    /// capacity.
+    pub strict_burst: u32,
+    /// `REDMINE_MCP_RATE_LIMIT_MAX_KEYS`: the hard cap on each class's
+    /// bucket map (RL7).
+    pub max_keys: usize,
 }
 
 const DEFAULT_MAX_RESPONSE_ITEMS: usize = 200;
@@ -244,6 +269,14 @@ const MAX_HEALTH_TTL_SECONDS: u64 = 3600;
 /// rmcp's own default, restated here because we must never let the list go
 /// empty by accident (an empty list means "allow every host").
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// RL9's proposed defaults: an order of magnitude above a real client's
+/// rate, orders below a flood.
+const DEFAULT_RATE_LIMIT_RPS: u32 = 10;
+const DEFAULT_RATE_LIMIT_BURST: u32 = 40;
+const DEFAULT_RATE_LIMIT_AUTH_RPS: u32 = 1;
+const DEFAULT_RATE_LIMIT_AUTH_BURST: u32 = 10;
+const DEFAULT_RATE_LIMIT_MAX_KEYS: usize = 10_000;
 
 /// Which plugin-gated tool families are enabled. Surfaced in
 /// `get_mcp_server_info`'s `plugin_flags`; no gated tools exist yet.
@@ -845,6 +878,7 @@ fn parse_http(vars: &EnvMap) -> Result<HttpConfig, ConfigError> {
         health_ttl: Duration::from_secs(health_ttl_seconds),
         request_timeout: Duration::from_secs(10),
         public_base: parse_public_base(vars, bind)?,
+        rate_limit: parse_rate_limit(vars)?,
     })
 }
 
@@ -1244,6 +1278,77 @@ fn positive_usize(vars: &EnvMap, var: &'static str, default: usize) -> Result<us
         ));
     }
     Ok(value)
+}
+
+/// Parses a positive `u32` env var, rejecting `0`.
+fn positive_u32(vars: &EnvMap, var: &'static str, default: u32) -> Result<u32, ConfigError> {
+    let Some(raw) = optional(vars, var) else {
+        return Ok(default);
+    };
+    let invalid = |because: String| ConfigError::Invalid {
+        var,
+        expected: "a positive integer",
+        because,
+    };
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| invalid("the value could not be parsed as a number".to_string()))?;
+    if value == 0 {
+        return Err(invalid("0 is not a usable value here".to_string()));
+    }
+    Ok(value)
+}
+
+/// RL2's per-class token-bucket settings, validated (`rps` > 0, `burst` >=
+/// `rps`, `max_keys` >= 1) rather than left for `crate::ratelimit::Limiter`
+/// to guess at a sane fallback.
+fn parse_rate_limit(vars: &EnvMap) -> Result<RateLimitConfig, ConfigError> {
+    let enabled = optional_bool(vars, "REDMINE_MCP_RATE_LIMIT_ENABLED", true)?;
+    let standard_rps = positive_u32(vars, "REDMINE_MCP_RATE_LIMIT_RPS", DEFAULT_RATE_LIMIT_RPS)?;
+    let standard_burst = positive_u32(
+        vars,
+        "REDMINE_MCP_RATE_LIMIT_BURST",
+        DEFAULT_RATE_LIMIT_BURST,
+    )?;
+    let strict_rps = positive_u32(
+        vars,
+        "REDMINE_MCP_RATE_LIMIT_AUTH_RPS",
+        DEFAULT_RATE_LIMIT_AUTH_RPS,
+    )?;
+    let strict_burst = positive_u32(
+        vars,
+        "REDMINE_MCP_RATE_LIMIT_AUTH_BURST",
+        DEFAULT_RATE_LIMIT_AUTH_BURST,
+    )?;
+    let max_keys = positive_usize(
+        vars,
+        "REDMINE_MCP_RATE_LIMIT_MAX_KEYS",
+        DEFAULT_RATE_LIMIT_MAX_KEYS,
+    )?;
+
+    if standard_burst < standard_rps {
+        return Err(ConfigError::Invalid {
+            var: "REDMINE_MCP_RATE_LIMIT_BURST",
+            expected: "a value >= REDMINE_MCP_RATE_LIMIT_RPS",
+            because: format!("{standard_burst} is less than the configured rps ({standard_rps})"),
+        });
+    }
+    if strict_burst < strict_rps {
+        return Err(ConfigError::Invalid {
+            var: "REDMINE_MCP_RATE_LIMIT_AUTH_BURST",
+            expected: "a value >= REDMINE_MCP_RATE_LIMIT_AUTH_RPS",
+            because: format!("{strict_burst} is less than the configured rps ({strict_rps})"),
+        });
+    }
+
+    Ok(RateLimitConfig {
+        enabled,
+        standard_rps,
+        standard_burst,
+        strict_rps,
+        strict_burst,
+        max_keys,
+    })
 }
 
 const DEFAULT_ATTACHMENT_MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
@@ -3290,5 +3395,132 @@ mod tests {
     fn public_base_for_a_loopback_v6_bind_brackets_the_address() {
         let cfg = http(&[("SERVER_HOST", "::1")]).expect("loopback v6 should be valid");
         assert_eq!(cfg.public_base.to_string(), "http://[::1]:8000/");
+    }
+
+    // --- rate limiting (9.2) -----------------------------------------------
+
+    #[test]
+    fn rate_limit_defaults() {
+        let cfg = http(&[]).expect("defaults should be valid");
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.standard_rps, 10);
+        assert_eq!(cfg.rate_limit.standard_burst, 40);
+        assert_eq!(cfg.rate_limit.strict_rps, 1);
+        assert_eq!(cfg.rate_limit.strict_burst, 10);
+        assert_eq!(cfg.rate_limit.max_keys, 10_000);
+    }
+
+    #[test]
+    fn rate_limit_enabled_accepts_false() {
+        let cfg =
+            http(&[("REDMINE_MCP_RATE_LIMIT_ENABLED", "false")]).expect("false should be valid");
+        assert!(!cfg.rate_limit.enabled);
+    }
+
+    #[test]
+    fn rate_limit_enabled_rejects_a_non_boolean() {
+        let err = http(&[("REDMINE_MCP_RATE_LIMIT_ENABLED", "sometimes")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_ENABLED",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_reads_each_var() {
+        let cfg = http(&[
+            ("REDMINE_MCP_RATE_LIMIT_RPS", "5"),
+            ("REDMINE_MCP_RATE_LIMIT_BURST", "20"),
+            ("REDMINE_MCP_RATE_LIMIT_AUTH_RPS", "2"),
+            ("REDMINE_MCP_RATE_LIMIT_AUTH_BURST", "3"),
+            ("REDMINE_MCP_RATE_LIMIT_MAX_KEYS", "500"),
+        ])
+        .expect("should be valid");
+        assert_eq!(cfg.rate_limit.standard_rps, 5);
+        assert_eq!(cfg.rate_limit.standard_burst, 20);
+        assert_eq!(cfg.rate_limit.strict_rps, 2);
+        assert_eq!(cfg.rate_limit.strict_burst, 3);
+        assert_eq!(cfg.rate_limit.max_keys, 500);
+    }
+
+    #[test]
+    fn rate_limit_rps_zero_is_invalid() {
+        let err = http(&[("REDMINE_MCP_RATE_LIMIT_RPS", "0")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_RPS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_auth_rps_non_numeric_is_invalid() {
+        let err = http(&[("REDMINE_MCP_RATE_LIMIT_AUTH_RPS", "fast")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_AUTH_RPS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_max_keys_zero_is_invalid() {
+        let err = http(&[("REDMINE_MCP_RATE_LIMIT_MAX_KEYS", "0")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_MAX_KEYS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_burst_below_rps_is_invalid() {
+        let err = http(&[
+            ("REDMINE_MCP_RATE_LIMIT_RPS", "10"),
+            ("REDMINE_MCP_RATE_LIMIT_BURST", "5"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_BURST",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_auth_burst_below_auth_rps_is_invalid() {
+        let err = http(&[
+            ("REDMINE_MCP_RATE_LIMIT_AUTH_RPS", "5"),
+            ("REDMINE_MCP_RATE_LIMIT_AUTH_BURST", "1"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "REDMINE_MCP_RATE_LIMIT_AUTH_BURST",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_burst_equal_to_rps_is_valid() {
+        let cfg = http(&[
+            ("REDMINE_MCP_RATE_LIMIT_RPS", "10"),
+            ("REDMINE_MCP_RATE_LIMIT_BURST", "10"),
+        ])
+        .expect("burst == rps should be valid");
+        assert_eq!(cfg.rate_limit.standard_burst, 10);
     }
 }

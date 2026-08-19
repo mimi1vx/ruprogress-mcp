@@ -10,6 +10,7 @@ mod health;
 pub mod logging;
 mod oauth;
 mod panic_guard;
+mod ratelimit;
 pub mod readonly;
 pub mod render;
 pub mod server;

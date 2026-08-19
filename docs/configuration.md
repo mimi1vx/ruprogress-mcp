@@ -64,6 +64,20 @@ Both allowlists reject a value that is set but contains no usable entries
 | `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` | no | `4194304` (4 MiB) | 1 KiB – 64 MiB. Enforced while streaming the body, so `Content-Length` cannot be lied about; oversized payloads get `413`. |
 | `HEALTH_INTROSPECTION_TTL_SECONDS` | no | `30` | 0–3600. How long a `/readyz` Redmine probe stays cached. `0` disables caching. |
 | `PUBLIC_SCHEME` | no | `https` if `PUBLIC_PORT` is `443`, else `http` | `http` or `https`. Feeds the origin used to build `/files/{uuid}` attachment URLs (`public_base`); has no effect on the `Host` allowlist. |
+| `REDMINE_MCP_RATE_LIMIT_ENABLED` | no | `true` | `false` restores pre-9.2 behaviour exactly — no limiter is constructed and no request is ever rejected for rate. |
+| `REDMINE_MCP_RATE_LIMIT_RPS` | no | `10` | The **standard** class's refill rate (`/mcp`, `/files/{uuid}`). Must be > 0. |
+| `REDMINE_MCP_RATE_LIMIT_BURST` | no | `40` | The standard class's bucket capacity. Must be >= `REDMINE_MCP_RATE_LIMIT_RPS`. |
+| `REDMINE_MCP_RATE_LIMIT_AUTH_RPS` | no | `1` | The **strict** class's refill rate (`/register`, `/authorize`, `/auth/callback`, `/token`, `/revoke` — `oauth-proxy` mode only). Must be > 0. |
+| `REDMINE_MCP_RATE_LIMIT_AUTH_BURST` | no | `10` | The strict class's bucket capacity. Must be >= `REDMINE_MCP_RATE_LIMIT_AUTH_RPS`. |
+| `REDMINE_MCP_RATE_LIMIT_MAX_KEYS` | no | `10000` | Hard cap on each class's bucket map. At capacity, a new key evicts the least-recently-touched entry rather than being refused. |
+
+Both classes key by the request's peer IP address, never a header
+(`X-Forwarded-For`/`X-Real-IP` are never read — see "Rate limiting" below); the
+standard class keys `/mcp` by a bearer token's digest instead when one is
+present, so one NAT or containerised client does not share a bucket across
+distinct users. A rejected request gets `429` with a `Retry-After` header and
+`Cache-Control: no-store`, body `{"error": "rate_limited"}` — never a
+JSON-RPC error. `/livez`, `/readyz`, and `/health` are never rate limited.
 
 The derived `Host` allowlist is always `localhost`, `127.0.0.1`, `::1`, plus
 the `PUBLIC_HOST` entry when set. It is logged at `INFO` on startup, so a `403`

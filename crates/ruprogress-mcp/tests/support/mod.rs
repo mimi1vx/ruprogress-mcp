@@ -161,9 +161,12 @@ pub(crate) async fn http_harness(env: &[(&str, &str)]) -> HttpHarness {
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async move { signal.cancelled_owned().await })
-            .await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { signal.cancelled_owned().await })
+        .await;
     });
 
     HttpHarness {

@@ -148,7 +148,10 @@ impl TokenVerifier {
         }
     }
 
-    fn digest(token: &str) -> [u8; 32] {
+    /// `pub(crate)`: also used by `transport::http`'s standard rate-limit
+    /// class (RL5) to key `/mcp` by token identity without a second hashing
+    /// decision.
+    pub(crate) fn digest(token: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
         hasher.finalize().into()

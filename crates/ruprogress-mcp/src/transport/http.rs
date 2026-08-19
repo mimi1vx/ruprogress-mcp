@@ -8,12 +8,14 @@
 //! different status code and a different log line.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Once};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,7 +23,7 @@ use base64::Engine as _;
 use redmine_client::{Credential, RedmineClient};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +41,7 @@ use crate::config::{AuthMode, Config, DiscoveryAs, HttpConfig, OAuthConfig, OAut
 use crate::health::{self, HealthState};
 use crate::oauth as oauth_docs;
 use crate::oauth::metadata::DiscoveryMode;
+use crate::ratelimit::{self, Limiter};
 use crate::server::RedmineMcp;
 
 /// The session manager in use. Swapping this for
@@ -46,6 +49,214 @@ use crate::server::RedmineMcp;
 /// is the whole change needed to go back to stateful sessions, should a client
 /// turn up that hard-requires an `Mcp-Session-Id`.
 type SessionManager = NeverSessionManager;
+
+// --- Rate limiting (phase 9.2) ---------------------------------------------
+
+/// A rate-limit bucket key. `Fallback` is reserved for the programming-error
+/// case where `ConnectInfo` is unexpectedly absent (RL10) — never a real
+/// client's key, so it cannot collide with one.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LimitKey {
+    Ip(IpAddr),
+    TokenDigest([u8; 32]),
+    Fallback,
+}
+
+fn connect_info_ip(req: &Request) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+}
+
+/// RL10: a missing `ConnectInfo` at request time means the HTTP server was
+/// not started via `into_make_service_with_connect_info` — a programming
+/// error, not a runtime condition, so it is logged loudly but only once per
+/// process rather than once per request.
+fn log_missing_connect_info_once() {
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        tracing::error!(
+            "the rate limiter could not read the peer address (ConnectInfo is missing from the \
+             request); the HTTP server must be started via \
+             into_make_service_with_connect_info for rate limiting to key correctly"
+        );
+    });
+}
+
+/// The standard class's key (RL5): a bearer token's digest when a
+/// well-formed one is present — so one NAT or containerised client does not
+/// share a bucket across distinct callers — otherwise the peer IP.
+fn standard_key(req: &Request) -> LimitKey {
+    if let Ok(token) = oauth::extract_bearer(req.headers()) {
+        return LimitKey::TokenDigest(TokenVerifier::digest(token.expose_secret()));
+    }
+    if let Some(ip) = connect_info_ip(req) {
+        return LimitKey::Ip(ip);
+    }
+    log_missing_connect_info_once();
+    LimitKey::Fallback
+}
+
+/// The strict class's key (RL3): peer IP only, never a header. `None` when
+/// `ConnectInfo` is absent — RL10 fails this class closed rather than
+/// falling back to a shared bucket the way the standard class does.
+fn strict_key(req: &Request) -> Option<LimitKey> {
+    if let Some(ip) = connect_info_ip(req) {
+        return Some(LimitKey::Ip(ip));
+    }
+    log_missing_connect_info_once();
+    None
+}
+
+/// `429` with `Retry-After` and `Cache-Control: no-store` (RL8) — never a
+/// JSON-RPC error: at limiter time there may be no parsed envelope and no
+/// session to attach one to.
+fn too_many_requests(retry_after_secs: u64) -> Response {
+    let mut response = (
+        http::StatusCode::TOO_MANY_REQUESTS,
+        axum::Json(json!({ "error": "rate_limited" })),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_str(&retry_after_secs.to_string())
+            .unwrap_or_else(|_| http::HeaderValue::from_static("1")),
+    );
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Turns a `Limiter` decision into either a `429` or "let it through",
+/// logging a transition (RL11) rather than a line per request.
+fn apply_decision(class: &'static str, decision: ratelimit::Decision) -> Option<Response> {
+    match decision {
+        ratelimit::Decision::Allow { recovered } => {
+            if recovered {
+                tracing::info!(class, "rate limit recovered for a key");
+            }
+            None
+        }
+        ratelimit::Decision::Deny {
+            retry_after_secs,
+            newly_limited,
+        } => {
+            if newly_limited {
+                tracing::warn!(class, retry_after_secs, "rate limit engaged for a key");
+            }
+            Some(too_many_requests(retry_after_secs))
+        }
+    }
+}
+
+/// RL4: the standard class, mounted on `/mcp` and `/files/{uuid}`.
+async fn rate_limit_standard(
+    State(limiter): State<Arc<Limiter<LimitKey>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let decision = limiter.check(standard_key(&req), Instant::now());
+    match apply_decision("standard", decision) {
+        Some(response) => response,
+        None => next.run(req).await,
+    }
+}
+
+/// RL4: the strict class, mounted on the unauthenticated, state-allocating
+/// oauth-proxy endpoints (`/register`, `/authorize`, `/auth/callback`,
+/// `/token`, `/revoke`).
+async fn rate_limit_strict(
+    State(limiter): State<Arc<Limiter<LimitKey>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(key) = strict_key(&req) else {
+        // RL10: fail closed rather than share one bucket across every
+        // caller when the peer address could not be determined.
+        return too_many_requests(1);
+    };
+    let decision = limiter.check(key, Instant::now());
+    match apply_decision("strict", decision) {
+        Some(response) => response,
+        None => next.run(req).await,
+    }
+}
+
+/// One class's limiter, shared (cheaply cloned) across every route it is
+/// layered onto.
+type SharedLimiter = Arc<Limiter<LimitKey>>;
+
+/// RL9: `false` restores pre-9.2 behaviour exactly — no `Limiter` is
+/// constructed, and `router` layers no rate-limit middleware at all. Split
+/// out of `router` to keep it under clippy's line-count pedantic threshold.
+fn build_limiters(cfg: &HttpConfig) -> (Option<SharedLimiter>, Option<SharedLimiter>) {
+    if !cfg.rate_limit.enabled {
+        return (None, None);
+    }
+    let standard = Arc::new(Limiter::new(
+        cfg.rate_limit.standard_rps,
+        cfg.rate_limit.standard_burst,
+        cfg.rate_limit.max_keys,
+    ));
+    let strict = Arc::new(Limiter::new(
+        cfg.rate_limit.strict_rps,
+        cfg.rate_limit.strict_burst,
+        cfg.rate_limit.max_keys,
+    ));
+    (Some(standard), Some(strict))
+}
+
+/// Layers the standard class's rate-limit middleware onto `route` when
+/// enabled (RL9), otherwise returns it unchanged. Shared by `router` (the
+/// MCP route) and `files_route`.
+fn layer_standard_class(route: Router, limiter: Option<&SharedLimiter>) -> Router {
+    match limiter {
+        Some(limiter) => route.layer(middleware::from_fn_with_state(
+            limiter.clone(),
+            rate_limit_standard,
+        )),
+        None => route,
+    }
+}
+
+/// Layers the strict class's rate-limit middleware onto `route` when
+/// enabled (RL9), otherwise returns it unchanged. Used only for the
+/// oauth-proxy flow routes (`/register`&c.).
+fn layer_strict_class(route: Router, limiter: Option<&SharedLimiter>) -> Router {
+    match limiter {
+        Some(limiter) => route.layer(middleware::from_fn_with_state(
+            limiter.clone(),
+            rate_limit_strict,
+        )),
+        None => route,
+    }
+}
+
+/// `/livez`, `/readyz`, and `/health` (an alias for `/readyz`). Never rate
+/// limited (RL6) and never traced (see the comment above `router`'s
+/// `mcp_route` construction) — split out of `router` to keep it under
+/// clippy's line-count pedantic threshold.
+fn health_routes(cfg: &HttpConfig, health_state: HealthState) -> Router {
+    Router::new()
+        .route("/livez", get(health::livez))
+        .route("/readyz", get(health::readyz))
+        // Alias, so an `.env` or compose file written for the reference
+        // server keeps working. It maps to readiness, not liveness.
+        .route("/health", get(health::readyz))
+        .layer(TimeoutLayer::with_status_code(
+            http::StatusCode::GATEWAY_TIMEOUT,
+            cfg.request_timeout,
+        ))
+        // Outside the timeout layer, so the 504 it synthesises is covered too.
+        .layer(SetResponseHeaderLayer::overriding(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-store"),
+        ))
+        .with_state(health_state)
+}
 
 /// Build the full HTTP router.
 ///
@@ -72,6 +283,7 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
 
     let attachments = server.attachments();
     let health_state = HealthState::new(server.clone(), cfg.health_ttl);
+    let (standard_limiter, strict_limiter) = build_limiters(cfg);
     // Read before `server` moves into `mcp_service` below. `discovery_mode`
     // and `verifier()` are set together by every mode that has either (see
     // `RedmineMcp::new`), so zipping them here is what actually establishes
@@ -99,22 +311,7 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         service_config,
     );
 
-    let health_routes = Router::new()
-        .route("/livez", get(health::livez))
-        .route("/readyz", get(health::readyz))
-        // Alias, so an `.env` or compose file written for the reference
-        // server keeps working. It maps to readiness, not liveness.
-        .route("/health", get(health::readyz))
-        .layer(TimeoutLayer::with_status_code(
-            http::StatusCode::GATEWAY_TIMEOUT,
-            cfg.request_timeout,
-        ))
-        // Outside the timeout layer, so the 504 it synthesises is covered too.
-        .layer(SetResponseHeaderLayer::overriding(
-            http::header::CACHE_CONTROL,
-            http::HeaderValue::from_static("no-store"),
-        ))
-        .with_state(health_state);
+    let health_routes = health_routes(cfg, health_state);
 
     // Tracing is scoped to the MCP route rather than applied to the whole
     // router, because the health routes must not be traced at all: probes run
@@ -173,12 +370,21 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         None => {}
     }
 
+    // RL4/RL10: outside the auth layer added above (an unauthenticated
+    // flood must be rejected before it costs an introspection call), inside
+    // `TraceLayer` and the CORS layer added further below.
+    mcp_route = layer_standard_class(mcp_route, standard_limiter.as_ref());
+
     let mcp_route = mcp_route.layer(TraceLayer::new_for_http());
 
     let mut router = Router::new()
         .merge(mcp_route)
         .merge(health_routes)
-        .merge(files_route(attachments, cfg.allowed_hosts.clone()));
+        .merge(files_route(
+            attachments,
+            cfg.allowed_hosts.clone(),
+            standard_limiter.as_ref(),
+        ));
 
     // Merged outside `mcp_route`, so the bearer-auth layer above never sees
     // these: RFC 9728/8414 metadata must be reachable with no token (O8,
@@ -192,6 +398,10 @@ pub fn router(server: RedmineMcp, cfg: &HttpConfig, service_ct: CancellationToke
         }
     }
     if let Some(proxy_flow_routes) = proxy_flow_routes {
+        // RL4: strict class — `/register`, `/authorize`, `/auth/callback`,
+        // `/token`, and `/revoke` all allocate state or spend an
+        // unauthenticated caller's request on a fixed cost.
+        let proxy_flow_routes = layer_strict_class(proxy_flow_routes, strict_limiter.as_ref());
         router = router.merge(proxy_flow_routes);
     }
 
@@ -510,8 +720,12 @@ fn cors_layer(cfg: &HttpConfig) -> Option<CorsLayer> {
 /// credential of its own — binding it to a fetching request's
 /// `X-Redmine-API-Key` would defeat that use case, and disabling it would
 /// break `get_redmine_attachment`. See `docs/legacy-per-user-auth.md`.
-fn files_route(store: Arc<AttachmentStore>, allowed_hosts: Vec<String>) -> Router {
-    Router::new()
+fn files_route(
+    store: Arc<AttachmentStore>,
+    allowed_hosts: Vec<String>,
+    limiter: Option<&SharedLimiter>,
+) -> Router {
+    let router = Router::new()
         .route("/files/{uuid}", get(serve_file))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let allowed_hosts = allowed_hosts.clone();
@@ -526,7 +740,9 @@ fn files_route(store: Arc<AttachmentStore>, allowed_hosts: Vec<String>) -> Route
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static("no-store"),
         ))
-        .with_state(store)
+        .with_state(store);
+    // RL4: the standard class, shared with `/mcp`.
+    layer_standard_class(router, limiter)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,9 +949,15 @@ pub async fn serve(
 
     let service_ct = CancellationToken::new();
     let router = router(server, cfg, service_ct.clone());
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
-        .await;
+    // RL10: the rate limiter keys by peer address (RL3), which requires
+    // `ConnectInfo` — plain `axum::serve(listener, router)` never populates
+    // it.
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+    .await;
     service_ct.cancel();
     result.context("the HTTP server exited with an error")
 }
