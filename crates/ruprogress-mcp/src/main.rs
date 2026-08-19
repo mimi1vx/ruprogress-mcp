@@ -35,6 +35,11 @@ struct Cli {
     /// Print the redacted resolved config and exit.
     #[arg(long)]
     print_config: bool,
+    /// GET `/livez` on the local `SERVER_PORT` and exit 0/1. The container
+    /// `HEALTHCHECK`: distroless has no shell and no `curl`, so the binary
+    /// has to check itself.
+    #[arg(long)]
+    healthcheck: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +119,35 @@ fn print_config(config: &Config) -> anyhow::Result<()> {
     stdout.write_all(summary.as_bytes())?;
     stdout.write_all(b"\n")?;
     Ok(())
+}
+
+/// How long `--healthcheck`'s GET is allowed to take before it counts as a
+/// failure. Deliberately short: a container orchestrator's own healthcheck
+/// timeout wraps this, and a hung probe should not be the reason a restart
+/// is late.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `--healthcheck`'s fallback when `SERVER_PORT` is unset, matching
+/// `config::DEFAULT_SERVER_PORT` (private to that module, so restated here
+/// rather than exported just for this).
+const HEALTHCHECK_DEFAULT_PORT: u16 = 8000;
+
+/// Runs before config resolution: no Redmine credential, no attachments
+/// directory, nothing this probe needs beyond the port the server itself
+/// bound to. Returns whether `/livez` answered with a success status.
+async fn healthcheck() -> bool {
+    let port = std::env::var("SERVER_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(HEALTHCHECK_DEFAULT_PORT);
+    let url = format!("http://127.0.0.1:{port}/livez");
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(HEALTHCHECK_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    matches!(client.get(&url).send().await, Ok(response) if response.status().is_success())
 }
 
 /// If `AUTO_CLEANUP_ENABLED`, spawns the background sweeper and returns the
@@ -256,6 +290,9 @@ async fn run_http(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.healthcheck {
+        std::process::exit(i32::from(!healthcheck().await));
+    }
     let log_format = std::env::var("REDMINE_MCP_LOG_FORMAT")
         .ok()
         .and_then(|value| ruprogress_mcp::logging::LogFormat::parse(&value))

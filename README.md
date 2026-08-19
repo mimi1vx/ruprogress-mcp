@@ -128,6 +128,48 @@ It binds loopback by default; read
 [Exposing the server on a network](docs/configuration.md#exposing-the-server-on-a-network)
 before changing `SERVER_HOST`.
 
+## Docker
+
+A distroless, non-root image, built locally (no registry push, no multi-arch
+matrix). On Apple silicon, pin the build to `arm64` explicitly — an unpinned
+build silently produces `amd64` under emulation:
+
+```sh
+docker build --platform linux/arm64 -t ruprogress-mcp:dev .
+```
+
+```sh
+docker run --rm -p 8000:8000 \
+  -e REDMINE_URL=https://redmine.example.com \
+  -e REDMINE_API_KEY=... \
+  -e PUBLIC_HOST=localhost \
+  ruprogress-mcp:dev
+```
+
+The image already sets `SERVER_HOST=0.0.0.0`; `PUBLIC_HOST` is still required
+(see [Exposing the server on a network](docs/configuration.md#exposing-the-server-on-a-network)) —
+without it the container exits immediately with a `Missing PUBLIC_HOST` error.
+`curl -f localhost:8000/livez` should then return `200`.
+
+For a locked-down run — read-only root filesystem, a named volume for the one
+directory the process writes to — see `docker-compose.yml`, or by hand:
+
+```sh
+docker volume create ruprogress-mcp-attachments
+docker run --rm -p 8000:8000 \
+  -e REDMINE_URL=https://redmine.example.com \
+  -e REDMINE_API_KEY=... \
+  -e PUBLIC_HOST=localhost \
+  --read-only \
+  -v ruprogress-mcp-attachments:/var/lib/ruprogress-mcp/attachments \
+  ruprogress-mcp:dev
+```
+
+The image's own `HEALTHCHECK` runs `ruprogress-mcp --healthcheck` against
+`/livez` (distroless has no shell or `curl` to run one another way) and never
+`/readyz` — a Redmine outage must not turn into a container restart loop. Point
+an orchestrator's own readiness probe at `/readyz` separately.
+
 ## Attachments
 
 Downloaded attachments are staged in a local store (`ATTACHMENTS_DIR`, created

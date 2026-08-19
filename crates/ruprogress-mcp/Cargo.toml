@@ -38,8 +38,10 @@ secrecy     = { workspace = true }
 url         = { workspace = true }
 rand        = { workspace = true }
 sha2        = { workspace = true }
+# Real dependency, not dev-only: `--healthcheck` (main.rs) GETs /livez itself,
+# since distroless has no shell/curl for the container HEALTHCHECK to run.
+reqwest     = { workspace = true }
 
 [dev-dependencies]
 rmcp     = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
-reqwest  = { workspace = true }
 wiremock = { workspace = true }
