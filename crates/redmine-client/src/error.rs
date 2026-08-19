@@ -77,6 +77,18 @@ pub enum Error {
         /// The optional `error_description`.
         description: Option<String>,
     },
+    /// A request or redirect target was refused because it did not match
+    /// the configured Redmine origin — this client only ever sends
+    /// credentials to the origin it was built against. Produced by
+    /// [`crate::client::Scoped::download_attachment`] and by the
+    /// client-wide redirect policy in [`crate::client::RedmineClientBuilder::build`].
+    #[error("refused to send credentials to {origin}, which is not the configured Redmine origin")]
+    ForeignOrigin {
+        /// The refused origin, `scheme://host[:port]` only — never a path,
+        /// query, or userinfo, since this value may end up in logs and in
+        /// a model-visible message.
+        origin: String,
+    },
 }
 
 /// Convenience alias used throughout this crate.
@@ -101,7 +113,8 @@ impl Error {
             Self::Transport(_)
             | Self::Decode { .. }
             | Self::Config { .. }
-            | Self::LimitExceeded { .. } => None,
+            | Self::LimitExceeded { .. }
+            | Self::ForeignOrigin { .. } => None,
         }
     }
 
@@ -120,6 +133,7 @@ impl Error {
             | Self::Decode { .. }
             | Self::Config { .. }
             | Self::LimitExceeded { .. }
+            | Self::ForeignOrigin { .. }
             // POST is never retried by `retry::method_is_retryable` anyway
             // (the only verb this variant is ever produced for), so this is
             // a documentation of that fact rather than a load-bearing check.

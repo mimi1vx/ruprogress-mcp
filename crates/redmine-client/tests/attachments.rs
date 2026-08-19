@@ -291,6 +291,172 @@ async fn download_attachment_rejects_an_unparseable_url() {
 }
 
 #[tokio::test]
+async fn download_attachment_rejects_a_foreign_host() {
+    let (server, client) = support::mock_redmine().await;
+    let foreign = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/download/6243/test.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret".to_vec()))
+        .mount(&foreign)
+        .await;
+
+    let cred = cred();
+    let content_url = format!("{}/attachments/download/6243/test.txt", foreign.uri());
+    match client
+        .as_user(&cred)
+        .download_attachment(&content_url)
+        .await
+    {
+        Ok(_) => panic!("a content_url on a foreign host must be rejected"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+    assert!(
+        foreign
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the foreign server must receive zero requests"
+    );
+    let _ = server; // the base server is never contacted for this case either
+}
+
+#[tokio::test]
+async fn download_attachment_rejects_the_same_host_on_a_different_port() {
+    let (server, client) = support::mock_redmine().await;
+    let base_url: url::Url = server.uri().parse().unwrap();
+    let mut foreign_port_url = base_url.clone();
+    foreign_port_url
+        .set_port(Some(base_url.port_or_known_default().unwrap() + 1))
+        .unwrap();
+    let content_url = foreign_port_url
+        .join("attachments/download/6243/test.txt")
+        .unwrap();
+
+    let cred = cred();
+    match client
+        .as_user(&cred)
+        .download_attachment(content_url.as_str())
+        .await
+    {
+        Ok(_) => panic!("a content_url on a different port must be rejected"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the base server must receive zero requests for a port-mismatched URL"
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_rejects_a_scheme_mismatch() {
+    let (server, client) = support::mock_redmine().await;
+    let base_url: url::Url = server.uri().parse().unwrap();
+    assert_eq!(base_url.scheme(), "http");
+    let content_url = format!(
+        "https://{}/attachments/download/6243/test.txt",
+        base_url.host_str().unwrap()
+    );
+
+    let cred = cred();
+    match client
+        .as_user(&cred)
+        .download_attachment(&content_url)
+        .await
+    {
+        Ok(_) => panic!("a scheme mismatch (https URL against an http base) must be rejected"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an https URL must never be dialed against an http-only mock"
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_rejects_a_non_http_scheme() {
+    let (_server, client) = support::mock_redmine().await;
+    let cred = cred();
+    match client
+        .as_user(&cred)
+        .download_attachment("file:///etc/passwd")
+        .await
+    {
+        Ok(_) => panic!("a non-http(s) scheme must be rejected"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+}
+
+#[tokio::test]
+async fn download_attachment_rejects_userinfo_confusion() {
+    let (server, client) = support::mock_redmine().await;
+    let foreign = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret".to_vec()))
+        .mount(&foreign)
+        .await;
+
+    // `http://<base-host:port>@<foreign-host:port>/x`: the userinfo makes
+    // this *look* like a base-origin URL, but the actual connect target
+    // (per `url::Url::origin()`, the same parser reqwest uses) is `foreign`.
+    let base_authority = server.uri().replacen("http://", "", 1);
+    let foreign_authority = foreign.uri().replacen("http://", "", 1);
+    let content_url = format!("http://{base_authority}@{foreign_authority}/x");
+
+    let cred = cred();
+    match client
+        .as_user(&cred)
+        .download_attachment(&content_url)
+        .await
+    {
+        Ok(_) => panic!("userinfo confusion must be rejected before any request is sent"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+    assert!(
+        foreign
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the foreign server must receive zero requests"
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_rejects_embedded_credentials_on_an_otherwise_same_origin_url() {
+    let (server, client) = support::mock_redmine().await;
+    let authority = server.uri().replacen("http://", "", 1);
+    let content_url = format!("http://user:pass@{authority}/attachments/download/6243/test.txt");
+
+    let cred = cred();
+    match client
+        .as_user(&cred)
+        .download_attachment(&content_url)
+        .await
+    {
+        Ok(_) => panic!("embedded credentials must be rejected even on the configured origin"),
+        Err(err) => assert!(matches!(err, Error::ForeignOrigin { .. })),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "embedded Basic credentials must never be sent"
+    );
+}
+
+#[tokio::test]
 async fn download_attachment_not_found() {
     let (server, client) = support::mock_redmine().await;
     let content_url = format!("{}/attachments/download/999/gone.txt", server.uri());

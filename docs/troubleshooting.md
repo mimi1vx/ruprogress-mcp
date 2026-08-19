@@ -208,6 +208,22 @@ returned, never a cached older one; if this happens after a genuine crash
 mid-refresh (the client can't tell if its own request succeeded), the fix
 is to re-authorize from scratch, not to retry the old refresh token.
 
+## `UNEXPECTED_RESPONSE` on `get_redmine_attachment`
+
+**Symptom:** `get_redmine_attachment` returns `{code: "UNEXPECTED_RESPONSE",
+retryable: false}` instead of downloading the file, even though the
+attachment's metadata looked fine.
+
+**Cause:** the attachment's `content_url` (or a redirect Redmine sent while
+fetching it) points at a different origin than `REDMINE_URL` — different
+scheme, host, or port. This client only ever sends its credential to the
+configured Redmine origin, so a Redmine that serves attachments from a CDN
+or that redirects `http` to `https` is refused rather than leaking the
+credential to that other origin.
+
+**Fix:** set `REDMINE_URL` to the origin attachments are actually served
+from (e.g. the `https` form if Redmine redirects to it).
+
 ## Attachment `404`
 
 **Symptom:** `GET /files/{uuid}` (or `get_redmine_attachment` referencing a

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::TryStreamExt as _;
+use reqwest::redirect;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -43,6 +44,15 @@ impl Query {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Whether `candidate` may be sent credentials scoped to `base`: same
+/// scheme, host, and effective port. `http`/`https` only — a non-special
+/// scheme (`file:`, `data:`, ...) yields an opaque [`url::Origin`] that
+/// never compares equal, so this scheme check exists to make that intent
+/// legible rather than to carry the security boundary itself.
+fn is_trusted_origin(base: &Url, candidate: &Url) -> bool {
+    matches!(candidate.scheme(), "http" | "https") && candidate.origin() == base.origin()
 }
 
 /// Builder for [`RedmineClient`].
@@ -210,10 +220,40 @@ impl RedmineClientBuilder {
             tracing::warn!("TLS certificate verification is DISABLED for this RedmineClient");
         }
 
+        let mut base = self.base_url;
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
+
+        // Same-origin redirect policy: the `X-Redmine-API-Key` header (the
+        // default credential) is not one of the headers reqwest strips on a
+        // cross-host redirect, so an unrestricted redirect would leak it to
+        // whatever host a compromised/misconfigured Redmine names in a
+        // `Location` header. `stop()` rather than `error()`: the un-followed
+        // `3xx` then flows through the normal non-success response path
+        // (`Error::Api { status: 3xx }`, not retryable), which is
+        // diagnosable, rather than collapsing into a retryable
+        // `Error::Transport`.
+        let redirect_base = base.clone();
+        let inner_policy = redirect::Policy::limited(10);
+        let redirect_policy = redirect::Policy::custom(move |attempt| {
+            if is_trusted_origin(&redirect_base, attempt.url()) {
+                inner_policy.redirect(attempt)
+            } else {
+                tracing::warn!(
+                    origin = %attempt.url().origin().ascii_serialization(),
+                    "refusing to follow a redirect to a foreign origin"
+                );
+                attempt.stop()
+            }
+        });
+
         let mut http = reqwest::Client::builder()
             .timeout(self.timeout)
             .connect_timeout(self.connect_timeout)
-            .tls_danger_accept_invalid_certs(self.danger_accept_invalid_certs);
+            .tls_danger_accept_invalid_certs(self.danger_accept_invalid_certs)
+            .redirect(redirect_policy);
 
         if let Some(ua) = &self.user_agent {
             http = http.user_agent(ua);
@@ -242,12 +282,6 @@ impl RedmineClientBuilder {
         let http = http.build().map_err(|e| Error::Config {
             reason: format!("failed to build HTTP client: {}", e.without_url()),
         })?;
-
-        let mut base = self.base_url;
-        if !base.path().ends_with('/') {
-            let path = format!("{}/", base.path());
-            base.set_path(&path);
-        }
 
         Ok(RedmineClient {
             inner: Arc::new(Inner {
@@ -579,15 +613,20 @@ impl Scoped<'_> {
     /// filesystem-free.
     ///
     /// `content_url` is used as given — it is expected to be a value
-    /// Redmine itself returned from an earlier call in the same scope, not
-    /// arbitrary caller-supplied input.
+    /// Redmine itself returned from an earlier call in the same scope, but
+    /// is treated as untrusted: it must resolve to this client's own
+    /// origin, or the request is refused before any credential is applied.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] if `content_url` does not parse. Returns a
-    /// transport or status error if the request itself fails; errors
-    /// surfaced by the stream (a connection drop mid-body) are yielded as
-    /// stream items, not from this method.
+    /// Returns [`Error::Config`] if `content_url` does not parse.
+    /// Returns [`Error::ForeignOrigin`] if `content_url` carries embedded
+    /// userinfo, or does not resolve to this client's configured origin —
+    /// in either case, refused before the credential is ever applied and
+    /// before any request is sent. Returns a transport or status error if
+    /// the request itself fails; errors surfaced by the stream (a
+    /// connection drop mid-body) are yielded as stream items, not from this
+    /// method.
     pub async fn download_attachment(
         &self,
         content_url: &str,
@@ -598,6 +637,16 @@ impl Scoped<'_> {
         let url: Url = content_url.parse().map_err(|e| Error::Config {
             reason: format!("invalid attachment content_url: {e}"),
         })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::ForeignOrigin {
+                origin: url.origin().ascii_serialization(),
+            });
+        }
+        if !is_trusted_origin(&self.inner.base, &url) {
+            return Err(Error::ForeignOrigin {
+                origin: url.origin().ascii_serialization(),
+            });
+        }
         let template = self.credential.apply(self.inner.http.get(url));
         let resp = self.send_with_retry(&http::Method::GET, &template).await?;
         let headers = resp.headers().clone();
@@ -2432,6 +2481,189 @@ mod tests {
             .endpoint("issues.json")
             .expect("relative path should be accepted");
         assert_eq!(url.as_str(), "https://example.com/issues.json");
+    }
+
+    // --- is_trusted_origin / same-origin redirect policy (finding 1) ---
+
+    #[test]
+    fn is_trusted_origin_rejects_foreign_scheme_host_or_port() {
+        let base: Url = "https://redmine.example.com/".parse().unwrap();
+        assert!(is_trusted_origin(
+            &base,
+            &"https://redmine.example.com/x".parse().unwrap()
+        ));
+        assert!(!is_trusted_origin(
+            &base,
+            &"https://evil.test/x".parse().unwrap()
+        ));
+        assert!(!is_trusted_origin(
+            &base,
+            &"https://redmine.example.com:8443/x".parse().unwrap()
+        ));
+        assert!(!is_trusted_origin(
+            &base,
+            &"http://redmine.example.com/x".parse().unwrap()
+        ));
+        assert!(!is_trusted_origin(
+            &base,
+            &"file:///etc/passwd".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn is_trusted_origin_ipv6_literal_base_accepts_own_origin_rejects_ipv4_loopback() {
+        let base: Url = "http://[::1]:8080/".parse().unwrap();
+        assert!(is_trusted_origin(
+            &base,
+            &"http://[::1]:8080/x".parse().unwrap()
+        ));
+        assert!(!is_trusted_origin(
+            &base,
+            &"http://127.0.0.1:8080/x".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_is_followed_and_streams_download_body() {
+        use futures_util::TryStreamExt as _;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/attachments/download/1/a.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/attachments/download/1/final.txt", server.uri()),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/attachments/download/1/final.txt",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(b"redirected bytes".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let content_url = format!("{}/attachments/download/1/a.txt", server.uri());
+        let (_headers, stream) = client
+            .as_user(&cred)
+            .download_attachment(&content_url)
+            .await
+            .expect("a same-origin redirect should be followed");
+        let chunks: Vec<Bytes> = stream
+            .try_collect()
+            .await
+            .expect("stream should yield all chunks without error");
+        let body: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(body, b"redirected bytes");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_from_base_is_not_followed_on_download_path() {
+        let server = wiremock::MockServer::start().await;
+        let foreign = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/attachments/download/1/a.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/steal", foreign.uri())),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/steal"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"secret".to_vec()))
+            .mount(&foreign)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let content_url = format!("{}/attachments/download/1/a.txt", server.uri());
+        match client
+            .as_user(&cred)
+            .download_attachment(&content_url)
+            .await
+        {
+            Ok(_) => panic!("a cross-origin redirect must not be followed"),
+            Err(Error::Api { status, .. }) => assert_eq!(status, http::StatusCode::FOUND),
+            Err(other) => panic!("expected Error::Api with status 302, got {other:?}"),
+        }
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the base server should have been hit"
+        );
+        assert!(
+            foreign
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the foreign server must receive zero requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_is_not_followed_on_a_plain_json_endpoint() {
+        // Regression guard for the wider `X-Redmine-API-Key` leak (not just
+        // the download path): reverting the client-wide redirect policy in
+        // `build()` must make this test fail.
+        let server = wiremock::MockServer::start().await;
+        let foreign = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/widgets.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/steal", foreign.uri())),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/steal"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"secret": true})),
+            )
+            .mount(&foreign)
+            .await;
+
+        let client = discovery_client(&server);
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let err = client
+            .as_user(&cred)
+            .get_json::<serde_json::Value>("widgets.json", &Query::default())
+            .await
+            .expect_err("a cross-origin redirect from a plain endpoint must not be followed");
+        assert!(matches!(
+            err,
+            Error::Api {
+                status,
+                ..
+            } if status == http::StatusCode::FOUND
+        ));
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the base server should have been hit"
+        );
+        assert!(
+            foreign
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the foreign server must receive zero requests"
+        );
     }
 
     // --- get_collection / fetch_page ---

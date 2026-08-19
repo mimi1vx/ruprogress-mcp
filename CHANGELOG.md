@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `redmine-client` now refuses to send credentials anywhere but the
+  configured Redmine origin. `download_attachment`'s `content_url` (an
+  absolute URL Redmine itself returns) is checked against the client's
+  configured origin — scheme, host, and port must all match, and embedded
+  userinfo is rejected outright — before the request is built, closing a
+  credential-exfiltration path a compromised Redmine, plugin, or reverse
+  proxy could otherwise use. Separately, the shared `reqwest::Client` now
+  carries a same-origin redirect policy: previously its default
+  `redirect::Policy::limited(10)` would follow a cross-origin `3xx`
+  response on *any* endpoint, and reqwest does not strip the
+  `X-Redmine-API-Key` header (the default credential) on such a redirect —
+  so a redirecting Redmine leaked the API key to whatever host it named. A
+  Redmine that legitimately redirects to a different origin (e.g. `http`
+  to `https`, or attachments served from a CDN) now fails with an in-band
+  `UNEXPECTED_RESPONSE` instead of silently following the redirect; point
+  `REDMINE_URL` at the final origin directly.
+
 ## [0.1.0] - 2026-08-19
 
 ### Added

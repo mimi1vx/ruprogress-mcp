@@ -81,6 +81,16 @@ pub(crate) fn to_tool_error(e: redmine_client::Error) -> CallToolResult {
             ),
             Some("narrow the request (a smaller limit or a more specific filter) and retry"),
         ),
+        // The refused origin is deliberately not interpolated: it is
+        // Redmine-authored and this message is not boundary-wrapped. It is
+        // still logged server-side by the client's own `tracing::warn!`.
+        Error::ForeignOrigin { .. } => err(
+            ErrorCode::UnexpectedResponse,
+            "Redmine returned a download link or redirect pointing outside the configured Redmine origin",
+            Some(
+                "this is a server configuration problem the model cannot fix; the operator should check REDMINE_URL",
+            ),
+        ),
         other => err(
             ErrorCode::UnexpectedResponse,
             format!("Redmine request failed: {other}"),
@@ -193,6 +203,13 @@ mod tests {
                     actual: 200,
                 },
                 "LIMIT_EXCEEDED",
+                false,
+            ),
+            (
+                Error::ForeignOrigin {
+                    origin: "https://evil.test".to_string(),
+                },
+                "UNEXPECTED_RESPONSE",
                 false,
             ),
         ];

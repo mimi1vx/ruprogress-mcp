@@ -229,6 +229,55 @@ async fn a_404_from_redmine_surfaces_as_not_found() {
 }
 
 #[tokio::test]
+async fn a_content_url_on_a_foreign_origin_is_refused_and_leaves_no_reservation() {
+    let dir = std::env::temp_dir().join(format!(
+        "ruprogress-mcp-test-files-foreign-origin-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let dir_str = dir.to_string_lossy().into_owned();
+    let h = support::harness(&[("ATTACHMENTS_DIR", dir_str.as_str())]).await;
+    let foreign = wiremock::MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/attachments/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachment": {
+                "id": 1, "filename": "report.pdf", "filesize": 5,
+                "content_url": format!("{}/attachments/download/1/report.pdf", foreign.uri()),
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(&h.redmine)
+        .await;
+    let download_mock = Mock::given(method("GET"))
+        .and(path("/attachments/download/1/report.pdf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .expect(0);
+    foreign.register(download_mock).await;
+
+    let result = call(&h, json!({"attachment_id": 1})).await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "UNEXPECTED_RESPONSE");
+    assert_eq!(structured["retryable"], false);
+
+    assert!(
+        foreign
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the foreign server must receive zero requests"
+    );
+    let remaining = std::fs::read_dir(&dir).map_or(0, Iterator::count);
+    assert_eq!(
+        remaining, 0,
+        "a refused foreign-origin download must leave no UUID directory behind"
+    );
+}
+
+#[tokio::test]
 async fn list_files_returns_the_files_module_shape_including_version() {
     let h = support::harness(&[]).await;
     Mock::given(method("GET"))
