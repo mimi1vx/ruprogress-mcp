@@ -549,40 +549,12 @@ async fn an_unadvertised_scope_is_invalid_scope() {
 
 // --- redaction (risk 5) ------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// No proxy token, upstream token, upstream client secret, `code`, or
 /// `code_verifier` may appear in captured `TRACE` output across the whole
 /// flow (risk 5).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn no_secret_appears_in_captured_trace_logs_across_the_whole_flow() {
-    let buf = SharedBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let capture = support::capture("trace").await;
 
     let harness = support::http_harness(&oauth_proxy_env(&[])).await;
     const UPSTREAM_ACCESS_TOKEN: &str = "super-secret-upstream-access-token-0123456789";
@@ -630,20 +602,12 @@ async fn no_secret_appears_in_captured_trace_logs_across_the_whole_flow() {
         .expect("tool call should succeed");
     mcp_client.cancel().await.ok();
 
-    drop(guard);
-    let rendered = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8 log output");
-
-    for secret in [
+    capture.assert_no_secrets(&[
         UPSTREAM_ACCESS_TOKEN,
         UPSTREAM_CODE,
         UPSTREAM_CLIENT_SECRET,
         proxy_access_token.as_str(),
         verifier.as_str(),
         code.as_str(),
-    ] {
-        assert!(
-            !rendered.contains(secret),
-            "captured trace output leaked a secret ({secret}): {rendered}"
-        );
-    }
+    ]);
 }

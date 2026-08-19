@@ -487,42 +487,14 @@ async fn manage_contact_rejects_an_unknown_parameter() {
 /// captured `TRACE` log line, and the `background` field's delimiter
 /// injection attempt must not break out of its boundary wrap. Mirrors
 /// `auth_oauth.rs`'s equivalent secret-leak test.
-#[derive(Clone, Default)]
-struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 const PII_EMAIL: &str = "ada.pii-marker@example.test";
 const PII_PHONE: &str = "+1-555-0100-pii-marker";
 const PII_BIRTHDAY: &str = "1815-12-10";
 const PII_STREET: &str = "1 Pii Marker St";
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn contact_pii_never_appears_in_captured_trace_logs() {
-    let buf = SharedBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let capture = support::capture("trace").await;
 
     let h = support::harness(&crm_env()).await;
     Mock::given(method("GET"))
@@ -574,14 +546,7 @@ async fn contact_pii_never_appears_in_captured_trace_logs() {
         .await
         .expect("list should succeed");
 
-    drop(guard);
-    let captured = String::from_utf8(buf.0.lock().unwrap().clone()).expect("logs are valid UTF-8");
-    for pii in [PII_EMAIL, PII_PHONE, PII_BIRTHDAY, PII_STREET] {
-        assert!(
-            !captured.contains(pii),
-            "captured TRACE log leaked contact PII {pii:?}: {captured}"
-        );
-    }
+    capture.assert_no_secrets(&[PII_EMAIL, PII_PHONE, PII_BIRTHDAY, PII_STREET]);
 }
 
 #[tokio::test]

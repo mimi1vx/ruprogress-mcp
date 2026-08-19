@@ -263,6 +263,103 @@ fn assert_schema(value: &serde_json::Value, schema: &serde_json::Value, path: &s
     }
 }
 
+/// A `tracing_subscriber::fmt::MakeWriter` backed by a shared, lockable
+/// buffer — installed as the thread-local default subscriber by [`capture`]
+/// to observe what the shipped filter actually lets through.
+#[derive(Clone, Default)]
+pub(crate) struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A capture in progress: the thread-local default subscriber is live until
+/// [`Capture::assert_no_secrets`] drops its guard.
+pub(crate) struct Capture {
+    buf: SharedBuf,
+    guard: tracing::subscriber::DefaultGuard,
+}
+
+/// Emitted from inside a freshly `tokio::spawn`ed task the moment a
+/// [`capture`] is armed. Deliberately *not* a real production log line: a
+/// production event (e.g. rmcp's own "Service initialized as server") is
+/// also reachable from every other test in the same binary that connects a
+/// client, most of which install no subscriber at all — `tracing`'s
+/// per-callsite `Interest` cache is process-global and one-shot (nothing in
+/// a test binary ever calls `set_global_default`, so whichever thread hits
+/// a given callsite *first* decides its fate for the rest of the process),
+/// so a shared callsite can be latched "never interested" by a sibling
+/// before this test ever gets a chance at it. This literal call site exists
+/// nowhere else, so its first-ever hit is always made by *this* capture's
+/// own subscriber.
+const CAPTURE_CANARY: &str = "capture armed: a spawned task's tracing reached this buffer";
+
+/// Installs the *shipped* filter (`ruprogress_mcp::logging::env_filter`, not
+/// an approximation of it) as the thread-local default subscriber, and
+/// captures everything it lets through. `requested_level` is what
+/// `--log-level`/`RUST_LOG` would carry, e.g. `"trace"`.
+///
+/// Pair with `#[tokio::test(flavor = "current_thread")]`: a thread-local
+/// dispatcher is only guaranteed to see a `tokio::spawn`ed task's output
+/// when nothing else can steal that task onto a different worker thread —
+/// which this proves by round-tripping [`CAPTURE_CANARY`] through one.
+pub(crate) async fn capture(requested_level: &str) -> Capture {
+    let buf = SharedBuf::default();
+    let (filter, _overridden) = ruprogress_mcp::logging::env_filter(requested_level);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_env_filter(filter)
+        .without_time()
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tokio::spawn(async { tracing::info!("{CAPTURE_CANARY}") })
+        .await
+        .expect("canary task should not panic");
+    Capture { buf, guard }
+}
+
+impl Capture {
+    /// Ends the capture and returns everything it observed, for a test with
+    /// its own bespoke assertions beyond "no secret leaked".
+    pub(crate) fn finish(self) -> String {
+        drop(self.guard);
+        String::from_utf8(self.buf.0.lock().unwrap().clone()).expect("logs are valid UTF-8")
+    }
+
+    /// Ends the capture and asserts [`CAPTURE_CANARY`] is present *before*
+    /// asserting every string in `secrets` is absent. A canary miss means
+    /// the capture observed nothing, which would otherwise make the
+    /// secrets check pass vacuously.
+    pub(crate) fn assert_no_secrets(self, secrets: &[&str]) {
+        let captured = self.finish();
+        assert!(
+            captured.contains(CAPTURE_CANARY),
+            "capture observed nothing — this test cannot prove an absence: {captured}"
+        );
+        for secret in secrets {
+            assert!(
+                !captured.contains(secret),
+                "captured log leaked a secret {secret:?}: {captured}"
+            );
+        }
+    }
+}
+
 /// Mock `GET /my/account.json` with a fixture user, `times` responses expected.
 pub(crate) async fn mock_current_user(redmine: &wiremock::MockServer, times: Option<u64>) {
     use wiremock::matchers::{method, path};

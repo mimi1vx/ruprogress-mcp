@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use reqwest::Client as ReqwestClient;
 use rmcp::model::CallToolRequestParams;
@@ -268,15 +268,9 @@ async fn readyz_reports_not_probed_and_does_not_500() {
     assert_eq!(body["redmine"], "not_probed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn audit_identity_logs_one_fingerprint_line_per_tool_call() {
-    let buf = SharedBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::INFO)
-        .without_time()
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let capture = support::capture("trace").await;
 
     let mut env = per_user_env();
     env.push(("REDMINE_PER_USER_AUDIT_IDENTITY", "true"));
@@ -297,9 +291,8 @@ async fn audit_identity_logs_one_fingerprint_line_per_tool_call() {
             .expect("get_current_user should succeed");
     }
     client.cancel().await.ok();
-    drop(guard);
 
-    let captured = String::from_utf8(buf.0.lock().unwrap().clone()).expect("logs are valid UTF-8");
+    let captured = capture.finish();
     let lines = captured.matches("per-user request").count();
     assert_eq!(
         lines, 3,
@@ -345,28 +338,6 @@ async fn get_mcp_server_info_reports_legacy_per_user_auth_mode() {
     client.cancel().await.ok();
 }
 
-#[derive(Clone, Default)]
-struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// A stray `tracing::debug!(?parts)`/`?ctx` anywhere on the per-user request
 /// path would print the key verbatim, since inbound HTTP headers are not
 /// marked `set_sensitive` the way outbound ones are — this is the finding a
@@ -376,15 +347,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
 /// which would not catch a regression. (Manually verified this assertion
 /// fails if a `tracing::debug!(?parts)` is added to
 /// `auth::per_user::credential`; removed after confirming.)
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn the_api_key_never_appears_in_captured_logs_or_error_output() {
-    let buf = SharedBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let capture = support::capture("trace").await;
 
     let harness = support::http_harness(&per_user_env()).await;
     let success_key = "super-secret-success-path-key-0123456789";
@@ -437,24 +402,18 @@ async fn the_api_key_never_appears_in_captured_logs_or_error_output() {
         "duplicated header should be rejected: {rejected_response}"
     );
 
-    drop(guard);
-
-    let captured = String::from_utf8(buf.0.lock().unwrap().clone()).expect("logs are valid UTF-8");
     let rejected_debug = format!("{rejected_response:?}");
-
-    for secret in [
+    let secrets = [
         success_key,
         unauthorized_key,
         rejected_key_one,
         rejected_key_two,
-    ] {
-        assert!(
-            !captured.contains(secret),
-            "captured TRACE log leaked the API key {secret:?}: {captured}"
-        );
+    ];
+    for secret in secrets {
         assert!(
             !rejected_debug.contains(secret),
             "rejected-header error response leaked the API key {secret:?}: {rejected_debug}"
         );
     }
+    capture.assert_no_secrets(&secrets);
 }

@@ -53,15 +53,22 @@ impl From<CliTransport> for TransportKind {
 }
 
 fn init_tracing(log_level: Option<&str>) {
-    let filter = log_level.map_or_else(
+    let requested = log_level.map_or_else(
         || std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         std::string::ToString::to_string,
     );
+    let (filter, overridden_floors) = ruprogress_mcp::logging::env_filter(&requested);
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
+    for target in overridden_floors {
+        tracing::warn!(
+            "RUST_LOG enables `{target}` above the payload-safety floor; request and response \
+             bodies may be written to the log"
+        );
+    }
 }
 
 /// Load `.env`-style entries without ever mutating the process environment

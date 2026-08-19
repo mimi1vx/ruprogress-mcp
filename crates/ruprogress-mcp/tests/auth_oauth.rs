@@ -960,28 +960,6 @@ async fn two_concurrent_tokens_never_cross_contaminate_identity() {
     bob.cancel().await.ok();
 }
 
-#[derive(Clone, Default)]
-struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// The access token, the introspection client secret, and the form body's
 /// `token=` field must never appear in captured `TRACE` output, across a
 /// success, a `401` (invalid token), and a `503` (introspection down).
@@ -989,15 +967,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
 /// header. (Manually verified this assertion fails if a
 /// `tracing::debug!(?parts)` is added to the bearer-auth middleware; removed
 /// after confirming.)
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn no_secret_appears_in_captured_trace_logs() {
-    let buf = SharedBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let capture = support::capture("trace").await;
 
     let harness = support::http_harness(&oauth_env(&[])).await;
     const SUCCESS_TOKEN: &str = "super-secret-success-path-token-0123456789";
@@ -1043,22 +1015,11 @@ async fn no_secret_appears_in_captured_trace_logs() {
         StatusCode::SERVICE_UNAVAILABLE
     );
 
-    drop(guard);
-
-    let captured = String::from_utf8(buf.0.lock().unwrap().clone()).expect("logs are valid UTF-8");
-    for secret in [
+    capture.assert_no_secrets(&[
         SUCCESS_TOKEN,
         INVALID_TOKEN,
         UNAVAILABLE_TOKEN,
         CLIENT_SECRET,
-    ] {
-        assert!(
-            !captured.contains(secret),
-            "captured TRACE log leaked a secret {secret:?}: {captured}"
-        );
-    }
-    assert!(
-        !captured.contains("token="),
-        "captured TRACE log leaked the introspection form body: {captured}"
-    );
+        "token=",
+    ]);
 }

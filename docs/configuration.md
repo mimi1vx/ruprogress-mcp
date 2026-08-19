@@ -271,6 +271,30 @@ error, `5xx`, or timeout — `503` overall).
 All three endpoints send `Cache-Control: no-store` and are excluded from
 request tracing.
 
+## Logging
+
+`--log-level` (falling back to `RUST_LOG`, defaulting to `info`) is a
+standard [`tracing_subscriber::EnvFilter`][envfilter] directive string,
+written to stderr — stdout is reserved for the JSON-RPC stream on the
+`stdio` transport.
+
+[envfilter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+
+Whatever is requested is combined with a **payload-safety floor**: `rmcp`,
+`hyper`, `hyper_util`, `h2`, `reqwest`, `rustls`, and `wiremock` are capped at
+`info`, and `tower_http::trace` at `debug` (its `debug` output is
+request/response *metadata* — method, path, status, latency — never a body).
+These are the dependencies whose own `DEBUG`/`TRACE` output includes a tool
+call's arguments, a full JSON-RPC envelope, or wire-level bodies and
+headers — nothing this server's own code can redact after the fact, since it
+isn't this server's `Debug` impl. `ruprogress_mcp` and `redmine_client` are
+never floored: `RUST_LOG=trace` (or `--log-level trace`) stays fully verbose
+for this server's own code.
+
+Naming a floored target explicitly wins: `RUST_LOG=trace,rmcp=trace` logs
+`rmcp` at `trace` — including tool payloads — and a startup `WARN` names the
+override, since that is a real trade a protocol-bug hunt sometimes needs.
+
 ## `--print-config`
 
 `ruprogress-mcp --print-config` resolves the config and prints
