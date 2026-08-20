@@ -13,6 +13,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use base64::Engine as _;
 use reqwest::StatusCode;
@@ -402,6 +403,80 @@ async fn reusing_a_rotated_refresh_token_invalidates_the_whole_chain_and_revokes
     assert_eq!(body["error"], "invalid_grant");
 
     // The original access token (same upstream session) must be dead too.
+    assert!(!call_tool_with_token(&harness, &first_access).await);
+}
+
+/// Finding 2: two concurrent redemptions of the same refresh token must
+/// never both mint a pair. Refresh A's upstream exchange is delayed 500ms;
+/// refresh B is driven 100ms in, well before A's response lands, so B
+/// observes A's redemption as still in flight. Wide timing margin because
+/// this is the one wall-clock-dependent test in the change — the invariant
+/// itself is proven deterministically by `store.rs`'s guard unit tests.
+#[tokio::test]
+async fn concurrent_refreshes_of_the_same_token_leave_no_winner() {
+    let harness = support::http_harness(&oauth_proxy_env(&[])).await;
+    const FIRST_ACCESS: &str = "upstream-access-race-1";
+    const SECOND_ACCESS: &str = "upstream-access-race-2";
+    let (first_access, first_refresh, client_id) =
+        full_round_trip_with_refresh(&harness, FIRST_ACCESS, "upstream-refresh-race-1").await;
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains(
+            "refresh_token=upstream-refresh-race-1",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "access_token": SECOND_ACCESS,
+                    "refresh_token": "upstream-refresh-race-2",
+                    "expires_in": 3600,
+                }))
+                .set_delay(Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&harness.redmine)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&harness.redmine)
+        .await;
+
+    let url = harness.url("/token");
+    let refresh_a = first_refresh.clone();
+    let client_id_a = client_id.clone();
+    let request_a = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh_a),
+                ("client_id", &client_id_a),
+            ])
+            .send()
+            .await
+            .expect("refresh A request should complete")
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let response_b = drive_refresh(&harness, &first_refresh, &client_id).await;
+    let response_a = request_a.await.expect("refresh A task should not panic");
+
+    assert_eq!(response_a.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_b.status(), StatusCode::BAD_REQUEST);
+    let body_a: serde_json::Value = response_a.json().await.expect("json body");
+    let body_b: serde_json::Value = response_b.json().await.expect("json body");
+    assert_eq!(body_a["error"], "invalid_grant");
+    assert_eq!(body_b["error"], "invalid_grant");
+    assert!(body_a.get("access_token").is_none());
+    assert!(body_b.get("access_token").is_none());
+
+    // The session died in the race: the original proxy access token no
+    // longer authenticates a tool call.
     assert!(!call_tool_with_token(&harness, &first_access).await);
 }
 

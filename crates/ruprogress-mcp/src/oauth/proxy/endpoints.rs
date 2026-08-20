@@ -851,26 +851,42 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
         return token_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
 
-    let (bound_client_id, upstream_id) = match state.proxy.refresh_tokens.redeem(refresh_token) {
-        RefreshOutcome::Invalid => return token_error(StatusCode::BAD_REQUEST, "invalid_grant"),
-        RefreshOutcome::Reused { upstream_id } => {
-            // R2: a replayed (already-rotated) refresh token kills whatever
-            // is currently live for its session, however many rotations
-            // ago it was current, and — unlike code-replay containment —
-            // is revoked upstream too, since a leaked refresh token is a
-            // far longer-lived threat than a leaked authorization code.
-            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
-                revoke_upstream_and_purge(state, &upstream.access).await;
+    // `_in_flight`, not `_`: the leading underscore only silences the
+    // unused-variable lint, the binding still lives until this function
+    // returns — that is what keeps the redeemed token locked out of a
+    // second, concurrent redemption for the whole refresh (finding 2). A
+    // bare `_` would drop the guard immediately and silently reinstate the
+    // race.
+    let (bound_client_id, upstream_id, _in_flight) =
+        match state.proxy.refresh_tokens.redeem(refresh_token) {
+            RefreshOutcome::Invalid => {
+                return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
             }
-            tracing::warn!("refresh token reuse detected; revoked the session");
-            return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
-        }
-        RefreshOutcome::Ok {
-            client_id,
-            upstream_id,
-        } => (client_id, upstream_id),
-    };
+            RefreshOutcome::Reused { upstream_id } => {
+                // R2: a replayed (already-rotated) refresh token, or a
+                // concurrent second use of a still-active one, kills
+                // whatever is currently live for its session, however many
+                // rotations ago it was current, and — unlike code-replay
+                // containment — is revoked upstream too, since a leaked
+                // refresh token is a far longer-lived threat than a leaked
+                // authorization code.
+                if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+                    revoke_upstream_and_purge(state, &upstream.access).await;
+                }
+                tracing::warn!(
+                    "refresh token reuse detected (replay or concurrent use); revoked the session"
+                );
+                return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+            }
+            RefreshOutcome::Ok {
+                client_id,
+                upstream_id,
+                guard,
+            } => (client_id, upstream_id, guard),
+        };
     if &bound_client_id != requested_client_id {
+        // `_in_flight` drops here, restoring the token to `Active`: a
+        // wrong `client_id` does not need to lock the token out.
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
@@ -921,7 +937,7 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
     let ttl = expires_at.saturating_duration_since(Instant::now());
     let wants_refresh = new_upstream.refresh_token.is_some();
     let granted_scope = granted_scopes.join(" ");
-    state.proxy.upstream_tokens.replace(
+    if let Err(set) = state.proxy.upstream_tokens.replace(
         &upstream_id,
         UpstreamTokenSet {
             access: new_upstream.access_token,
@@ -929,7 +945,18 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
             granted_scopes,
             expires_at,
         },
-    );
+    ) {
+        // The session vanished between `redeem` and here — a concurrent
+        // `/revoke`, or a racing redemption's reuse-containment path that
+        // won first. `replace` found nothing to update, so the upstream
+        // token set this request just obtained is orphaned; revoke it
+        // rather than mint anything against a session that no longer
+        // exists (finding 2).
+        state.proxy.refresh_tokens.discard(refresh_token);
+        revoke_upstream_and_purge(state, &set.access).await;
+        tracing::warn!("session vanished mid-refresh; revoked the orphaned upstream token set");
+        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
 
     let Some(pair) = mint_token_pair(
         &state.proxy,
@@ -938,6 +965,10 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
         ttl,
         wants_refresh,
     ) else {
+        // `_in_flight` restores the token to `Active` on this return, so
+        // the client's retry works — and it will present the *new*
+        // upstream refresh secret, since `replace` above already
+        // succeeded.
         return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
     state

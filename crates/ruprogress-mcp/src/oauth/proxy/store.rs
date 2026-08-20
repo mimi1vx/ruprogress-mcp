@@ -407,12 +407,22 @@ impl UpstreamStore {
     /// Replaces the stored set in place, keeping `id` stable across a
     /// refresh (R1): the proxy access/refresh tokens minted before the
     /// refresh, and any bookkeeping keyed on `id`, all still resolve to the
-    /// same session afterward.
-    pub(crate) fn replace(&self, id: &str, set: UpstreamTokenSet) {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.to_string(), set);
+    /// same session afterward. Conditional on `id` still being present
+    /// (finding 2): an in-flight refresh must not resurrect a session a
+    /// concurrent `/revoke` (or reuse-containment path) already removed.
+    /// On `Err`, `set` is handed back unused so the caller can revoke the
+    /// upstream secret it just obtained instead of it being silently
+    /// dropped.
+    #[must_use = "Err(set) hands back an unused upstream token set that must be revoked"]
+    pub(crate) fn replace(&self, id: &str, set: UpstreamTokenSet) -> Result<(), UpstreamTokenSet> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match inner.get_mut(id) {
+            Some(existing) => {
+                *existing = set;
+                Ok(())
+            }
+            None => Err(set),
+        }
     }
 
     /// Live upstream-session count, for `get_mcp_server_info`'s
@@ -746,28 +756,71 @@ const REFRESH_TTL: Duration = Duration::from_hours(720);
 /// unrecognised.
 const RETIRED_REFRESH_TTL: Duration = Duration::from_hours(24);
 
+/// Whether an active refresh entry is available to redeem, or is currently
+/// being redeemed by another (or the same, racing) request.
+enum RefreshState {
+    Active,
+    InFlight,
+}
+
 struct RefreshOwner {
     client_id: String,
     upstream_id: String,
+    state: RefreshState,
 }
 
 /// Outcome of [`RefreshStore::redeem`].
-pub(crate) enum RefreshOutcome {
+pub(crate) enum RefreshOutcome<'a> {
     /// Unknown, expired, or never issued — indistinguishable by design,
     /// same reasoning as [`CodeStore`]'s `Invalid` (F7).
     Invalid,
-    /// This digest was already rotated away: a replay (R2). `upstream_id`
+    /// This digest was already rotated away (a replay, R2), *or* it is
+    /// still active but another request is already redeeming it — a
+    /// concurrent double-use is indistinguishable from an attacker racing
+    /// the legitimate client, so both are treated as reuse. `upstream_id`
     /// is the session's stable identifier across every rotation in its
     /// chain (see [`UpstreamStore::replace`]), so the caller can revoke
     /// whatever is *currently* live for it, however many rotations ago
     /// this particular token was current.
     Reused { upstream_id: String },
     /// A live, not-yet-rotated refresh token bound to `client_id` and
-    /// `upstream_id`.
+    /// `upstream_id`, now marked `InFlight`. `guard` restores it to
+    /// `Active` on drop unless the caller commits via `retire`, `discard`,
+    /// or `take` first — all three remove the entry, making the guard a
+    /// no-op on every committed path.
     Ok {
         client_id: String,
         upstream_id: String,
+        guard: InFlightGuard<'a>,
     },
+}
+
+/// Restores an `InFlight` refresh entry to `Active` when dropped without a
+/// prior commit — covers a dropped handler future (client disconnect), an
+/// early return, or an unwinding panic (`panic = "unwind"` is pinned in the
+/// release profile so this runs). Deliberately has no `disarm`/`commit`
+/// method: `retire`, `discard`, and `take` all remove the entry outright, so
+/// the guard's rollback is a no-op on every path that actually finishes the
+/// refresh, and rollback-by-default is the safe behaviour for every path
+/// that doesn't.
+pub(crate) struct InFlightGuard<'a> {
+    store: &'a RefreshStore,
+    key: [u8; 32],
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut current = self
+            .store
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((owner, _)) = current.get_mut(&self.key)
+            && matches!(owner.state, RefreshState::InFlight)
+        {
+            owner.state = RefreshState::Active;
+        }
+    }
 }
 
 /// Digest-keyed (P2), two maps: `current` is the one active refresh token
@@ -825,6 +878,7 @@ impl RefreshStore {
                 RefreshOwner {
                     client_id,
                     upstream_id,
+                    state: RefreshState::Active,
                 },
                 expires_after(REFRESH_TTL),
             ),
@@ -832,21 +886,34 @@ impl RefreshStore {
         Some((token, key))
     }
 
-    /// Looks up `token` without consuming it — the caller mints the new
-    /// pair and confirms it is durable *before* calling [`Self::retire`]
-    /// (risk 1: the new pair must work before the old one stops).
-    pub(crate) fn redeem(&self, token: &str) -> RefreshOutcome {
+    /// Atomically transitions `token` from `Active` to `InFlight` under one
+    /// lock acquisition, so two concurrent redemptions of the same token
+    /// can never both succeed (finding 2): the second sees `InFlight` and
+    /// is treated as reuse. The caller mints the new pair and confirms it
+    /// is durable *before* calling [`Self::retire`] (risk 1: the new pair
+    /// must work before the old one stops) — until then, the returned
+    /// guard keeps the token locked out.
+    pub(crate) fn redeem(&self, token: &str) -> RefreshOutcome<'_> {
         let key = digest(token);
         {
             let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-            match current.get(&key) {
+            match current.get_mut(&key) {
                 Some((_, expires_at)) if *expires_at <= Instant::now() => {
                     current.remove(&key);
                 }
                 Some((owner, _)) => {
-                    return RefreshOutcome::Ok {
-                        client_id: owner.client_id.clone(),
-                        upstream_id: owner.upstream_id.clone(),
+                    return match owner.state {
+                        RefreshState::InFlight => RefreshOutcome::Reused {
+                            upstream_id: owner.upstream_id.clone(),
+                        },
+                        RefreshState::Active => {
+                            owner.state = RefreshState::InFlight;
+                            RefreshOutcome::Ok {
+                                client_id: owner.client_id.clone(),
+                                upstream_id: owner.upstream_id.clone(),
+                                guard: InFlightGuard { store: self, key },
+                            }
+                        }
                     };
                 }
                 None => {}
@@ -1158,6 +1225,7 @@ mod refresh_store_tests {
             RefreshOutcome::Ok {
                 client_id,
                 upstream_id,
+                guard: _,
             } => {
                 assert_eq!(client_id, "client-a");
                 assert_eq!(upstream_id, "upstream-1");
@@ -1228,5 +1296,107 @@ mod refresh_store_tests {
             .expect("should mint");
         store.retire(&token, "upstream-1".to_string());
         assert!(store.take(&token).is_none());
+    }
+
+    #[test]
+    fn a_second_redeem_while_the_first_guard_is_alive_is_reused() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        let RefreshOutcome::Ok { guard, .. } = store.redeem(&token) else {
+            panic!("expected Ok");
+        };
+        match store.redeem(&token) {
+            RefreshOutcome::Reused { upstream_id } => assert_eq!(upstream_id, "upstream-1"),
+            _ => panic!("expected Reused while the first guard is alive"),
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn dropping_the_guard_without_retiring_makes_the_token_redeemable_again() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        {
+            let RefreshOutcome::Ok { guard, .. } = store.redeem(&token) else {
+                panic!("expected Ok");
+            };
+            drop(guard);
+        }
+        assert!(matches!(store.redeem(&token), RefreshOutcome::Ok { .. }));
+    }
+
+    #[test]
+    fn retiring_while_the_guard_is_alive_then_dropping_it_stays_reused() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        let RefreshOutcome::Ok { guard, .. } = store.redeem(&token) else {
+            panic!("expected Ok");
+        };
+        store.retire(&token, "upstream-1".to_string());
+        // The guard's entry is already gone, so its `Drop` must be a
+        // no-op: it must not resurrect the retired token as `Active`.
+        drop(guard);
+        match store.redeem(&token) {
+            RefreshOutcome::Reused { upstream_id } => assert_eq!(upstream_id, "upstream-1"),
+            _ => panic!("expected Reused; the guard must not have undone the retire"),
+        }
+    }
+
+    #[test]
+    fn discarding_while_the_guard_is_alive_then_dropping_it_stays_invalid() {
+        let store = RefreshStore::new();
+        let (token, _) = store
+            .mint("client-a".to_string(), "upstream-1".to_string())
+            .expect("should mint");
+        let RefreshOutcome::Ok { guard, .. } = store.redeem(&token) else {
+            panic!("expected Ok");
+        };
+        store.discard(&token);
+        drop(guard);
+        assert!(matches!(store.redeem(&token), RefreshOutcome::Invalid));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod upstream_store_tests {
+    use super::*;
+
+    fn upstream_set(access: &str) -> UpstreamTokenSet {
+        UpstreamTokenSet {
+            access: SecretString::from(access.to_string()),
+            refresh: None,
+            granted_scopes: vec![],
+            expires_at: expires_after(Duration::from_mins(5)),
+        }
+    }
+
+    #[test]
+    fn replace_on_a_present_id_updates_in_place_and_returns_ok() {
+        let store = UpstreamStore::new();
+        let id = store.insert(upstream_set("old")).expect("should insert");
+        assert_eq!(store.len(), 1);
+
+        let result = store.replace(&id, upstream_set("new"));
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+        let access = store.access_token(&id).expect("should still resolve");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&access), "new");
+    }
+
+    #[test]
+    fn replace_on_an_absent_id_returns_err_and_inserts_nothing() {
+        let store = UpstreamStore::new();
+        assert_eq!(store.len(), 0);
+
+        let result = store.replace("never-inserted", upstream_set("orphaned"));
+        assert!(result.is_err());
+        assert_eq!(store.len(), 0);
     }
 }

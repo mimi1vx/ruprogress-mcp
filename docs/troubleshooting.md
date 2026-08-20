@@ -201,12 +201,18 @@ on `/token`, and its whole session (not just that refresh) is now dead.
 **Cause:** `oauth-proxy` refresh tokens rotate on every use, and reusing an
 already-rotated (retired) token is treated as evidence of token theft or a
 client bug that duplicated a request — the server responds by revoking the
-entire session upstream, not just rejecting the stale token.
+entire session upstream, not just rejecting the stale token. The same
+containment applies to a refresh token that is *still* current: redemption
+is single-use and atomic, so two requests presenting the same refresh token
+at the same time are indistinguishable from an attacker racing the
+legitimate client — both fail and the session dies.
 
 **Fix:** the client must always use the *most recent* refresh token
-returned, never a cached older one; if this happens after a genuine crash
-mid-refresh (the client can't tell if its own request succeeded), the fix
-is to re-authorize from scratch, not to retry the old refresh token.
+returned, never a cached older one, and must serialize its refreshes —
+never fire a speculative parallel refresh alongside one already in flight;
+if this happens after a genuine crash mid-refresh (the client can't tell if
+its own request succeeded), the fix is to re-authorize from scratch, not to
+retry the old refresh token.
 
 ## `UNEXPECTED_RESPONSE` on `get_redmine_attachment`
 

@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `https`, or attachments served from a CDN) now fails with an in-band
   `UNEXPECTED_RESPONSE` instead of silently following the redirect; point
   `REDMINE_URL` at the final origin directly.
+- `oauth-proxy`'s refresh-token redemption is now single-use atomically:
+  previously a refresh token was only looked up, not consumed, until the
+  handler finished, so two requests presenting the same token concurrently
+  could both refresh upstream and each mint an independent valid pair,
+  defeating rotation and reuse detection (RFC 9700 §4.14.2). Redemption now
+  transitions the token under one lock acquisition; a second concurrent
+  redemption is treated the same as replaying an already-rotated token —
+  the session is revoked upstream and both requests fail. A dropped,
+  cancelled, or early-returning refresh leaves the token immediately
+  reusable rather than stuck. `UpstreamStore::replace` is now conditional
+  too, so an in-flight refresh can no longer resurrect a session a
+  concurrent `/revoke` already removed.
 
 ## [0.1.0] - 2026-08-19
 
