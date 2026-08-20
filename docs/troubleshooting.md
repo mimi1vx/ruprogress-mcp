@@ -261,6 +261,24 @@ given deployment.
 requires it, defaulting to `localhost` for local use). Set it to the real
 hostname or IP the container is reachable at in production.
 
+## `REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK` missing at startup
+
+**Symptom:** the process exits immediately with a
+`REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK` config error, on a `legacy` auth
+mode deployment that previously started fine on a non-loopback `SERVER_HOST`.
+
+**Cause:** a shared `REDMINE_API_KEY` authenticates this server to Redmine,
+not the caller to this server — anyone who can reach a non-loopback bind acts
+as that Redmine account. This used to only log a `WARN`; it is now a startup
+error so the risk cannot go unnoticed. This is a breaking change on upgrade
+for any existing `legacy` + non-loopback HTTP deployment.
+
+**Fix:** pick one — bind loopback (`SERVER_HOST=127.0.0.1`, the default), put
+an authenticating proxy in front, switch to
+`REDMINE_AUTH_MODE=legacy-per-user`/`oauth`/`oauth-proxy`, or set
+`REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true` to accept the risk. See
+docs/configuration.md#exposing-the-server-on-a-network.
+
 ## Redmine unreachable
 
 **Symptom:** `/readyz` returns `503`, but the process is otherwise running

@@ -1519,6 +1519,19 @@ impl Config {
         if let (TransportConfig::Http(http), AuthMode::Legacy { .. }) = (&transport, &auth)
             && !http.bind.ip().is_loopback()
         {
+            if optional(vars, "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK").as_deref()
+                != Some("true")
+            {
+                return Err(ConfigError::Missing {
+                    var: "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK",
+                    because: "legacy auth mode authenticates this server to Redmine with a \
+                              single shared API key, not the caller to this server: anyone who \
+                              can reach a non-loopback bind acts as that Redmine account. Bind \
+                              loopback instead, put an authenticating proxy in front, switch to \
+                              legacy-per-user/oauth/oauth-proxy, or set this variable to \
+                              \"true\" to accept the risk",
+                });
+            }
             tracing::warn!(
                 bind = %http.bind,
                 "serving on a non-loopback address with a single shared Redmine API key: every \
@@ -2863,6 +2876,12 @@ mod tests {
     /// `TransportKind::Http`.
     fn http(pairs: &[(&str, &str)]) -> Result<HttpConfig, ConfigError> {
         let mut vars = valid_legacy();
+        // These tests exercise HTTP parsing, not the exposure guard, which
+        // has its own tests above.
+        vars.insert(
+            "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK".to_string(),
+            "true".to_string(),
+        );
         for (k, v) in pairs {
             vars.insert((*k).to_string(), (*v).to_string());
         }
@@ -3195,6 +3214,103 @@ mod tests {
             Config::from_map(&vars, TransportKind::Stdio),
             Err(ConfigError::Conflict { .. })
         ));
+    }
+
+    // --- Unauthenticated network exposure guard -------------------------
+
+    #[test]
+    fn non_loopback_legacy_http_without_the_var_is_missing() {
+        let vars = map(&[
+            ("REDMINE_URL", "https://redmine.example.com"),
+            ("REDMINE_API_KEY", "test-key"),
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+        ]);
+        let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Missing {
+                var: "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_loopback_legacy_http_with_the_var_true_succeeds() {
+        let mut vars = map(&[
+            ("REDMINE_URL", "https://redmine.example.com"),
+            ("REDMINE_API_KEY", "test-key"),
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+        ]);
+        vars.insert(
+            "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK".to_string(),
+            "true".to_string(),
+        );
+        let config =
+            Config::from_map(&vars, TransportKind::Http).expect("accepted risk should start");
+        assert!(matches!(config.auth, AuthMode::Legacy { .. }));
+    }
+
+    #[test]
+    fn non_loopback_legacy_http_with_a_truthy_but_not_exact_true_value_still_refuses() {
+        for value in ["1", "yes", "True"] {
+            let mut vars = map(&[
+                ("REDMINE_URL", "https://redmine.example.com"),
+                ("REDMINE_API_KEY", "test-key"),
+                ("SERVER_HOST", "0.0.0.0"),
+                ("PUBLIC_HOST", "mcp.example.com"),
+            ]);
+            vars.insert(
+                "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK".to_string(),
+                value.to_string(),
+            );
+            let err = Config::from_map(&vars, TransportKind::Http).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Missing {
+                        var: "REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK",
+                        ..
+                    }
+                ),
+                "{value:?} should not satisfy the gate, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_legacy_http_succeeds_without_the_var() {
+        let config = Config::from_map(&valid_legacy(), TransportKind::Http).expect("valid");
+        assert!(matches!(config.auth, AuthMode::Legacy { .. }));
+    }
+
+    #[test]
+    fn stdio_legacy_is_unaffected_by_a_non_loopback_server_host() {
+        let mut vars = valid_legacy();
+        vars.insert("SERVER_HOST".to_string(), "0.0.0.0".to_string());
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("stdio has no bind");
+        assert!(matches!(config.auth, AuthMode::Legacy { .. }));
+    }
+
+    #[test]
+    fn legacy_per_user_and_oauth_on_a_non_loopback_bind_succeed_without_the_var() {
+        let per_user = map(&[
+            ("REDMINE_URL", "https://redmine.example.com"),
+            ("REDMINE_AUTH_MODE", "legacy-per-user"),
+            ("REDMINE_PER_USER_TRUST_PROXY", "true"),
+            ("SERVER_HOST", "0.0.0.0"),
+            ("PUBLIC_HOST", "mcp.example.com"),
+        ]);
+        let config = Config::from_map(&per_user, TransportKind::Http).expect("valid");
+        assert!(matches!(config.auth, AuthMode::LegacyPerUser { .. }));
+
+        let mut oauth = valid_oauth();
+        oauth.insert("SERVER_HOST".to_string(), "0.0.0.0".to_string());
+        oauth.insert("PUBLIC_HOST".to_string(), "mcp.example.com".to_string());
+        let config = Config::from_map(&oauth, TransportKind::Http).expect("valid");
+        assert!(matches!(config.auth, AuthMode::OAuth(_)));
     }
 
     #[test]

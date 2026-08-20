@@ -3,7 +3,12 @@ services:
     build: .
     image: ruprogress-mcp:dev
     ports:
-      - "8000:8000"
+      # Loopback-only publication: the container binds 0.0.0.0 inside its
+      # own network namespace by necessity (that's what
+      # REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK below accepts), but this
+      # mapping is what actually limits reach from the host. Remove it (and
+      # put an authenticating proxy in front) to expose beyond localhost.
+      - "127.0.0.1:8000:8000"
     environment:
       REDMINE_URL: https://redmine.example.com
       REDMINE_API_KEY: ${REDMINE_API_KEY}
@@ -11,6 +16,10 @@ services:
       # non-loopback bind with no PUBLIC_HOST is a startup error — see
       # docs/configuration.md#exposing-the-server-on-a-network.
       PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      # Required in legacy auth mode: attests that the operator accepts a
+      # non-loopback bind under a single shared API key. The loopback port
+      # publication above is the real control on reach.
+      REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK: "true"
 
       # Rate limiting (9.2) defaults — uncomment to override.
       # REDMINE_MCP_RATE_LIMIT_ENABLED: "true"

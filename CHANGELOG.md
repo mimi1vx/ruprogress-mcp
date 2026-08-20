@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reusable rather than stuck. `UpstreamStore::replace` is now conditional
   too, so an in-flight refresh can no longer resurrect a session a
   concurrent `/revoke` already removed.
+- The default `legacy` auth mode now refuses to start on a non-loopback
+  `SERVER_HOST` unless `REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true` is
+  set. A shared `REDMINE_API_KEY` authenticates this server to Redmine, not
+  the caller to this server, so anyone who could reach a non-loopback bind
+  acted as that Redmine account; this previously only logged a `WARN`,
+  which the shipped `Dockerfile`/`docker-compose.yml` example configuration
+  (`SERVER_HOST=0.0.0.0` plus a published port) would have hit silently.
+  The `WARN` is unchanged and still fires once the variable is set.
+  `docker-compose.yml` now also publishes `127.0.0.1:8000:8000` instead of
+  `8000:8000`. **Breaking:** an existing `legacy` + non-loopback HTTP
+  deployment will refuse to start until the variable is set, loopback is
+  bound instead, or another auth mode is used — this speed bump is one env
+  var away from being overridden, and does not by itself authenticate
+  callers; `legacy-per-user`/`oauth`/`oauth-proxy` still exist for that.
 
 ## [0.1.0] - 2026-08-19
 

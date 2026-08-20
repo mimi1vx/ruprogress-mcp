@@ -56,6 +56,7 @@ Ignored entirely on `--transport stdio`.
 | `SERVER_PORT` | no | `8000` | 1–65535. `0` is rejected: the server would bind a port no client could be told about. |
 | `PUBLIC_HOST` | yes, for a non-loopback `SERVER_HOST` | — | The hostname clients use to reach this server. Added to the `Host` allowlist bare, which matches the host on **any** port. |
 | `PUBLIC_PORT` | no | — | Pins the `PUBLIC_HOST` entry to one port (`host:port` instead of bare `host`). Setting it alone is a `Conflict`. |
+| `REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK` | yes, for a non-loopback `SERVER_HOST` in `legacy` auth mode | — | Must be exactly `true`. Absent/false refuses to start (`Missing`) — the operator's explicit attestation that a single shared Redmine API key on a non-loopback bind is acceptable. See "Exposing the server on a network". |
 | `FASTMCP_STREAMABLE_HTTP_PATH` | no | `/mcp` | Must start with `/`, have at least one segment, and contain no `..`, `?`, `#`, `{`, `}`, `*`, or whitespace. |
 | `REDMINE_MCP_ALLOWED_HOSTS` | no | derived | Comma-separated `host` or `host:port`. **Replaces** the derived list entirely. `*` disables `Host` validation and logs a `WARN`; it is only accepted as the sole value. A port-less entry matches any port. |
 | `REDMINE_MCP_ALLOWED_ORIGINS` | no | `[]` (Origin validation off) | Comma-separated absolute origins, each with a scheme (`https://app.example.com`). `*` and `null` are rejected. When non-empty this also enables an exact-match CORS layer; when empty no CORS headers are sent at all. |
@@ -220,6 +221,7 @@ docker run --rm -p 8000:8000 \
   -e REDMINE_API_KEY=... \
   -e SERVER_HOST=0.0.0.0 \
   -e PUBLIC_HOST=localhost \
+  -e REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true \
   ruprogress-mcp --transport http
 ```
 
@@ -228,19 +230,46 @@ services:
   ruprogress-mcp:
     image: ruprogress-mcp
     command: ["--transport", "http"]
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
     environment:
       REDMINE_URL: https://redmine.example.com
       REDMINE_API_KEY: ${REDMINE_API_KEY}
       SERVER_HOST: 0.0.0.0
       PUBLIC_HOST: localhost
+      REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK: "true"
 ```
 
-Note that in the default `legacy` auth mode a non-loopback bind also logs a
-`WARN`: there is one shared Redmine API key, so everyone who can reach the port
-acts as that Redmine account. Put an authenticating proxy in front, or use
-`REDMINE_AUTH_MODE=legacy-per-user` or `oauth` so each caller presents their
-own credential.
+### The default `legacy` auth mode also requires an explicit opt-in
+
+A shared `REDMINE_API_KEY` authenticates this *server* to Redmine, not the
+*caller* to this server: anyone who can reach a non-loopback bind acts as that
+Redmine account. `REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK` unset on a
+non-loopback bind under `legacy` auth is a startup error. The exact message:
+
+```
+REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK is required because legacy auth mode
+authenticates this server to Redmine with a single shared API key, not the
+caller to this server: anyone who can reach a non-loopback bind acts as that
+Redmine account. Bind loopback instead, put an authenticating proxy in front,
+switch to legacy-per-user/oauth/oauth-proxy, or set this variable to "true" to
+accept the risk
+```
+
+Why an error and not just the pre-existing `WARN` (which still fires,
+byte-for-byte unchanged, once the variable is set): a log line that scrolls
+away is not consent, and the shipped `Dockerfile`/`docker-compose.yml` example
+is exactly this configuration — `ENV SERVER_HOST=0.0.0.0` plus a published
+port — so an operator who never reads the log would otherwise get
+unauthenticated network exposure by default. Four ways out, in order of
+preference:
+
+1. Bind loopback (`SERVER_HOST=127.0.0.1`, the default) and put your own
+   authenticating layer in front if remote access is needed.
+2. Put a proxy that authenticates the caller in front of a non-loopback bind.
+3. Switch to `REDMINE_AUTH_MODE=legacy-per-user`, `oauth`, or `oauth-proxy` so
+   each caller presents their own credential instead of sharing this server's.
+4. Set `REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true` to accept the risk —
+   the operator's explicit attestation, not something this process can verify.
 
 ## Health endpoints
 

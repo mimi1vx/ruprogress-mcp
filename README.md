@@ -134,7 +134,8 @@ streamed request-body cap, and `X-Content-Type-Options: nosniff` everywhere.
 
 It binds loopback by default; read
 [Exposing the server on a network](docs/configuration.md#exposing-the-server-on-a-network)
-before changing `SERVER_HOST`.
+before changing `SERVER_HOST` — in the default `legacy` auth mode a
+non-loopback bind refuses to start without an explicit opt-in.
 
 ### Rate limiting
 
@@ -166,13 +167,18 @@ docker run --rm -p 8000:8000 \
   -e REDMINE_URL=https://redmine.example.com \
   -e REDMINE_API_KEY=... \
   -e PUBLIC_HOST=localhost \
+  -e REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true \
   ruprogress-mcp:dev
 ```
 
 The image already sets `SERVER_HOST=0.0.0.0`; `PUBLIC_HOST` is still required
 (see [Exposing the server on a network](docs/configuration.md#exposing-the-server-on-a-network)) —
 without it the container exits immediately with a `Missing PUBLIC_HOST` error.
-`curl -f localhost:8000/livez` should then return `200`.
+The default `legacy` auth mode additionally requires
+`REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true` as an explicit attestation
+that a single shared API key on a non-loopback bind is acceptable here — the
+`-p` mapping (or `docker-compose.yml`'s loopback-only publication) is what
+actually limits reach. `curl -f localhost:8000/livez` should then return `200`.
 
 For a locked-down run — read-only root filesystem, a named volume for the one
 directory the process writes to — see `docker-compose.yml`, or by hand:
@@ -183,6 +189,7 @@ docker run --rm -p 8000:8000 \
   -e REDMINE_URL=https://redmine.example.com \
   -e REDMINE_API_KEY=... \
   -e PUBLIC_HOST=localhost \
+  -e REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true \
   --read-only \
   -v ruprogress-mcp-attachments:/var/lib/ruprogress-mcp/attachments \
   ruprogress-mcp:dev

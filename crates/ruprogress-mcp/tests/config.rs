@@ -138,8 +138,10 @@ fn a_non_loopback_bind_starts_with_either_escape_hatch() {
     // parse_allowed_hosts's own PUBLIC_HOST requirement) still needs an
     // origin to build /files/{uuid} URLs from.
     for extra in [
-        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n",
-        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\nREDMINE_MCP_ALLOWED_HOSTS=*\n",
+        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n\
+         REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true\n",
+        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\nREDMINE_MCP_ALLOWED_HOSTS=*\n\
+         REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true\n",
     ] {
         let output = print_http_config(extra);
         assert!(
@@ -171,11 +173,47 @@ fn config_stderr(extra: &str) -> String {
 
 #[test]
 fn a_non_loopback_bind_under_legacy_auth_warns_about_the_shared_key() {
-    let stderr = config_stderr("SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n");
+    let stderr = config_stderr(
+        "SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n\
+         REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true\n",
+    );
     assert!(stderr.contains("WARN"), "stderr: {stderr}");
     assert!(
         stderr.contains("single shared Redmine API key"),
         "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_non_loopback_bind_under_legacy_auth_without_the_override_refuses_to_start() {
+    let output = print_http_config("SERVER_HOST=0.0.0.0\nPUBLIC_HOST=mcp.example.com\n");
+    assert!(
+        !output.status.success(),
+        "a shared-key legacy server on a non-loopback bind must not start unattended"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn stdio_transport_is_unaffected_by_a_non_loopback_server_host() {
+    let env_file = TempEnvFile::new(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\nSERVER_HOST=0.0.0.0\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .args(["--transport", "stdio", "--print-config"])
+        .env_clear()
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "stdio has no bind, so SERVER_HOST is irrelevant; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
