@@ -871,7 +871,7 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
                 // refresh token is a far longer-lived threat than a leaked
                 // authorization code.
                 if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
-                    revoke_upstream_and_purge(state, &upstream.access).await;
+                    revoke_upstream_and_purge(state, &upstream).await;
                 }
                 tracing::warn!(
                     "refresh token reuse detected (replay or concurrent use); revoked the session"
@@ -953,7 +953,7 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
         // rather than mint anything against a session that no longer
         // exists (finding 2).
         state.proxy.refresh_tokens.discard(refresh_token);
-        revoke_upstream_and_purge(state, &set.access).await;
+        revoke_upstream_and_purge(state, &set).await;
         tracing::warn!("session vanished mid-refresh; revoked the orphaned upstream token set");
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
@@ -985,25 +985,38 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
 const ACCESS_TOKEN_PREFIX: &str = "rup_at_";
 const REFRESH_TOKEN_PREFIX: &str = "rup_rt_";
 
-/// Revokes `access` upstream with the confidential upstream client
-/// credential, then purges it from the introspection cache (R6). Logs
+/// Revokes `set` upstream with the confidential upstream client credential,
+/// then purges its access token from the introspection cache (R6). Prefers
+/// the refresh token when present, falling back to the access token
+/// otherwise: Doorkeeper revokes both credentials by revoking the single
+/// database row either holds (V3), but an already-expired access token is a
+/// silent no-op to revoke (V1) while the refresh token never expires on its
+/// own (V5) — so the refresh token is the one worth sending whenever there
+/// is one. Never both: `token_type_hint` is a one-way filter in the pinned
+/// Doorkeeper version (V4), and one call already revokes the row. Logs
 /// rather than fails on an upstream error: local state is already gone by
 /// the time this runs, and RFC 7009 requires `/revoke` to answer `200`
 /// regardless.
-async fn revoke_upstream_and_purge(state: &FlowState, access: &SecretString) {
+async fn revoke_upstream_and_purge(state: &FlowState, set: &UpstreamTokenSet) {
     let credential = Credential::Basic {
         user: state.upstream_client_id.clone(),
         pass: state.upstream_client_secret.clone(),
     };
+    let (token, hint) = set
+        .refresh
+        .as_ref()
+        .map_or((&set.access, "access_token"), |refresh| {
+            (refresh, "refresh_token")
+        });
     if let Err(error) = state
         .redmine
         .as_user(&credential)
-        .revoke_token(access, Some("access_token"))
+        .revoke_token(token, Some(hint))
         .await
     {
         tracing::warn!(%error, "upstream revocation failed; local state was already removed");
     }
-    state.verifier.purge(access);
+    state.verifier.purge(&set.access);
 }
 
 /// `POST /revoke` in `oauth-proxy` mode (R5): accepts a `rup_at_`/`rup_rt_`
@@ -1057,7 +1070,7 @@ async fn revoke(State(state): State<FlowState>, request: Request) -> Response {
     };
 
     if let Some(upstream) = upstream {
-        revoke_upstream_and_purge(&state, &upstream.access).await;
+        revoke_upstream_and_purge(&state, &upstream).await;
     }
 
     StatusCode::OK.into_response()

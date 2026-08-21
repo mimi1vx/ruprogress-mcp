@@ -385,7 +385,13 @@ async fn reusing_a_rotated_refresh_token_invalidates_the_whole_chain_and_revokes
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
         .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
-        .and(body_string_contains(format!("token={SECOND_ACCESS}")))
+        // The session's *refresh* token is revoked, not its access token
+        // (finding 6a): Doorkeeper answers `200` and does nothing for an
+        // already-revocable-but-unexpired access token here too, but the
+        // refresh token is the one that never expires on its own upstream,
+        // so it is the credential actually worth killing.
+        .and(body_string_contains("token=upstream-refresh-2"))
+        .and(body_string_contains("token_type_hint=refresh_token"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&harness.redmine)
@@ -564,7 +570,10 @@ async fn revoking_a_proxy_access_token_makes_the_next_call_401() {
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
         .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
-        .and(body_string_contains(format!("token={ACCESS}")))
+        // The session's refresh token is revoked, not its access token
+        // (finding 6a) — see the reuse-containment test's comment.
+        .and(body_string_contains("token=upstream-refresh-1"))
+        .and(body_string_contains("token_type_hint=refresh_token"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&harness.redmine)
@@ -576,6 +585,57 @@ async fn revoking_a_proxy_access_token_makes_the_next_call_401() {
     assert_eq!(response.status(), StatusCode::OK);
 
     assert!(!call_tool_with_token(&harness, &access).await);
+}
+
+/// Finding 6a: Doorkeeper silently no-ops revoking an already-expired
+/// access token (V1), so a session minted with `expires_in: 0` must still
+/// be revocable upstream — via its refresh token, which never expires on
+/// its own (V5).
+#[tokio::test]
+async fn revoking_a_session_whose_access_token_already_expired_still_revokes_its_refresh_token() {
+    let harness = support::http_harness(&oauth_proxy_env(&[])).await;
+    const ACCESS: &str = "upstream-access-already-expired";
+    const REFRESH: &str = "upstream-refresh-already-expired";
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": ACCESS,
+            "refresh_token": REFRESH,
+            "token_type": "Bearer",
+            "expires_in": 0,
+            "scope": "view_project view_issues",
+        })))
+        .mount(&harness.redmine)
+        .await;
+
+    let client_id = register_client(&harness).await;
+    let (verifier, challenge) = pkce_pair();
+    let transaction_state = drive_authorize(&harness, &client_id, &challenge).await;
+    let code = drive_callback(&harness, &transaction_state).await;
+
+    let response = drive_token(&harness, &code, &client_id, &verifier).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    let access = body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
+        .and(body_string_contains(format!("token={REFRESH}")))
+        .and(body_string_contains("token_type_hint=refresh_token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&harness.redmine)
+        .await;
+
+    let response = drive_revoke(&harness, &access).await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
