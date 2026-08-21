@@ -652,6 +652,35 @@ async fn upload_file_malformed_base64_is_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn upload_file_content_base64_over_the_cap_is_rejected_without_reaching_redmine() {
+    let h = support::harness(&[]).await;
+    // No mock for /uploads.json: if the decode-then-mint flow ever ran, a
+    // registered expect(0) mock proves it via a hard assertion instead of
+    // a silent 404 that would still make this test pass by accident.
+    let upload_mock = Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0);
+    h.redmine.register(upload_mock).await;
+
+    let raw = vec![b'A'; 50 * 1024 * 1024 + 1];
+    let result = call_tool(
+        &h,
+        "upload_file",
+        json!({"project_id": 1, "filename": "big.bin", "content_base64": base64_of(&raw)}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.expect("structured error");
+    assert_eq!(structured["code"], "FILE_TOO_LARGE");
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine: {requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn upload_file_413_from_create_upload_maps_to_file_too_large() {
     let h = support::harness(&[]).await;
     Mock::given(method("POST"))

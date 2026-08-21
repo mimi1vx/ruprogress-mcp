@@ -747,7 +747,7 @@ Delete a Redmine attachment by id. This can delete ANY attachment this credentia
 
 ### `upload_file`
 
-Upload a file and attach it to a project's Files module. Exactly one of content_base64 (requires filename) or file_path is required; source_url is not supported and returns UNSUPPORTED_SOURCE. file_path must be inside ATTACHMENTS_DIR or REDMINE_MCP_UPLOAD_FILE_ROOTS, capped at 50 MiB. Use this when attaching a file to a project. Write tool; blocked in read-only mode.
+Upload a file and attach it to a project's Files module. Exactly one of content_base64 (requires filename) or file_path is required; source_url is not supported and returns UNSUPPORTED_SOURCE. Both sources are capped at 50 MiB; file_path must additionally be inside ATTACHMENTS_DIR or REDMINE_MCP_UPLOAD_FILE_ROOTS. Use this when attaching a file to a project. Write tool; blocked in read-only mode.
 
 - **Kind:** write
 - **Required scopes:** `manage_files`
@@ -912,7 +912,7 @@ List, get, create, update, or delete a RedmineUP CRM contact, or attach/detach o
 
 ### `manage_document`
 
-List, get, create, or update documents in the DMSF plugin (redmine_dmsf, GPL v2; must be installed server-side, and its DMSF module replaces rather than complements Redmine's built-in Documents). There is no delete action. list/get work in read-only mode; create/update are blocked. create requires project_id and exactly one of content_base64 (requires name) or file_path; its response is sparse ({document_id} only) — follow up with action="get". update always creates a new revision rather than replacing one, and requires document_id.
+List, get, create, or update documents in the DMSF plugin (redmine_dmsf, GPL v2; must be installed server-side, and its DMSF module replaces rather than complements Redmine's built-in Documents). There is no delete action. list/get work in read-only mode; create/update are blocked. create requires project_id and exactly one of content_base64 (requires name) or file_path, both capped at 50 MiB; its response is sparse ({document_id} only) — follow up with action="get". update always creates a new revision rather than replacing one, and requires document_id.
 
 - **Kind:** partial (per `action`)
 - **Gated by:** `REDMINE_DMSF_ENABLED`

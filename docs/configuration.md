@@ -162,15 +162,19 @@ transport) or an absolute `file_path` (stdio transport).
 expired UUID; `403` for a `Host` header outside the same allowlist `/mcp`
 uses (see "`public_base`" above).
 
-`upload_file`'s two sources have two different, unrelated size ceilings:
-`content_base64` is bounded by `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` on the
-HTTP transport (the request body itself; the base64 encoding means roughly
-three-quarters of that byte count survives decoding); `file_path` has its own
-fixed 50 MiB limit, independent of `ATTACHMENT_MAX_DOWNLOAD_BYTES` (which
-bounds the opposite direction, a Redmine attachment downloading onto local
-disk). A `file_path` upload is refused with `PATH_NOT_ALLOWED` — never a path
-or existence detail — unless it resolves inside `ATTACHMENTS_DIR` or a
-`REDMINE_MCP_UPLOAD_FILE_ROOTS` entry.
+`upload_file`'s two sources (and `manage_document`'s `create` action, and each
+`uploads[]` item on `create_redmine_issue`/`update_redmine_issue`) share the
+same fixed 50 MiB per-file cap, independent of `ATTACHMENT_MAX_DOWNLOAD_BYTES`
+(which bounds the opposite direction, a Redmine attachment downloading onto
+local disk). For `content_base64` this is enforced against the *decoded*
+byte count, before the full decode buffer is allocated; a `file_path` upload
+is refused with `PATH_NOT_ALLOWED` — never a path or existence detail —
+unless it resolves inside `ATTACHMENTS_DIR` or a `REDMINE_MCP_UPLOAD_FILE_ROOTS`
+entry. `uploads[]` additionally shares a 100 MiB aggregate budget across all
+its items (both sources) for one call. On the HTTP transport,
+`REDMINE_MCP_MAX_REQUEST_BODY_BYTES` is an additional *outer* bound on the
+whole request body; on stdio there is no equivalent, so these are this
+server's only application-level upload limits there.
 
 ## Exposing the server on a network
 

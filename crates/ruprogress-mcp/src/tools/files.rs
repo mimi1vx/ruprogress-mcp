@@ -35,7 +35,7 @@ use crate::tools::output::{self, ContentUrlRewrite, ErrorCode, err};
 /// (Redmine → local disk). Matches the tool contract's documented 50 MiB
 /// limit; not configurable, since it is a fixed property
 /// of this server's `upload_file` implementation, not a deployment choice.
-const UPLOAD_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+pub(crate) const UPLOAD_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 // --- get_redmine_attachment ---
 
@@ -141,16 +141,79 @@ fn path_not_allowed() -> CallToolResult {
     )
 }
 
-fn upload_path_too_large(actual: u64) -> CallToolResult {
-    err(
-        ErrorCode::FileTooLarge,
-        format!(
-            "the file is {actual} bytes, larger than the {UPLOAD_FILE_MAX_BYTES}-byte per-file upload limit"
-        ),
-        Some(
+/// Builds the in-band `FILE_TOO_LARGE` refusal for either an oversize
+/// `content_base64` decode or an oversize `file_path` read, naming which
+/// limit was hit: `limit == UPLOAD_FILE_MAX_BYTES` is this server's
+/// per-file cap, anything smaller is the caller's remaining
+/// `uploads[]` aggregate budget (see `issues.rs::ISSUE_UPLOADS_MAX_TOTAL_BYTES`)
+/// — the exact byte count is always in the message, so the distinction is
+/// about which knob to reach for, not a rounded description.
+///
+/// `context` is the existing `"upload_file"` / `"uploads[2]"` /
+/// `"manage_document"` string already used by [`source_required`].
+pub(crate) fn upload_too_large(context: &str, actual: Option<u64>, limit: u64) -> CallToolResult {
+    let (scope, hint) = if limit == UPLOAD_FILE_MAX_BYTES {
+        (
+            "this server's per-file upload limit",
             "this server cannot upload a file this large; split the content or upload it to Redmine some other way",
-        ),
-    )
+        )
+    } else {
+        (
+            "the remaining aggregate budget for this call's uploads[]",
+            "split the batch across multiple calls",
+        )
+    };
+    let message = match actual {
+        Some(actual) => {
+            format!("{context}: the content is {actual} bytes, larger than {scope} ({limit} bytes)")
+        }
+        None => format!("{context}: the content is larger than {scope} ({limit} bytes)"),
+    };
+    err(ErrorCode::FileTooLarge, message, Some(hint))
+}
+
+/// A bounded `content_base64` decode: rejects when the base64 crate's own
+/// documented upper-bound estimate already exceeds `max_bytes` (before any
+/// decode allocation), then rejects again on the exact decoded length. Peak
+/// allocation is therefore `max_bytes + 2` bytes, not unbounded — the `+ 2`
+/// slack is `decoded_len_estimate`'s worst-case rounding overshoot, so a
+/// legitimate payload of exactly `max_bytes` bytes still passes the first
+/// check.
+pub(crate) fn decode_upload_base64(
+    context: &str,
+    b64: &str,
+    max_bytes: u64,
+) -> Result<Bytes, Base64UploadError> {
+    let estimate = base64::decoded_len_estimate(b64.len()) as u64;
+    if estimate > max_bytes.saturating_add(2) {
+        return Err(Base64UploadError::TooLarge(upload_too_large(
+            context, None, max_bytes,
+        )));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(Base64UploadError::Malformed)?;
+    let decoded_len = decoded.len() as u64;
+    if decoded_len > max_bytes {
+        return Err(Base64UploadError::TooLarge(upload_too_large(
+            context,
+            Some(decoded_len),
+            max_bytes,
+        )));
+    }
+    Ok(Bytes::from(decoded))
+}
+
+/// A per-site `content_base64` decode failure: either the base64 itself is
+/// malformed (a protocol error — the caller builds its own
+/// `McpError::invalid_params` so the existing per-site message prefix,
+/// e.g. `uploads[2]: …`, is preserved) or it decodes to more than the
+/// caller's `max_bytes`, already rendered as an in-band `FILE_TOO_LARGE`
+/// result by [`upload_too_large`].
+#[derive(Debug)]
+pub(crate) enum Base64UploadError {
+    Malformed(base64::DecodeError),
+    TooLarge(CallToolResult),
 }
 
 fn upload_rejected_as_too_large() -> CallToolResult {
@@ -212,6 +275,8 @@ pub(crate) async fn mint_upload_token(
 pub(crate) async fn read_and_validate_upload_path(
     roots: &[PathBuf],
     store_dir: &Path,
+    context: &str,
+    max_bytes: u64,
     raw: &str,
 ) -> Result<(Bytes, Option<String>), CallToolResult> {
     let requested = Path::new(raw);
@@ -246,8 +311,12 @@ pub(crate) async fn read_and_validate_upload_path(
     if !pre_open_meta.is_file() {
         return Err(path_not_allowed());
     }
-    if pre_open_meta.len() > UPLOAD_FILE_MAX_BYTES {
-        return Err(upload_path_too_large(pre_open_meta.len()));
+    if pre_open_meta.len() > max_bytes {
+        return Err(upload_too_large(
+            context,
+            Some(pre_open_meta.len()),
+            max_bytes,
+        ));
     }
 
     let mut file = tokio::fs::File::open(&canonical)
@@ -271,8 +340,12 @@ pub(crate) async fn read_and_validate_upload_path(
         }
     }
 
-    if handle_meta.len() > UPLOAD_FILE_MAX_BYTES {
-        return Err(upload_path_too_large(handle_meta.len()));
+    if handle_meta.len() > max_bytes {
+        return Err(upload_too_large(
+            context,
+            Some(handle_meta.len()),
+            max_bytes,
+        ));
     }
 
     // Reads from the already-validated handle, not a fresh open of
@@ -492,7 +565,7 @@ pub(crate) struct UploadFileParams {
     /// `content_base64`; inferred from the path when using `file_path`.
     pub(crate) filename: Option<String>,
     /// Raw file bytes, base64-encoded. Exactly one of `content_base64`/
-    /// `file_path` must be set.
+    /// `file_path` must be set. Limited to 50 MiB decoded.
     pub(crate) content_base64: Option<String>,
     /// Absolute path to a file already on this server: inside
     /// `ATTACHMENTS_DIR` or a directory listed in
@@ -679,7 +752,7 @@ impl RedmineMcp {
     /// call `204 No Content`, so the id from the first call is re-fetched
     /// via `GET /attachments/{id}.json` for the response.
     #[tool(
-        description = "Upload a file and attach it to a project's Files module. Exactly one of content_base64 (requires filename) or file_path is required; source_url is not supported and returns UNSUPPORTED_SOURCE. file_path must be inside ATTACHMENTS_DIR or REDMINE_MCP_UPLOAD_FILE_ROOTS, capped at 50 MiB. Use this when attaching a file to a project. Write tool; blocked in read-only mode.",
+        description = "Upload a file and attach it to a project's Files module. Exactly one of content_base64 (requires filename) or file_path is required; source_url is not supported and returns UNSUPPORTED_SOURCE. Both sources are capped at 50 MiB; file_path must additionally be inside ATTACHMENTS_DIR or REDMINE_MCP_UPLOAD_FILE_ROOTS. Use this when attaching a file to a project. Write tool; blocked in read-only mode.",
         input_schema = crate::tools::schema::input::<UploadFileParams>(),
         output_schema = crate::tools::schema::output::<FileEntryOut>(),
         annotations(
@@ -726,15 +799,16 @@ impl RedmineMcp {
                     None,
                 ));
             }
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(b64.as_bytes())
-                .map_err(|e| {
-                    McpError::invalid_params(
+            match decode_upload_base64("upload_file", &b64, UPLOAD_FILE_MAX_BYTES) {
+                Ok(bytes) => bytes,
+                Err(Base64UploadError::Malformed(e)) => {
+                    return Err(McpError::invalid_params(
                         format!("content_base64 is not valid base64: {e}"),
                         None,
-                    )
-                })?;
-            Bytes::from(decoded)
+                    ));
+                }
+                Err(Base64UploadError::TooLarge(result)) => return Ok(result),
+            }
         } else {
             // `sources_set == 1` and `source_url`/`content_base64` are both
             // excluded above, so `file_path` must be set.
@@ -743,6 +817,8 @@ impl RedmineMcp {
             let (contents, inferred) = match read_and_validate_upload_path(
                 &self.inner.config.attachments.upload_file_roots,
                 store.dir(),
+                "upload_file",
+                UPLOAD_FILE_MAX_BYTES,
                 &raw_path,
             )
             .await
@@ -823,5 +899,68 @@ impl RedmineMcp {
             },
             self.output_caps(),
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn exact_limit_payload_is_accepted() {
+        // 6 raw bytes encode to a padding-free quad pair; the estimate is
+        // exactly 6, no `+ 2` slack needed.
+        let encoded = b64(&[0u8; 6]);
+        let decoded = decode_upload_base64("ctx", &encoded, 6).unwrap();
+        assert_eq!(decoded.len(), 6);
+    }
+
+    #[test]
+    fn limit_minus_one_is_accepted() {
+        let encoded = b64(&[0u8; 5]);
+        let decoded = decode_upload_base64("ctx", &encoded, 6).unwrap();
+        assert_eq!(decoded.len(), 5);
+    }
+
+    #[test]
+    fn limit_plus_one_is_rejected_by_the_exact_check() {
+        // estimate(5 bytes) = 6, which is within `limit + 2` (4 + 2 = 6),
+        // so this is caught only by the exact post-decode check.
+        let encoded = b64(&[0u8; 5]);
+        let err = decode_upload_base64("ctx", &encoded, 4).unwrap_err();
+        assert!(matches!(err, Base64UploadError::TooLarge(_)));
+    }
+
+    #[test]
+    fn estimate_overshoot_within_slack_is_accepted() {
+        // 4 raw bytes need 2 padding chars, so `decoded_len_estimate`
+        // rounds up to 6 — 2 bytes above the 4-byte limit. The `+ 2` slack
+        // is exactly what keeps this legitimate payload from being
+        // rejected before it is even decoded.
+        let encoded = b64(&[0u8; 4]);
+        let decoded = decode_upload_base64("ctx", &encoded, 4).unwrap();
+        assert_eq!(decoded.len(), 4);
+    }
+
+    #[test]
+    fn malformed_base64_is_reported_as_malformed() {
+        let err = decode_upload_base64("ctx", "not valid base64!!", 100).unwrap_err();
+        assert!(matches!(err, Base64UploadError::Malformed(_)));
+    }
+
+    #[test]
+    fn empty_string_decodes_to_empty_bytes() {
+        let decoded = decode_upload_base64("ctx", "", 0).unwrap();
+        assert!(decoded.is_empty());
     }
 }

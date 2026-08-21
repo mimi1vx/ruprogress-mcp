@@ -12,7 +12,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use redmine_client::model::IdName;
@@ -770,7 +769,10 @@ pub(crate) struct CreateRedmineIssueParams {
     #[serde(default)]
     pub(crate) is_private: Option<bool>,
     /// Files to attach to the issue in this same request. Maximum 10 items;
-    /// each item follows the same source rules as `upload_file`.
+    /// each item follows the same source rules as `upload_file`. All items
+    /// combined (`content_base64` and `file_path` alike) are capped at a
+    /// 100 MiB aggregate budget for this call, on top of the 50 MiB
+    /// per-file limit.
     #[serde(default)]
     pub(crate) uploads: Option<Vec<IssueUploadParams>>,
     /// Tags to set on the new issue (`AlphaNodes` `additional_tags` plugin).
@@ -868,7 +870,10 @@ pub(crate) struct UpdateRedmineIssueParams {
     #[serde(default)]
     pub(crate) private_notes: Option<bool>,
     /// Files to attach to the issue in this same request. Maximum 10 items;
-    /// each item follows the same source rules as `upload_file`.
+    /// each item follows the same source rules as `upload_file`. All items
+    /// combined (`content_base64` and `file_path` alike) are capped at a
+    /// 100 MiB aggregate budget for this call, on top of the 50 MiB
+    /// per-file limit.
     #[serde(default)]
     pub(crate) uploads: Option<Vec<IssueUploadParams>>,
     /// New story points (`RedmineUP` Agile plugin). Omit to leave unchanged,
@@ -1472,6 +1477,14 @@ enum IssueUploadOutcome {
     InBand(CallToolResult),
 }
 
+/// Caps how many decoded/read bytes one `create_redmine_issue`/
+/// `update_redmine_issue` call may retain across all of `uploads[]`
+/// (`content_base64` and `file_path` items alike) before the first
+/// `mint_upload_token`. Without this, the existing 10-item cap alone still
+/// let one call buffer up to 10 × `UPLOAD_FILE_MAX_BYTES` ≈ 500 MiB of
+/// decoded bytes; this bounds the same call to ≈ 100 MiB.
+const ISSUE_UPLOADS_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Resolves one `uploads[]` item to its raw bytes and effective filename,
 /// touching no network (the first of two passes): a validation failure here
 /// — on any item — means zero `POST /uploads.json` requests are ever sent
@@ -1482,6 +1495,7 @@ async fn resolve_issue_upload(
     store_dir: &Path,
     idx: usize,
     item: IssueUploadParams,
+    max_bytes: u64,
 ) -> Result<(Bytes, Option<String>, Option<String>), IssueUploadOutcome> {
     let IssueUploadParams {
         mut filename,
@@ -1491,6 +1505,7 @@ async fn resolve_issue_upload(
         description,
     } = item;
 
+    let context = format!("uploads[{idx}]");
     let sources_set = [
         content_base64.is_some(),
         file_path.is_some(),
@@ -1500,9 +1515,7 @@ async fn resolve_issue_upload(
     .filter(|present| *present)
     .count();
     if sources_set != 1 {
-        return Err(IssueUploadOutcome::InBand(files::source_required(
-            &format!("uploads[{idx}]"),
-        )));
+        return Err(IssueUploadOutcome::InBand(files::source_required(&context)));
     }
     if source_url.is_some() {
         return Err(IssueUploadOutcome::InBand(files::unsupported_source()));
@@ -1515,21 +1528,24 @@ async fn resolve_issue_upload(
                 None,
             )));
         }
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64.as_bytes())
-            .map_err(|e| {
-                IssueUploadOutcome::Protocol(McpError::invalid_params(
+        match files::decode_upload_base64(&context, &b64, max_bytes) {
+            Ok(bytes) => bytes,
+            Err(files::Base64UploadError::Malformed(e)) => {
+                return Err(IssueUploadOutcome::Protocol(McpError::invalid_params(
                     format!("uploads[{idx}]: content_base64 is not valid base64: {e}"),
                     None,
-                ))
-            })?;
-        Bytes::from(decoded)
+                )));
+            }
+            Err(files::Base64UploadError::TooLarge(result)) => {
+                return Err(IssueUploadOutcome::InBand(result));
+            }
+        }
     } else {
         // `sources_set == 1` and `source_url`/`content_base64` are both
         // excluded above, so `file_path` must be set.
         let raw_path = file_path.unwrap_or_default();
         let (contents, inferred) =
-            files::read_and_validate_upload_path(roots, store_dir, &raw_path)
+            files::read_and_validate_upload_path(roots, store_dir, &context, max_bytes, &raw_path)
                 .await
                 .map_err(IssueUploadOutcome::InBand)?;
         if filename.is_none() {
@@ -1565,9 +1581,17 @@ async fn resolve_and_mint_issue_uploads(
         )));
     }
 
+    let mut remaining = ISSUE_UPLOADS_MAX_TOTAL_BYTES;
     let mut resolved = Vec::with_capacity(uploads.len());
     for (idx, item) in uploads.into_iter().enumerate() {
-        resolved.push(resolve_issue_upload(roots, store_dir, idx, item).await?);
+        let max_bytes = remaining.min(files::UPLOAD_FILE_MAX_BYTES);
+        let (bytes, filename, description) =
+            resolve_issue_upload(roots, store_dir, idx, item, max_bytes).await?;
+        // `resolve_issue_upload` already bounded `bytes.len()` by
+        // `max_bytes <= remaining`, so this can never saturate; guards
+        // against underflow rather than assuming the invariant holds.
+        remaining = remaining.saturating_sub(bytes.len() as u64);
+        resolved.push((bytes, filename, description));
     }
 
     let mut upload_refs = Vec::with_capacity(resolved.len());

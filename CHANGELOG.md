@@ -76,6 +76,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previous behaviour rather than a hard failure) and is always released —
   on commit, abort, a mid-stream error, or a dropped/cancelled request —
   so a refused or failed download's quota is immediately reusable.
+- `content_base64` uploads (`upload_file`, `manage_document`'s `create`
+  action, and each `uploads[]` item on `create_redmine_issue`/
+  `update_redmine_issue`) are now capped at 50 MiB decoded, the same limit
+  `file_path` already enforced — previously only the HTTP transport's
+  `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` bounded the encoded input, and
+  stdio had no cap at all, so a locally connected client could make the
+  process allocate an unbounded decode buffer. The check runs against the
+  base64 crate's own documented decode-length estimate before any decode
+  allocation, then again on the exact decoded length, so peak allocation
+  is bounded rather than proportional to the input. `create_redmine_issue`/
+  `update_redmine_issue`'s `uploads[]` also gained a 100 MiB aggregate
+  budget across all items (either source): previously the existing 10-item
+  cap alone still let one call buffer up to 10 × 50 MiB ≈ 500 MiB of
+  decoded bytes before the first attachment was uploaded. Both checks run
+  before any `POST /uploads.json` request, so a rejected batch never
+  strands an orphaned upload token on the Redmine server. **Breaking:** a
+  caller relying on a `content_base64` upload over 50 MiB on stdio, or a
+  `uploads[]` batch over 100 MiB aggregate, is now refused with an in-band
+  `FILE_TOO_LARGE` instead of succeeding.
 
 ## [0.1.0] - 2026-08-19
 

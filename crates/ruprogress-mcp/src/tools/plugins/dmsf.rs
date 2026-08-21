@@ -13,7 +13,6 @@
 
 use std::str::FromStr as _;
 
-use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use redmine_client::model::plugins::dmsf::{
@@ -157,7 +156,7 @@ pub(crate) struct ManageDocumentParams {
     #[serde(default)]
     pub(crate) document_id: Option<u64>,
     /// Raw file bytes, base64-encoded. For `create`; exactly one of
-    /// `content_base64`/`file_path` is required.
+    /// `content_base64`/`file_path` is required. Limited to 50 MiB decoded.
     #[serde(default)]
     pub(crate) content_base64: Option<String>,
     /// Absolute path to a file already on this server: inside
@@ -264,7 +263,7 @@ impl RedmineMcp {
     /// `POST /dmsf/files/{id}/revision/create.json` — every update creates a
     /// new revision; earlier ones survive.
     #[tool(
-        description = "List, get, create, or update documents in the DMSF plugin (redmine_dmsf, GPL v2; must be installed server-side, and its DMSF module replaces rather than complements Redmine's built-in Documents). There is no delete action. list/get work in read-only mode; create/update are blocked. create requires project_id and exactly one of content_base64 (requires name) or file_path; its response is sparse ({document_id} only) — follow up with action=\"get\". update always creates a new revision rather than replacing one, and requires document_id.",
+        description = "List, get, create, or update documents in the DMSF plugin (redmine_dmsf, GPL v2; must be installed server-side, and its DMSF module replaces rather than complements Redmine's built-in Documents). There is no delete action. list/get work in read-only mode; create/update are blocked. create requires project_id and exactly one of content_base64 (requires name) or file_path, both capped at 50 MiB; its response is sparse ({document_id} only) — follow up with action=\"get\". update always creates a new revision rather than replacing one, and requires document_id.",
         input_schema = crate::tools::schema::input::<ManageDocumentParams>(),
         output_schema = crate::tools::schema::output::<ManageDocumentOutput>(),
         annotations(
@@ -373,15 +372,20 @@ impl RedmineMcp {
                             None,
                         ));
                     }
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(b64.as_bytes())
-                        .map_err(|e| {
-                            McpError::invalid_params(
+                    match files::decode_upload_base64(
+                        "manage_document",
+                        &b64,
+                        files::UPLOAD_FILE_MAX_BYTES,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(files::Base64UploadError::Malformed(e)) => {
+                            return Err(McpError::invalid_params(
                                 format!("content_base64 is not valid base64: {e}"),
                                 None,
-                            )
-                        })?;
-                    Bytes::from(decoded)
+                            ));
+                        }
+                        Err(files::Base64UploadError::TooLarge(result)) => return Ok(result),
+                    }
                 } else {
                     // `sources_set == 1` and `source_url`/`content_base64`
                     // are both excluded above, so `file_path` must be set.
@@ -390,6 +394,8 @@ impl RedmineMcp {
                     let (contents, inferred) = match files::read_and_validate_upload_path(
                         &self.inner.config.attachments.upload_file_roots,
                         store.dir(),
+                        "manage_document",
+                        files::UPLOAD_FILE_MAX_BYTES,
                         &raw_path,
                     )
                     .await

@@ -265,6 +265,71 @@ async fn create_redmine_issue_uploads_over_ten_items_is_a_protocol_error() {
     assert!(result.is_err());
 }
 
+fn unique_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "ruprogress-mcp-test-issueuploads-{name}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+#[tokio::test]
+async fn create_redmine_issue_uploads_over_the_aggregate_budget_is_rejected_with_no_requests() {
+    // Three ~40 MiB sparse files: the first two (80 MiB) fit inside the
+    // 100 MiB aggregate budget, but the third would push the batch to
+    // ~120 MiB. It must be refused before it is ever read, and before any
+    // of the earlier items' upload tokens are minted.
+    let root = unique_dir("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let paths: Vec<_> = (0..3)
+        .map(|i| {
+            let p = root.join(format!("f{i}.bin"));
+            let file = std::fs::File::create(&p).unwrap();
+            file.set_len(40 * 1024 * 1024).unwrap();
+            p
+        })
+        .collect();
+
+    let h = support::harness(&[(
+        "REDMINE_MCP_UPLOAD_FILE_ROOTS",
+        root.to_string_lossy().as_ref(),
+    )])
+    .await;
+    let upload_mock = wiremock::Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0);
+    h.redmine.register(upload_mock).await;
+
+    let uploads: Vec<Value> = paths
+        .iter()
+        .map(|p| json!({"file_path": p.to_string_lossy()}))
+        .collect();
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue", "uploads": uploads}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "FILE_TOO_LARGE");
+    assert!(
+        structured["error"]
+            .as_str()
+            .unwrap()
+            .contains("aggregate budget"),
+        "{structured:?}"
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "no request should reach Redmine: {requests:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[tokio::test]
 async fn create_redmine_issue_rejects_an_empty_subject_as_an_argument_error() {
     let h = support::harness(&[]).await;
