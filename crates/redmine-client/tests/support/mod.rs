@@ -1,7 +1,7 @@
 //! Shared harness for `redmine-client` integration tests.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
-use redmine_client::{Credential, RedmineClient, RedmineClientBuilder};
+use redmine_client::{Credential, Limits, RedmineClient, RedmineClientBuilder};
 use secrecy::SecretString;
 
 /// Start a `wiremock` server and a [`RedmineClient`] pointed at it, with a
@@ -34,6 +34,28 @@ pub(crate) async fn mock_redmine_fast() -> (wiremock::MockServer, RedmineClient)
             max_retries: 3,
             base: std::time::Duration::from_millis(10),
             max_backoff: std::time::Duration::from_millis(50),
+        })
+        .build()
+        .expect("client should build against a valid base URL");
+    (server, client)
+}
+
+/// Like [`mock_redmine`], but with `max_response_bytes` shrunk to
+/// `max_response_bytes` so oversized-body tests don't need multi-megabyte
+/// fixtures.
+pub(crate) async fn mock_redmine_limited(
+    max_response_bytes: u64,
+) -> (wiremock::MockServer, RedmineClient) {
+    let server = wiremock::MockServer::start().await;
+    let base = server
+        .uri()
+        .parse()
+        .expect("mock server URI should parse as a URL");
+    let client = RedmineClientBuilder::new(base)
+        .credential(Credential::ApiKey(SecretString::from("test-api-key")))
+        .limits(Limits {
+            max_response_bytes,
+            ..Limits::default()
         })
         .build()
         .expect("client should build against a valid base URL");

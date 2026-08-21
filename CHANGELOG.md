@@ -51,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound instead, or another auth mode is used — this speed bump is one env
   var away from being overridden, and does not by itself authenticate
   callers; `legacy-per-user`/`oauth`/`oauth-proxy` still exist for that.
+- `redmine-client` now enforces `Limits::max_response_bytes` while streaming
+  a response, instead of after buffering the whole body into memory. A
+  response declaring an over-limit `Content-Length` is rejected before any
+  body byte is read; a chunked response with no (or a lying) `Content-Length`
+  is now read chunk-by-chunk and aborted mid-stream — dropping the
+  connection — the moment the running total crosses the limit. Previously a
+  malicious, compromised, or misconfigured upstream (or an intermediary
+  error page returned in its place) could make the process allocate an
+  unbounded `Bytes` buffer per in-flight request; this covers the
+  status-error path, JSON decoding, and both OAuth token-exchange error
+  paths. `download_attachment` remains the sole, documented exemption: it
+  streams to its caller, which owns its own byte cap.
 
 ## [0.1.0] - 2026-08-19
 

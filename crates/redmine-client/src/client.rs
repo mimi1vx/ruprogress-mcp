@@ -360,6 +360,40 @@ impl RedmineClient {
     }
 }
 
+/// Read `resp`'s body into memory, rejecting it before or during the read if
+/// it exceeds `limit`. A declared `Content-Length` above `limit` is rejected
+/// without reading a single body byte; otherwise the body is read
+/// chunk-by-chunk and the running total is checked after every chunk, so a
+/// chunked response with no (or a lying) `Content-Length` is aborted
+/// mid-stream — dropping `resp` and its connection — the moment it crosses
+/// `limit`. Invariant: this function never holds more than `limit` bytes of
+/// upstream body in memory at once.
+async fn read_bounded(mut resp: reqwest::Response, limit: u64) -> crate::Result<Vec<u8>> {
+    if let Some(declared) = resp.content_length()
+        && declared > limit
+    {
+        return Err(Error::LimitExceeded {
+            what: "response bytes",
+            limit,
+            actual: declared,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(Error::transport)? {
+        body.extend_from_slice(&chunk);
+        let total = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        if total > limit {
+            return Err(Error::LimitExceeded {
+                what: "response bytes",
+                limit,
+                actual: total,
+            });
+        }
+    }
+    Ok(body)
+}
+
 /// A [`RedmineClient`] scoped to one credential. The only handle that can
 /// perform a request. Owns its `Credential` (a cheap ~40-byte clone from the
 /// caller) rather than borrowing it, so a per-request credential built
@@ -439,14 +473,7 @@ impl Scoped<'_> {
                     let status = resp.status();
                     let retry_after = retry::retry_after(resp.headers())
                         .map(|d| retry::clamp_retry_after(d, policy.max_backoff));
-                    let body = resp.bytes().await.map_err(Error::transport)?;
-                    if body.len() as u64 > self.inner.limits.max_response_bytes {
-                        return Err(Error::LimitExceeded {
-                            what: "response bytes",
-                            limit: self.inner.limits.max_response_bytes,
-                            actual: body.len() as u64,
-                        });
-                    }
+                    let body = read_bounded(resp, self.inner.limits.max_response_bytes).await?;
                     crate::error::from_status(status, &body, retry_after)
                 }
                 Err(e) => Error::transport(e),
@@ -481,14 +508,7 @@ impl Scoped<'_> {
         resp: reqwest::Response,
         context: &'static str,
     ) -> crate::Result<T> {
-        let bytes = resp.bytes().await.map_err(Error::transport)?;
-        if bytes.len() as u64 > self.inner.limits.max_response_bytes {
-            return Err(Error::LimitExceeded {
-                what: "response bytes",
-                limit: self.inner.limits.max_response_bytes,
-                actual: bytes.len() as u64,
-            });
-        }
+        let bytes = read_bounded(resp, self.inner.limits.max_response_bytes).await?;
         serde_json::from_slice(&bytes).map_err(|source| Error::Decode { context, source })
     }
 
@@ -887,7 +907,9 @@ impl Scoped<'_> {
     /// # Errors
     ///
     /// Returns [`Error::OAuth`] for a non-2xx RFC 6749 §5.2 error response
-    /// (e.g. `invalid_grant`), or a transport/decode error otherwise.
+    /// (e.g. `invalid_grant`), [`Error::LimitExceeded`] if the error body
+    /// exceeds [`Limits::max_response_bytes`], or a transport/decode error
+    /// otherwise.
     pub async fn exchange_authorization_code(
         &self,
         code: &str,
@@ -916,7 +938,7 @@ impl Scoped<'_> {
             self.read_json(resp, "oauth token response").await
         } else {
             let status = resp.status();
-            let bytes = resp.bytes().await.map_err(Error::transport)?;
+            let bytes = read_bounded(resp, self.inner.limits.max_response_bytes).await?;
             Err(crate::error::oauth_error_from_status(status, &bytes))
         }
     }
@@ -930,7 +952,9 @@ impl Scoped<'_> {
     /// # Errors
     ///
     /// Returns [`Error::OAuth`] for a non-2xx RFC 6749 §5.2 error response
-    /// (e.g. `invalid_grant`), or a transport/decode error otherwise.
+    /// (e.g. `invalid_grant`), [`Error::LimitExceeded`] if the error body
+    /// exceeds [`Limits::max_response_bytes`], or a transport/decode error
+    /// otherwise.
     pub async fn refresh_access_token(
         &self,
         refresh_token: &SecretString,
@@ -953,7 +977,7 @@ impl Scoped<'_> {
             self.read_json(resp, "oauth token response").await
         } else {
             let status = resp.status();
-            let bytes = resp.bytes().await.map_err(Error::transport)?;
+            let bytes = read_bounded(resp, self.inner.limits.max_response_bytes).await?;
             Err(crate::error::oauth_error_from_status(status, &bytes))
         }
     }
