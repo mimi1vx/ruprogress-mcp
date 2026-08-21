@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::attachments::{AttachmentStore, Reservation, StoredFile};
+use crate::attachments::{AttachmentStore, Reservation, ReserveError, StoredFile};
 use crate::config::TransportConfig;
 use crate::error::to_tool_error;
 use crate::render::Boundary;
@@ -86,6 +86,16 @@ fn file_too_large(limit: u64, actual: Option<u64>) -> CallToolResult {
         message,
         Some(
             "this attachment cannot be downloaded through this server; raise ATTACHMENT_MAX_DOWNLOAD_BYTES if that is expected",
+        ),
+    )
+}
+
+fn store_full() -> CallToolResult {
+    err(
+        ErrorCode::StoreFull,
+        "the local attachment store is at capacity",
+        Some(
+            "wait for expired entries to be cleaned up, or ask the operator to raise ATTACHMENT_STORE_MAX_BYTES",
         ),
     )
 }
@@ -288,7 +298,7 @@ async fn download_and_commit(
     scoped: &redmine_client::Scoped<'_>,
     store: &AttachmentStore,
     attachment: &Attachment,
-    reservation: Reservation,
+    mut reservation: Reservation<'_>,
 ) -> Result<StoredFile, CallToolResult> {
     let (_headers, stream) = match scoped.download_attachment(&attachment.content_url).await {
         Ok(v) => v,
@@ -327,6 +337,14 @@ async fn download_and_commit(
             store.abort(&reservation).await;
             return Err(file_too_large(max_download_bytes, None));
         }
+        if written > reservation.reserved() {
+            let deficit = written.saturating_sub(reservation.reserved());
+            if !reservation.extend(deficit) {
+                drop(file);
+                store.abort(&reservation).await;
+                return Err(store_full());
+            }
+        }
         if let Err(error) = file.write_all(&chunk).await {
             tracing::error!(%error, "failed to write a downloaded attachment chunk to disk");
             drop(file);
@@ -339,9 +357,7 @@ async fn download_and_commit(
     }
     drop(file);
 
-    Ok(store
-        .commit(reservation, attachment.content_type.clone(), written)
-        .await)
+    Ok(store.commit(reservation, attachment.content_type.clone(), written))
 }
 
 fn get_redmine_attachment_output(
@@ -541,24 +557,31 @@ impl RedmineMcp {
             ));
         }
 
-        // Check store capacity before reserving; sweep once if over, then
-        // refuse rather than filling the disk.
-        if !store.has_room_for(attachment.filesize).await {
-            store.sweep_expired().await;
-            if !store.has_room_for(attachment.filesize).await {
-                return Ok(err(
-                    ErrorCode::StoreFull,
-                    "the local attachment store is at capacity",
-                    Some(
-                        "wait for expired entries to be cleaned up, or ask the operator to raise ATTACHMENT_STORE_MAX_BYTES",
-                    ),
-                ));
-            }
-        }
-
-        let reservation = match store.reserve(attachment.id, &attachment.filename).await {
+        // Reserve the declared filesize atomically against in-flight and
+        // committed bytes; on STORE_FULL sweep expired entries once and
+        // retry, mirroring the old pre-check-then-sweep behaviour.
+        let reservation = match store
+            .reserve(attachment.id, &attachment.filename, attachment.filesize)
+            .await
+        {
             Ok(r) => r,
-            Err(error) => {
+            Err(ReserveError::Full) => {
+                store.sweep_expired().await;
+                match store
+                    .reserve(attachment.id, &attachment.filename, attachment.filesize)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(ReserveError::Full) => return Ok(store_full()),
+                    Err(ReserveError::Io(error)) => {
+                        tracing::error!(%error, "failed to reserve local storage for a downloaded attachment");
+                        return Ok(local_storage_error(
+                            "allocate local storage for this download",
+                        ));
+                    }
+                }
+            }
+            Err(ReserveError::Io(error)) => {
                 tracing::error!(%error, "failed to reserve local storage for a downloaded attachment");
                 return Ok(local_storage_error(
                     "allocate local storage for this download",

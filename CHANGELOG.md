@@ -63,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status-error path, JSON decoding, and both OAuth token-exchange error
   paths. `download_attachment` remains the sole, documented exemption: it
   streams to its caller, which owns its own byte cap.
+- `get_redmine_attachment` now reserves its declared `filesize` against
+  `ATTACHMENT_STORE_MAX_BYTES` atomically, before streaming a single byte,
+  instead of only checking committed entries. Previously the check and the
+  accounting were separated by the whole download: N concurrent downloads
+  all observed the same (unchanged) committed total, all passed admission,
+  and could together write up to `N × ATTACHMENT_MAX_DOWNLOAD_BYTES` to
+  disk — enough concurrent requests could exhaust local storage regardless
+  of the configured cap. The reservation grows mid-stream if the actual
+  byte count exceeds the declared size (still bounded by
+  `ATTACHMENT_MAX_DOWNLOAD_BYTES`, so a stale `filesize` degrades to the
+  previous behaviour rather than a hard failure) and is always released —
+  on commit, abort, a mid-stream error, or a dropped/cancelled request —
+  so a refused or failed download's quota is immediately reusable.
 
 ## [0.1.0] - 2026-08-19
 

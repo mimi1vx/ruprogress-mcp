@@ -19,13 +19,12 @@ use crate::tools::output::{self, ErrorCode};
 /// # SAFETY (`AssertUnwindSafe`)
 ///
 /// The state reachable from a panic mid-call is: an immutable `Config`, a
-/// `reqwest` connection pool, two `tokio::sync::Mutex`es
-/// (`attachments.rs`/`health.rs` — no poisoning, the guard is simply
-/// released on unwind), and one `std::sync::Mutex` (`auth/oauth.rs`) whose
-/// every `lock()` call already recovers with `PoisonError::into_inner`. None
-/// of that can be left in a state this assertion doesn't already account
-/// for; re-check this list before adding a new shared mutable field to
-/// `RedmineMcp`.
+/// `reqwest` connection pool, one `tokio::sync::Mutex` (`health.rs` — no
+/// poisoning, the guard is simply released on unwind), and `std::sync::Mutex`
+/// fields (`attachments.rs`, `auth/oauth.rs`) whose every `lock()` call
+/// already recovers with `PoisonError::into_inner`. None of that can be left
+/// in a state this assertion doesn't already account for; re-check this list
+/// before adding a new shared mutable field to `RedmineMcp`.
 pub(crate) async fn catch_tool_panic<F>(tool: &str, fut: F) -> Result<CallToolResponse, McpError>
 where
     F: Future<Output = Result<CallToolResponse, McpError>>,

@@ -10,9 +10,9 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
@@ -47,16 +47,101 @@ pub struct StoredFile {
     created_at: Instant,
 }
 
+/// Owns `bytes` of `max_store_bytes` quota, counted against `Inner::in_flight`.
+/// Released back to the store on drop unless [`QuotaGuard::disarm`] has run —
+/// this is what makes every exit from a download (success, error, early
+/// `return`, panic, or a dropped/cancelled future) give the quota back
+/// without every call site having to remember to.
+#[derive(Debug)]
+struct QuotaGuard<'a> {
+    store: &'a AttachmentStore,
+    bytes: u64,
+    armed: bool,
+}
+
+impl QuotaGuard<'_> {
+    /// Grows the reservation by `additional` bytes if the store still has
+    /// room; otherwise leaves it unchanged. Same admission rule as
+    /// [`AttachmentStore::try_reserve`], re-checked under the same lock.
+    fn extend(&mut self, additional: u64) -> bool {
+        let mut inner = self.store.lock();
+        let committed = AttachmentStore::committed_locked(&inner);
+        let projected = committed
+            .saturating_add(inner.in_flight)
+            .saturating_add(additional);
+        if projected > self.store.max_store_bytes {
+            return false;
+        }
+        inner.in_flight = inner.in_flight.saturating_add(additional);
+        self.bytes = self.bytes.saturating_add(additional);
+        true
+    }
+
+    /// Marks the guard as already accounted for elsewhere (by `commit`,
+    /// under its own lock acquisition), so `Drop` does not also release it.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QuotaGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut inner = self.store.lock();
+        inner.in_flight = inner.in_flight.saturating_sub(self.bytes);
+    }
+}
+
 /// A reserved-but-not-yet-registered download slot: the UUID directory has
 /// been created and the sanitised destination path chosen, but nothing has
 /// been written yet. The caller streams bytes to `path`, then calls
 /// [`AttachmentStore::commit`] on success or [`AttachmentStore::abort`] on
-/// failure or a mid-stream cap trip.
+/// failure or a mid-stream cap trip — either way, dropping the reservation
+/// (via `commit` consuming it, or the caller's own scope exit) is what
+/// releases the quota held by `quota`.
 #[derive(Debug)]
-pub struct Reservation {
+pub struct Reservation<'a> {
     pub uuid: Uuid,
     pub attachment_id: u64,
     pub path: PathBuf,
+    quota: QuotaGuard<'a>,
+}
+
+impl Reservation<'_> {
+    /// How many bytes of store quota this reservation currently holds.
+    #[must_use]
+    pub fn reserved(&self) -> u64 {
+        self.quota.bytes
+    }
+
+    /// Grows the reservation to cover `additional` more bytes than declared
+    /// at `reserve` time — the deficit when a download streams more than
+    /// Redmine's advertised `filesize`. Returns `false` if the store has no
+    /// room, in which case the caller should abort.
+    pub fn extend(&mut self, additional: u64) -> bool {
+        self.quota.extend(additional)
+    }
+}
+
+/// Failure modes for [`AttachmentStore::reserve`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReserveError {
+    #[error("the local attachment store is at capacity")]
+    Full,
+    #[error("failed to allocate local storage for a reservation: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// The mutable state behind one lock: committed entries plus the bytes
+/// currently reserved for in-flight downloads. Sharing one lock for both
+/// counts is what makes admission atomic — a `reserve` and a `commit` can
+/// never interleave to momentarily under-count either total.
+#[derive(Debug, Default)]
+struct Inner {
+    entries: HashMap<Uuid, StoredFile>,
+    in_flight: u64,
 }
 
 /// Result of a sweep pass, used by the background sweeper and by
@@ -140,7 +225,7 @@ pub struct AttachmentStore {
     expires_after: Duration,
     max_download_bytes: u64,
     max_store_bytes: u64,
-    entries: Mutex<HashMap<Uuid, StoredFile>>,
+    inner: Mutex<Inner>,
 }
 
 impl AttachmentStore {
@@ -164,7 +249,7 @@ impl AttachmentStore {
             expires_after: config.expires_after,
             max_download_bytes: config.max_download_bytes,
             max_store_bytes: config.store_max_bytes,
-            entries: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
         })
     }
 
@@ -178,32 +263,61 @@ impl AttachmentStore {
         self.max_download_bytes
     }
 
-    /// Sum of every currently-tracked entry's size. Cheap: reads the
-    /// in-memory map, never the filesystem.
-    pub async fn total_bytes(&self) -> u64 {
-        self.entries.lock().await.values().map(|e| e.size).sum()
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `additional_bytes` more would still fit under
-    /// `ATTACHMENT_STORE_MAX_BYTES`. Callers should sweep expired
-    /// entries first if this returns `false`, then re-check before refusing
-    /// with `STORE_FULL`.
-    pub async fn has_room_for(&self, additional_bytes: u64) -> bool {
-        self.total_bytes().await.saturating_add(additional_bytes) <= self.max_store_bytes
+    fn committed_locked(inner: &Inner) -> u64 {
+        inner.entries.values().map(|e| e.size).sum()
     }
 
-    /// Allocates a fresh UUID directory and a sanitised destination path
-    /// inside it. Does not create or write the file itself — the caller
-    /// streams bytes to [`Reservation::path`].
+    /// Sum of every currently-*committed* entry's size — cheap, reads the
+    /// in-memory map, never the filesystem. Admission (`reserve`/`extend`)
+    /// also counts bytes reserved for in-flight downloads, which this does
+    /// not include.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        Self::committed_locked(&self.lock())
+    }
+
+    /// Atomically admits `bytes` against `committed + in_flight <=
+    /// max_store_bytes`, returning a guard that holds the reservation until
+    /// [`QuotaGuard::disarm`] (via `commit`) or `Drop` releases it.
+    fn try_reserve(&self, bytes: u64) -> Option<QuotaGuard<'_>> {
+        let mut inner = self.lock();
+        let committed = Self::committed_locked(&inner);
+        let projected = committed
+            .saturating_add(inner.in_flight)
+            .saturating_add(bytes);
+        if projected > self.max_store_bytes {
+            return None;
+        }
+        inner.in_flight = inner.in_flight.saturating_add(bytes);
+        Some(QuotaGuard {
+            store: self,
+            bytes,
+            armed: true,
+        })
+    }
+
+    /// Reserves `bytes` of store quota, then allocates a fresh UUID
+    /// directory and a sanitised destination path inside it. Does not
+    /// create or write the file itself — the caller streams bytes to
+    /// [`Reservation::path`], extending the reservation via
+    /// [`Reservation::extend`] if the stream turns out to exceed `bytes`.
     ///
     /// # Errors
     ///
-    /// Fails if the UUID directory cannot be created.
+    /// `ReserveError::Full` if the store has no room for `bytes`;
+    /// `ReserveError::Io` if the UUID directory cannot be created — in
+    /// either case, no quota is left held.
     pub async fn reserve(
         &self,
         attachment_id: u64,
         redmine_filename: &str,
-    ) -> std::io::Result<Reservation> {
+        bytes: u64,
+    ) -> Result<Reservation<'_>, ReserveError> {
+        let quota = self.try_reserve(bytes).ok_or(ReserveError::Full)?;
         let uuid = Uuid::new_v4();
         let entry_dir = self.dir.join(uuid.to_string());
         tokio::fs::create_dir_all(&entry_dir).await?;
@@ -213,18 +327,26 @@ impl AttachmentStore {
             uuid,
             attachment_id,
             path,
+            quota,
         })
     }
 
     /// Registers a completed download, making it fetchable via [`Self::get`].
-    pub async fn commit(
+    /// Accounts the bytes actually written (`size`), not the reservation's
+    /// declared size, and releases any unused portion of the reservation.
+    pub fn commit(
         &self,
-        reservation: Reservation,
+        reservation: Reservation<'_>,
         content_type: Option<String>,
         size: u64,
     ) -> StoredFile {
-        let filename = reservation
-            .path
+        let Reservation {
+            uuid,
+            attachment_id,
+            path,
+            quota,
+        } = reservation;
+        let filename = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("attachment")
@@ -234,25 +356,29 @@ impl AttachmentStore {
             .checked_add_signed(ttl)
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
         let stored = StoredFile {
-            uuid: reservation.uuid,
-            attachment_id: reservation.attachment_id,
+            uuid,
+            attachment_id,
             filename,
             content_type,
             size,
-            path: reservation.path,
+            path,
             expires_at,
             created_at: Instant::now(),
         };
-        self.entries
-            .lock()
-            .await
-            .insert(stored.uuid, stored.clone());
+        {
+            let mut inner = self.lock();
+            inner.entries.insert(stored.uuid, stored.clone());
+            inner.in_flight = inner.in_flight.saturating_sub(quota.bytes);
+        }
+        quota.disarm();
         stored
     }
 
     /// Discards a reservation that will never be committed (a mid-stream cap
-    /// trip or a write error), removing the whole UUID directory.
-    pub async fn abort(&self, reservation: &Reservation) {
+    /// trip or a write error), removing the whole UUID directory. The quota
+    /// itself is released by the reservation's own `Drop` when the caller's
+    /// `Reservation` goes out of scope — not by this call.
+    pub async fn abort(&self, reservation: &Reservation<'_>) {
         if let Some(entry_dir) = reservation.path.parent() {
             let _ = tokio::fs::remove_dir_all(entry_dir).await;
         }
@@ -262,15 +388,17 @@ impl AttachmentStore {
     /// one whose TTL has passed — the latter case removes the entry
     /// (map and disk) immediately rather than waiting for the sweeper.
     pub async fn get(&self, id: Uuid) -> Option<StoredFile> {
-        let mut entries = self.entries.lock().await;
-        let expired = entries
-            .get(&id)
-            .is_some_and(|e| e.created_at.elapsed() >= self.expires_after);
-        if !expired {
-            return entries.get(&id).cloned();
-        }
-        let removed = entries.remove(&id);
-        drop(entries);
+        let removed = {
+            let mut inner = self.lock();
+            let expired = inner
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.created_at.elapsed() >= self.expires_after);
+            if !expired {
+                return inner.entries.get(&id).cloned();
+            }
+            inner.entries.remove(&id)
+        };
         if let Some(removed) = removed
             && let Some(entry_dir) = removed.path.parent()
         {
@@ -341,9 +469,9 @@ impl AttachmentStore {
         }
 
         if !expired_uuids.is_empty() {
-            let mut entries = self.entries.lock().await;
+            let mut inner = self.lock();
             for uuid in expired_uuids {
-                entries.remove(&uuid);
+                inner.entries.remove(&uuid);
             }
         }
         result
@@ -459,12 +587,10 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let store = AttachmentStore::init(&test_config(&dir)).unwrap();
 
-        let reservation = store.reserve(42, "report.pdf").await.unwrap();
+        let reservation = store.reserve(42, "report.pdf", 5).await.unwrap();
         tokio::fs::write(&reservation.path, b"hello").await.unwrap();
         let uuid = reservation.uuid;
-        let stored = store
-            .commit(reservation, Some("application/pdf".to_string()), 5)
-            .await;
+        let stored = store.commit(reservation, Some("application/pdf".to_string()), 5);
         assert_eq!(stored.filename, "report.pdf");
         assert_eq!(stored.attachment_id, 42);
 
@@ -487,7 +613,7 @@ mod tests {
             "..\\..\\windows\\system32",
             "a\0b",
         ] {
-            let reservation = store.reserve(1, hostile).await.unwrap();
+            let reservation = store.reserve(1, hostile, 1).await.unwrap();
             assert!(
                 reservation.path.starts_with(&dir),
                 "{hostile:?} escaped the attachments directory: {}",
@@ -515,11 +641,11 @@ mod tests {
         let dir = temp_dir("lazy-expiry");
         let store = AttachmentStore::init(&test_config(&dir)).unwrap();
 
-        let reservation = store.reserve(1, "f.txt").await.unwrap();
+        let reservation = store.reserve(1, "f.txt", 1).await.unwrap();
         tokio::fs::write(&reservation.path, b"x").await.unwrap();
         let uuid = reservation.uuid;
         let entry_dir = reservation.path.parent().unwrap().to_path_buf();
-        store.commit(reservation, None, 1).await;
+        store.commit(reservation, None, 1);
 
         // expires_after is 50ms in test_config; outlast it without relying
         // on the (much longer, interval-based) sweeper.
@@ -539,7 +665,7 @@ mod tests {
         let dir = temp_dir("abort");
         let store = AttachmentStore::init(&test_config(&dir)).unwrap();
 
-        let reservation = store.reserve(1, "f.txt").await.unwrap();
+        let reservation = store.reserve(1, "f.txt", 7).await.unwrap();
         tokio::fs::write(&reservation.path, b"partial")
             .await
             .unwrap();
@@ -589,10 +715,10 @@ mod tests {
     async fn sweep_leaves_a_fresh_directory_alone() {
         let dir = temp_dir("fresh-sweep");
         let store = AttachmentStore::init(&test_config(&dir)).unwrap();
-        let reservation = store.reserve(1, "f.txt").await.unwrap();
+        let reservation = store.reserve(1, "f.txt", 1).await.unwrap();
         tokio::fs::write(&reservation.path, b"x").await.unwrap();
         let uuid = reservation.uuid;
-        store.commit(reservation, None, 1).await;
+        store.commit(reservation, None, 1);
 
         let result = store.sweep_expired().await;
         assert_eq!(result.removed_files, 0);
@@ -602,26 +728,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn total_bytes_and_has_room_for_reflect_committed_entries() {
-        let dir = temp_dir("capacity");
+    async fn an_in_flight_reservation_blocks_a_second_one_that_would_not_fit() {
+        let dir = temp_dir("in-flight-blocks");
         let mut config = test_config(&dir);
         config.store_max_bytes = 100;
         let store = AttachmentStore::init(&config).unwrap();
 
-        assert_eq!(store.total_bytes().await, 0);
-        assert!(store.has_room_for(100).await);
-        assert!(!store.has_room_for(101).await);
+        let first = store.reserve(1, "a.txt", 60).await.unwrap();
+        assert_eq!(store.total_bytes(), 0, "nothing is committed yet");
 
-        let reservation = store.reserve(1, "f.txt").await.unwrap();
+        let second = store.reserve(2, "b.txt", 41).await;
+        assert!(
+            matches!(second, Err(ReserveError::Full)),
+            "60 in-flight + 41 more exceeds the 100-byte cap"
+        );
+
+        drop(first);
+        let third = store.reserve(2, "b.txt", 41).await;
+        assert!(
+            third.is_ok(),
+            "dropping the first reservation should free its quota"
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn abort_also_frees_the_reservation_for_reuse() {
+        let dir = temp_dir("abort-frees");
+        let mut config = test_config(&dir);
+        config.store_max_bytes = 50;
+        let store = AttachmentStore::init(&config).unwrap();
+
+        let reservation = store.reserve(1, "a.txt", 50).await.unwrap();
+        assert!(store.reserve(2, "b.txt", 1).await.is_err());
+
+        store.abort(&reservation).await;
+        drop(reservation);
+
+        assert!(store.reserve(2, "b.txt", 50).await.is_ok());
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn commit_with_fewer_bytes_than_reserved_releases_the_surplus() {
+        let dir = temp_dir("commit-surplus");
+        let mut config = test_config(&dir);
+        config.store_max_bytes = 100;
+        let store = AttachmentStore::init(&config).unwrap();
+
+        let reservation = store.reserve(1, "a.txt", 100).await.unwrap();
         tokio::fs::write(&reservation.path, vec![0u8; 60])
             .await
             .unwrap();
-        store.commit(reservation, None, 60).await;
+        store.commit(reservation, None, 60);
 
-        assert_eq!(store.total_bytes().await, 60);
-        assert!(store.has_room_for(40).await);
-        assert!(!store.has_room_for(41).await);
+        assert_eq!(store.total_bytes(), 60);
+        let second = store.reserve(2, "b.txt", 40).await;
+        assert!(second.is_ok(), "the unused 40 bytes should be reusable");
 
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn extend_succeeds_under_the_cap_and_fails_at_it() {
+        let dir = temp_dir("extend");
+        let mut config = test_config(&dir);
+        config.store_max_bytes = 100;
+        let store = AttachmentStore::init(&config).unwrap();
+
+        let mut reservation = store.reserve(1, "a.txt", 60).await.unwrap();
+        assert!(reservation.extend(40), "60 + 40 == 100, exactly at the cap");
+        assert_eq!(reservation.reserved(), 100);
+        assert!(!reservation.extend(1), "60 + 40 + 1 exceeds the cap");
+        assert_eq!(
+            reservation.reserved(),
+            100,
+            "a failed extend must not partially apply"
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_reservation_is_still_bounded_by_extend() {
+        let dir = temp_dir("zero-byte");
+        let mut config = test_config(&dir);
+        config.store_max_bytes = 10;
+        let store = AttachmentStore::init(&config).unwrap();
+
+        // A legitimate empty attachment: filesize 0 reserves nothing, but
+        // once the store is otherwise full, extend() must still refuse.
+        let _holder = store.reserve(1, "hold.bin", 10).await.unwrap();
+        let mut empty = store.reserve(2, "empty.bin", 0).await.unwrap();
+        assert!(!empty.extend(1), "the store has no room for even 1 byte");
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_reservation_whose_mkdir_fails_leaves_no_quota_held() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("mkdir-fails");
+        let mut config = test_config(&dir);
+        config.store_max_bytes = 100;
+        let store = AttachmentStore::init(&config).unwrap();
+        // Strip write permission so creating a uuid subdirectory fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = store.reserve(1, "a.txt", 50).await;
+        assert!(matches!(result, Err(ReserveError::Io(_))));
+        assert_eq!(
+            store.lock().in_flight,
+            0,
+            "a failed reserve must not leak quota"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
 

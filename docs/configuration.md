@@ -148,7 +148,7 @@ transport) or an absolute `file_path` (stdio transport).
 |---|---|---|---|
 | `ATTACHMENTS_DIR` | no | `{temp_dir}/ruprogress-mcp-attachments` | Created `0700` on Unix at startup; a `WARN` is logged on other platforms, where permissions rely on inherited ACLs. Per-installation, not per-process, so a restarted process can still reap a predecessor's files. |
 | `ATTACHMENT_MAX_DOWNLOAD_BYTES` | no | `209715200` (200 MiB) | Positive integer. The per-file cap. |
-| `ATTACHMENT_STORE_MAX_BYTES` | no | `2147483648` (2 GiB) | Positive integer. The whole-store cap. Must be `>=` `ATTACHMENT_MAX_DOWNLOAD_BYTES`, or a startup `Conflict` — a smaller store cap would mean no single download could ever fit. |
+| `ATTACHMENT_STORE_MAX_BYTES` | no | `2147483648` (2 GiB) | Positive integer. The whole-store cap. Must be `>=` `ATTACHMENT_MAX_DOWNLOAD_BYTES`, or a startup `Conflict` — a smaller store cap would mean no single download could ever fit. Counts bytes reserved for in-flight downloads as well as committed ones, so a burst of concurrent downloads that would together exceed this cap now gets `STORE_FULL` on the excess requests instead of overshooting it. |
 | `AUTO_CLEANUP_ENABLED` | no | `true` | Whether the background sweeper task runs at all. |
 | `CLEANUP_INTERVAL_MINUTES` | no | `15` | Positive integer. How often the sweeper runs. |
 | `ATTACHMENT_EXPIRES_MINUTES` | no | `60` | Positive integer. How long a stored file stays fetchable. Checked on every lookup (not just by the interval sweeper), so an expired file is refused immediately rather than up to `CLEANUP_INTERVAL_MINUTES` late. |

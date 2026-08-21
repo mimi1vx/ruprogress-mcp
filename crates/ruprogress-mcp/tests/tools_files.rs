@@ -212,6 +212,107 @@ async fn store_full_refuses_a_download_that_would_exceed_the_store_cap() {
 }
 
 #[tokio::test]
+async fn concurrent_downloads_cannot_together_exceed_the_store_cap() {
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!(
+        "ruprogress-mcp-test-files-concurrent-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let dir_str = dir.to_string_lossy().into_owned();
+    let h = support::harness(&[
+        ("ATTACHMENTS_DIR", dir_str.as_str()),
+        ("ATTACHMENT_MAX_DOWNLOAD_BYTES", "500"),
+        ("ATTACHMENT_STORE_MAX_BYTES", "500"),
+    ])
+    .await;
+
+    // attachment 1's own download body is deliberately slow, so its
+    // reservation stays uncommitted for the whole window attachment 2's
+    // call runs in — proving admission counts in-flight bytes, not just
+    // committed ones.
+    let content_url_1 = format!("{}/attachments/download/1/first.bin", h.redmine.uri());
+    Mock::given(method("GET"))
+        .and(path("/attachments/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachment": {
+                "id": 1, "filename": "first.bin", "filesize": 300,
+                "content_url": content_url_1,
+                "created_on": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/download/1/first.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(400))
+                .set_body_bytes(vec![1u8; 300]),
+        )
+        .mount(&h.redmine)
+        .await;
+    mock_attachment(&h.redmine, 2, "second.bin", 300, &[2u8; 300]).await;
+
+    let (first, second) = tokio::join!(
+        call(&h, json!({"attachment_id": 1})),
+        call(&h, json!({"attachment_id": 2}))
+    );
+
+    let successes = [&first, &second]
+        .into_iter()
+        .filter(|r| r.is_error == Some(false))
+        .count();
+    assert_eq!(
+        successes, 1,
+        "exactly one of the two concurrent downloads should fit under the cap"
+    );
+    let failed = if first.is_error == Some(true) {
+        &first
+    } else {
+        &second
+    };
+    assert_eq!(
+        failed
+            .structured_content
+            .as_ref()
+            .expect("structured error")["code"],
+        "STORE_FULL"
+    );
+
+    let remaining = std::fs::read_dir(&dir).map_or(0, Iterator::count);
+    assert_eq!(
+        remaining, 1,
+        "only the successful download's uuid directory should remain"
+    );
+}
+
+#[tokio::test]
+async fn quota_is_reusable_after_an_aborted_download() {
+    let h = support::harness(&[
+        ("ATTACHMENT_MAX_DOWNLOAD_BYTES", "3"),
+        ("ATTACHMENT_STORE_MAX_BYTES", "3"),
+    ])
+    .await;
+    // Declared 3 bytes (fits the whole store), actual stream 50 bytes: the
+    // download cap trips first and the reservation is aborted.
+    mock_attachment(&h.redmine, 1, "sneaky.bin", 3, &[0u8; 50]).await;
+    let first = call(&h, json!({"attachment_id": 1})).await;
+    assert_eq!(first.is_error, Some(true));
+    assert_eq!(
+        first.structured_content.expect("structured error")["code"],
+        "FILE_TOO_LARGE"
+    );
+
+    // A second, honest same-size download must still fit exactly — if the
+    // aborted reservation's quota had leaked, this would be STORE_FULL.
+    mock_attachment(&h.redmine, 2, "clean.bin", 3, b"abc").await;
+    let second = call(&h, json!({"attachment_id": 2})).await;
+    assert_eq!(second.is_error, Some(false));
+}
+
+#[tokio::test]
 async fn a_404_from_redmine_surfaces_as_not_found() {
     let h = support::harness(&[]).await;
     Mock::given(method("GET"))

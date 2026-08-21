@@ -35,7 +35,7 @@ async fn a_stored_file_is_served_with_the_expected_headers() {
     let harness = support::http_harness(&[]).await;
     let reservation = harness
         .attachments
-        .reserve(7, "../../etc/report.pdf")
+        .reserve(7, "../../etc/report.pdf", 9)
         .await
         .expect("reserve should succeed");
     tokio::fs::write(&reservation.path, b"pdf-bytes")
@@ -44,8 +44,7 @@ async fn a_stored_file_is_served_with_the_expected_headers() {
     let uuid = reservation.uuid;
     harness
         .attachments
-        .commit(reservation, Some("application/pdf".to_string()), 9)
-        .await;
+        .commit(reservation, Some("application/pdf".to_string()), 9);
 
     let response = client()
         .get(harness.url(&format!("/files/{uuid}")))
@@ -91,7 +90,7 @@ async fn a_hostile_content_type_falls_back_to_octet_stream() {
     let harness = support::http_harness(&[]).await;
     let reservation = harness
         .attachments
-        .reserve(1, "f.bin")
+        .reserve(1, "f.bin", 1)
         .await
         .expect("reserve should succeed");
     tokio::fs::write(&reservation.path, b"x")
@@ -101,8 +100,7 @@ async fn a_hostile_content_type_falls_back_to_octet_stream() {
     // A CRLF-bearing content type could not form a valid header value.
     harness
         .attachments
-        .commit(reservation, Some("text/plain\r\nX-Evil: 1".to_string()), 1)
-        .await;
+        .commit(reservation, Some("text/plain\r\nX-Evil: 1".to_string()), 1);
 
     let response = client()
         .get(harness.url(&format!("/files/{uuid}")))
@@ -129,7 +127,7 @@ async fn a_removed_entry_is_404_through_the_route() {
     let harness = support::http_harness(&[]).await;
     let reservation = harness
         .attachments
-        .reserve(1, "f.txt")
+        .reserve(1, "f.txt", 1)
         .await
         .expect("reserve should succeed");
     tokio::fs::write(&reservation.path, b"x")
@@ -152,14 +150,14 @@ async fn a_disallowed_host_header_is_403() {
     let harness = support::http_harness(&[]).await;
     let reservation = harness
         .attachments
-        .reserve(1, "f.txt")
+        .reserve(1, "f.txt", 1)
         .await
         .expect("reserve should succeed");
     tokio::fs::write(&reservation.path, b"x")
         .await
         .expect("write");
     let uuid = reservation.uuid;
-    harness.attachments.commit(reservation, None, 1).await;
+    harness.attachments.commit(reservation, None, 1);
 
     let response = client()
         .get(harness.url(&format!("/files/{uuid}")))
