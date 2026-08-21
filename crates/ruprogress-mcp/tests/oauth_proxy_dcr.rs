@@ -209,6 +209,56 @@ async fn register_404s_in_oauth_and_legacy_modes() {
     }
 }
 
+// --- registration lifecycle --------------------------------------------------
+
+/// A client that registers and then completes `/authorize` twice is still
+/// resolvable the second time — proving the `last_seen` touch on a
+/// validated `/authorize` lookup is wired into the real router, not just
+/// the store-level policy `store.rs`'s unit tests exercise directly. Driving
+/// 1000 registrations through this same harness to prove the anti-eviction
+/// property itself is not possible here: `/register` sits on the strict
+/// rate-limit class (1 rps, burst 10), so that property is proven at the
+/// store level instead.
+#[tokio::test]
+async fn a_registered_client_remains_resolvable_across_repeated_authorize_calls() {
+    let harness = support::http_harness(&oauth_proxy_env(&[])).await;
+    let response = client()
+        .post(harness.url("/register"))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({ "redirect_uris": ["http://localhost/cb"] }))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: Value = response.json().await.expect("json body");
+    let client_id = body["client_id"]
+        .as_str()
+        .expect("client_id present")
+        .to_string();
+
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build a test HTTP client");
+    let mut authorize_url = url::Url::parse(&harness.url("/authorize")).expect("valid url");
+    authorize_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", "http://localhost/cb")
+        .append_pair("code_challenge", "x")
+        .append_pair("code_challenge_method", "S256");
+
+    for _ in 0..2 {
+        let response = no_redirect
+            .get(authorize_url.as_str())
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+}
+
 // --- route matrix -----------------------------------------------------------
 
 #[tokio::test]

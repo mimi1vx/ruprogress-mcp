@@ -218,8 +218,7 @@ async fn register(State(state): State<RegisterState>, request: Request) -> Respo
 
     let Some(registration) = state
         .proxy
-        .registry
-        .register(payload.redirect_uris.clone(), payload.client_name.clone())
+        .register_client(payload.redirect_uris.clone(), payload.client_name.clone())
     else {
         let mut response = no_store(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -388,6 +387,10 @@ fn authorize_phase_a(
         .registry
         .get(&client_id)
         .ok_or("client_id is not a registered client")?;
+    // Any caller that can name a valid client_id may keep it alive, which
+    // is the safe direction — this runs before redirect_uri is even
+    // checked.
+    state.proxy.registry.touch(&client_id);
     let redirect_uri = query
         .redirect_uri
         .clone()
@@ -848,6 +851,9 @@ fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>)
             token_error(StatusCode::BAD_REQUEST, "invalid_grant")
         }
         RedeemOutcome::Ok(upstream) => {
+            // `redeem`'s Ok variant already validated the client binding,
+            // so this use is trusted.
+            state.proxy.registry.touch(client_id);
             sweep_expired_sessions(state);
             let ttl = upstream
                 .expires_at
@@ -927,6 +933,8 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
         // wrong `client_id` does not need to lock the token out.
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
+    // The client binding is now validated, so this use is trusted.
+    state.proxy.registry.touch(&bound_client_id);
 
     let Some(old_refresh_secret) = state.proxy.upstream_tokens.refresh_token(&upstream_id) else {
         // The session died between `redeem` and here (e.g. a concurrent

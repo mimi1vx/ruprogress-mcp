@@ -5,7 +5,7 @@
 //! the lock across it (never across an `.await`, F12) is the right call
 //! rather than an async lock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -27,19 +27,23 @@ pub(crate) struct ClientRegistration {
 
 struct Entry {
     registration: ClientRegistration,
-    /// Touched at registration, and (once `/authorize` and `/token` exist)
-    /// on every use — the basis [`ClientRegistry::register`]'s eviction
-    /// picks the least-recently-used *idle* entry from.
+    /// Touched at registration and on every validated use (`/authorize`,
+    /// an `authorization_code` redemption, a `refresh_token` grant) — the
+    /// idle clock [`ClientRegistry::register`]'s capacity sweep measures
+    /// against [`CLIENT_IDLE_TTL`].
     last_seen: Instant,
-    /// Whether this client holds a live token. Always `false` today (no
-    /// token can exist without `/token`); the field exists now so eviction
-    /// already prefers idle registrations once tokens do.
-    live: bool,
 }
 
 /// Hard cap on registrations (P8, C8): an unauthenticated endpoint that
 /// allocates on every call must not be an unbounded allocator.
 const MAX_CLIENTS: usize = 1000;
+
+/// How long a registration may sit idle (no `/authorize`, code redemption,
+/// or refresh use) before it becomes reclaimable under capacity pressure.
+/// Comfortably above [`TRANSACTION_TTL`], so a registration
+/// mid-authorization is never at risk; caps an attacker-driven `/register`
+/// lockout of a given `client_id` at an hour.
+const CLIENT_IDLE_TTL: Duration = Duration::from_hours(1);
 
 /// Bounded DCR client registry. `Debug` prints counts, never a registration's
 /// contents (a redirect URI list is operator-configured-adjacent data, not a
@@ -89,17 +93,34 @@ impl ClientRegistry {
         Some(id)
     }
 
-    /// Registers a new client. `None` means the store is full of live
-    /// registrations, or `OsRng` failed (C8) — the caller turns either into
-    /// a `503` with `Retry-After`.
+    /// Registers a new client. `live` is the union of every `client_id`
+    /// currently holding an unexpired proxy access or refresh token
+    /// ([`TokenStore::live_client_ids`], [`RefreshStore::live_client_ids`]),
+    /// built by the caller ([`ProxyState::register_client`]) before this
+    /// lock is taken. `None` means the store is still full once reclaimable
+    /// entries are swept, or `OsRng` failed (C8) — the caller turns either
+    /// into a `503` with `Retry-After`.
     pub(crate) fn register(
         &self,
         redirect_uris: Vec<String>,
         client_name: Option<String>,
+        live: &HashSet<String>,
     ) -> Option<ClientRegistration> {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.len() >= MAX_CLIENTS {
-            Self::evict_idle(&mut inner);
+            let now = Instant::now();
+            let before = inner.len();
+            inner.retain(|client_id, entry| {
+                live.contains(client_id)
+                    || now.saturating_duration_since(entry.last_seen) < CLIENT_IDLE_TTL
+            });
+            if inner.len() < before {
+                tracing::debug!(
+                    len = inner.len(),
+                    capacity = MAX_CLIENTS,
+                    "swept idle DCR client registrations to make room"
+                );
+            }
         }
         if inner.len() >= MAX_CLIENTS {
             return None;
@@ -115,29 +136,9 @@ impl ClientRegistry {
             Entry {
                 registration: registration.clone(),
                 last_seen: Instant::now(),
-                live: false,
             },
         );
         Some(registration)
-    }
-
-    /// Evicts the least-recently-used entry with no live token, if any.
-    /// Degrades gracefully: if every entry is live, this is a no-op and
-    /// [`Self::register`] reports the store full.
-    fn evict_idle(inner: &mut HashMap<String, Entry>) {
-        let victim = inner
-            .iter()
-            .filter(|(_, entry)| !entry.live)
-            .min_by_key(|(_, entry)| entry.last_seen)
-            .map(|(client_id, _)| client_id.clone());
-        if let Some(client_id) = victim {
-            inner.remove(&client_id);
-            tracing::debug!(
-                len = inner.len(),
-                capacity = MAX_CLIENTS,
-                "evicted an idle DCR client registration to make room"
-            );
-        }
     }
 
     #[allow(
@@ -153,15 +154,32 @@ impl ClientRegistry {
             .map(|entry| entry.registration.clone())
     }
 
-    #[cfg(test)]
-    fn set_live(&self, client_id: &str, live: bool) {
+    /// Marks `client_id` as used just now, resetting the idle clock
+    /// [`Self::register`]'s capacity sweep measures against. A no-op if the
+    /// client is unknown.
+    pub(crate) fn touch(&self, client_id: &str) {
         if let Some(entry) = self
             .inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get_mut(client_id)
         {
-            entry.live = live;
+            entry.last_seen = Instant::now();
+        }
+    }
+
+    /// Moves `client_id`'s `last_seen` backwards by `by`, so a test can age
+    /// an entry past [`CLIENT_IDLE_TTL`] without waiting an hour — the same
+    /// shape as the `set_live` seam this replaces.
+    #[cfg(test)]
+    fn rewind(&self, client_id: &str, by: Duration) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(client_id)
+        {
+            entry.last_seen = entry.last_seen.checked_sub(by).unwrap_or(entry.last_seen);
         }
     }
 
@@ -687,11 +705,6 @@ impl CodeStore {
 
 pub(crate) struct TokenEntry {
     pub(crate) upstream_id: String,
-    #[allow(
-        dead_code,
-        reason = "carried for a future scope-mismatch diagnostic; enforcement reads \
-                  introspection (P9), not this field"
-    )]
     pub(crate) client_id: String,
 }
 
@@ -798,6 +811,22 @@ impl TokenStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (entry, _)| entry.upstream_id != upstream_id);
+    }
+
+    /// Every `client_id` with a currently unexpired proxy access token:
+    /// half of the anti-eviction live set
+    /// [`ProxyState::register_client`] passes to [`ClientRegistry::register`].
+    /// Read-only — an expired entry is left in place for its own resolve
+    /// path or sweep to remove, not evicted from here.
+    pub(crate) fn live_client_ids(&self) -> HashSet<String> {
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(entry, _)| entry.client_id.clone())
+            .collect()
     }
 }
 
@@ -1049,6 +1078,23 @@ impl RefreshStore {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (owner, _)| owner.upstream_id != upstream_id);
     }
+
+    /// Every `client_id` with a currently unexpired *active* refresh token:
+    /// the other half of the anti-eviction live set
+    /// [`ProxyState::register_client`] passes to [`ClientRegistry::register`].
+    /// Reads `current` only — a `retired` digest carries no `client_id` and
+    /// a rotated-away token is not a live session; the session is
+    /// represented by its current refresh entry.
+    pub(crate) fn live_client_ids(&self) -> HashSet<String> {
+        let now = Instant::now();
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(owner, _)| owner.client_id.clone())
+            .collect()
+    }
 }
 
 // --- the bundle shared by every oauth-proxy route and `get_mcp_server_info` (R7) ---
@@ -1077,6 +1123,24 @@ impl ProxyState {
             upstream_tokens: UpstreamStore::new(),
             refresh_tokens: RefreshStore::new(),
         }
+    }
+
+    /// Registers a new DCR client: builds the union of every `client_id`
+    /// currently holding a live proxy access or refresh token
+    /// *before* the registry's own lock is taken, then delegates to
+    /// [`ClientRegistry::register`] — each store's lock is released before
+    /// the next is acquired, so no lock here is ever held across another.
+    /// `None` means the registry is full even after sweeping reclaimable
+    /// entries, or `OsRng` failed (C8); the caller turns either into a
+    /// `503` with `Retry-After`.
+    pub(crate) fn register_client(
+        &self,
+        redirect_uris: Vec<String>,
+        client_name: Option<String>,
+    ) -> Option<ClientRegistration> {
+        let mut live = self.tokens.live_client_ids();
+        live.extend(self.refresh_tokens.live_client_ids());
+        self.registry.register(redirect_uris, client_name, &live)
     }
 
     /// Removes the session `upstream_id` names, along with every proxy
@@ -1124,11 +1188,18 @@ impl ProxyState {
 mod tests {
     use super::*;
 
+    /// No live tokens in any of these tests: an empty set stands in for
+    /// [`ProxyState::register_client`]'s union whenever a test only cares
+    /// about the idle-TTL half of the policy.
+    fn no_live() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn register_returns_a_32_char_hex_client_id() {
         let registry = ClientRegistry::new();
         let registration = registry
-            .register(vec!["http://localhost/cb".to_string()], None)
+            .register(vec!["http://localhost/cb".to_string()], None, &no_live())
             .expect("should register");
         assert_eq!(registration.client_id.len(), 32);
         assert!(
@@ -1146,6 +1217,7 @@ mod tests {
             .register(
                 vec!["http://localhost/cb".to_string()],
                 Some("cli".to_string()),
+                &no_live(),
             )
             .expect("should register");
         let fetched = registry.get(&registration.client_id).expect("should exist");
@@ -1162,8 +1234,12 @@ mod tests {
     #[test]
     fn two_registrations_never_collide() {
         let registry = ClientRegistry::new();
-        let a = registry.register(vec![], None).expect("should register");
-        let b = registry.register(vec![], None).expect("should register");
+        let a = registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
+        let b = registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
         assert_ne!(a.client_id, b.client_id);
     }
 
@@ -1174,6 +1250,7 @@ mod tests {
             .register(
                 vec!["https://secret-looking-host.example/cb".to_string()],
                 None,
+                &no_live(),
             )
             .expect("should register");
         let rendered = format!("{registry:?}");
@@ -1181,49 +1258,159 @@ mod tests {
         assert!(rendered.contains("len"));
     }
 
+    /// The anti-eviction property: a full registry of *recent* idle
+    /// registrations refuses a new registration and evicts nothing — unlike
+    /// the old LRU policy, no entry is ever sacrificed to make room.
     #[test]
-    fn overflow_evicts_the_oldest_idle_registration() {
+    fn full_registry_of_recent_registrations_refuses_new_and_evicts_nothing() {
         let registry = ClientRegistry::new();
-        let first = registry.register(vec![], None).expect("should register");
-        for _ in 1..MAX_CLIENTS {
-            registry.register(vec![], None).expect("should register");
+        let mut ids = Vec::new();
+        for _ in 0..MAX_CLIENTS {
+            ids.push(
+                registry
+                    .register(vec![], None, &no_live())
+                    .expect("should register")
+                    .client_id,
+            );
         }
         assert_eq!(registry.len(), MAX_CLIENTS);
 
-        // One more push should evict `first` (the oldest) rather than fail.
-        let newest = registry
-            .register(vec![], None)
-            .expect("eviction should make room");
+        assert!(registry.register(vec![], None, &no_live()).is_none());
         assert_eq!(registry.len(), MAX_CLIENTS);
-        assert!(registry.get(&first.client_id).is_none());
+        for id in &ids {
+            assert!(registry.get(id).is_some(), "no entry should be evicted");
+        }
+    }
+
+    /// A registration idle past [`CLIENT_IDLE_TTL`] with no live session is
+    /// reclaimed under capacity pressure, and exactly that entry
+    /// disappears.
+    #[test]
+    fn an_entry_idle_past_the_ttl_is_reclaimed_under_capacity_pressure() {
+        let registry = ClientRegistry::new();
+        let stale = registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
+        registry.rewind(&stale.client_id, CLIENT_IDLE_TTL + Duration::from_secs(1));
+        for _ in 1..MAX_CLIENTS {
+            registry
+                .register(vec![], None, &no_live())
+                .expect("should register");
+        }
+        assert_eq!(registry.len(), MAX_CLIENTS);
+
+        let newest = registry
+            .register(vec![], None, &no_live())
+            .expect("the sweep should have made room");
+        assert_eq!(registry.len(), MAX_CLIENTS);
+        assert!(registry.get(&stale.client_id).is_none());
         assert!(registry.get(&newest.client_id).is_some());
     }
 
+    /// `touch` resets the idle clock: an entry rewound past the TTL, then
+    /// touched, survives capacity pressure.
     #[test]
-    fn overflow_prefers_evicting_an_idle_registration_over_a_live_one() {
+    fn touch_resets_the_idle_clock_so_the_entry_survives_capacity_pressure() {
         let registry = ClientRegistry::new();
-        let live = registry.register(vec![], None).expect("should register");
-        registry.set_live(&live.client_id, true);
+        let touched = registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
+        registry.rewind(&touched.client_id, CLIENT_IDLE_TTL + Duration::from_secs(1));
+        registry.touch(&touched.client_id);
         for _ in 1..MAX_CLIENTS {
-            registry.register(vec![], None).expect("should register");
+            registry
+                .register(vec![], None, &no_live())
+                .expect("should register");
         }
         assert_eq!(registry.len(), MAX_CLIENTS);
 
-        registry
-            .register(vec![], None)
-            .expect("an idle slot exists");
-        // The live registration must survive even though it was the oldest.
-        assert!(registry.get(&live.client_id).is_some());
+        assert!(
+            registry.register(vec![], None, &no_live()).is_none(),
+            "the touched entry should not have been reclaimed"
+        );
+        assert!(registry.get(&touched.client_id).is_some());
     }
 
+    /// A client past the idle TTL that owns a live proxy access token
+    /// survives capacity pressure, and becomes reclaimable once
+    /// `take_session` removes that token — proving both the derived
+    /// liveness and its release.
     #[test]
-    fn registration_is_refused_once_every_slot_is_live() {
-        let registry = ClientRegistry::new();
-        for _ in 0..MAX_CLIENTS {
-            let registration = registry.register(vec![], None).expect("should register");
-            registry.set_live(&registration.client_id, true);
+    fn a_client_with_a_live_access_token_survives_ttl_expiry_until_its_session_is_removed() {
+        let proxy = ProxyState::new();
+        let stale = proxy
+            .registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
+        proxy
+            .registry
+            .rewind(&stale.client_id, CLIENT_IDLE_TTL + Duration::from_secs(1));
+
+        let upstream_id = proxy
+            .upstream_tokens
+            .insert(UpstreamTokenSet {
+                access: SecretString::from("access"),
+                refresh: None,
+                granted_scopes: vec![],
+                expires_at: expires_after(Duration::from_mins(5)),
+            })
+            .expect("should insert");
+        proxy
+            .tokens
+            .mint(
+                stale.client_id.clone(),
+                upstream_id.clone(),
+                Duration::from_mins(5),
+            )
+            .expect("should mint");
+
+        for _ in 1..MAX_CLIENTS {
+            proxy
+                .register_client(vec![], None)
+                .expect("should register");
         }
-        assert!(registry.register(vec![], None).is_none());
+        assert_eq!(proxy.registry.len(), MAX_CLIENTS);
+
+        assert!(
+            proxy.register_client(vec![], None).is_none(),
+            "the live entry must survive capacity pressure"
+        );
+        assert!(proxy.registry.get(&stale.client_id).is_some());
+
+        let _ = proxy.take_session(&upstream_id);
+        let newest = proxy
+            .register_client(vec![], None)
+            .expect("the sweep should have made room once the session is gone");
+        assert!(proxy.registry.get(&stale.client_id).is_none());
+        assert!(proxy.registry.get(&newest.client_id).is_some());
+    }
+
+    /// A refresh-token-only client (no access token minted) is equally
+    /// protected by the `RefreshStore` half of the live-client union.
+    #[test]
+    fn a_client_with_only_a_live_refresh_token_survives_ttl_expiry() {
+        let proxy = ProxyState::new();
+        let stale = proxy
+            .registry
+            .register(vec![], None, &no_live())
+            .expect("should register");
+        proxy
+            .registry
+            .rewind(&stale.client_id, CLIENT_IDLE_TTL + Duration::from_secs(1));
+        proxy
+            .refresh_tokens
+            .mint(stale.client_id.clone(), "upstream-1".to_string())
+            .expect("should mint");
+
+        for _ in 1..MAX_CLIENTS {
+            proxy
+                .register_client(vec![], None)
+                .expect("should register");
+        }
+        assert_eq!(proxy.registry.len(), MAX_CLIENTS);
+
+        assert!(proxy.register_client(vec![], None).is_none());
+        assert!(proxy.registry.get(&stale.client_id).is_some());
     }
 
     /// The caps every store above degrades under, reviewable together
@@ -1231,6 +1418,7 @@ mod tests {
     #[test]
     fn every_store_cap_is_documented_here() {
         assert_eq!(MAX_CLIENTS, 1000);
+        assert_eq!(CLIENT_IDLE_TTL, Duration::from_hours(1));
         assert_eq!(MAX_ENTRIES, 10_000);
         assert_eq!(REFRESH_TTL, Duration::from_hours(720));
         assert_eq!(RETIRED_REFRESH_TTL, Duration::from_hours(24));

@@ -87,3 +87,16 @@ expired until the client asks for a new one.
   the swept session's refresh token — never its already-expired access
   token — revoked upstream in a best-effort background task, only when the
   session carried one.
+- **The client registry never evicts a live or recently-used registration
+  to make room for a new one.** `POST /register` is intentionally
+  unauthenticated (RFC 7591 DCR), so a full registry sweeps every
+  registration that is neither in the live set (an unexpired proxy access
+  or refresh token, derived from `TokenStore`/`RefreshStore` the same way
+  the upstream session deadline above is) nor used within the last hour
+  (`CLIENT_IDLE_TTL`, well above `TRANSACTION_TTL` so a registration
+  mid-authorization is never at risk); a still-full registry after the
+  sweep degrades to the existing `503` + `Retry-After`. This trades a
+  bounded `/register` lockout under sustained attacker traffic (existing
+  clients keep working; new ones wait out the idle TTL) for the
+  alternative of evicting a client that is mid-flow or holds a live
+  session, which is strictly worse.

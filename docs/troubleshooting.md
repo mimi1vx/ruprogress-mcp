@@ -193,6 +193,42 @@ MCP client recovers on its own. Avoid restarting the process during a burst
 of user-facing authorization flows if that's disruptive; there is no way to
 preserve state across a restart in this mode today.
 
+## `/register` returns `503 temporarily_unavailable`
+
+**Symptom:** `POST /register` answers `503`/`temporarily_unavailable` with a
+`Retry-After: 5` header, even though the deployment has not registered
+anywhere near 1000 real clients.
+
+**Cause:** the client registry is at its 1000-entry capacity, and every
+entry is either recently used or holds a live proxy access/refresh token
+(see `oauth/proxy/store.rs` and the ADR for `oauth-proxy`'s
+authorization-server role). Unlike the other proxy stores, this one never
+evicts a live-or-recent registration just to make room for a new one,
+since `/register` is intentionally unauthenticated and an attacker
+flooding it must not be able to knock a legitimate, mid-authorization
+client out of the registry.
+
+**Fix:** retry after a short wait, or wait out `CLIENT_IDLE_TTL` (one hour):
+a registration idle that long with no live session becomes reclaimable on
+the next capacity-pressure `/register`. A deployment that sustains 1000
+concurrent registered clients is not a configuration this mode supports
+today; there is no registry-size override to tune.
+
+## `/authorize` answers `client_id is not a registered client` after a long idle period
+
+**Symptom:** a client that registered successfully some time ago gets a
+plain `400` from `/authorize` naming an unknown `client_id`, with no prior
+restart or `/revoke` call.
+
+**Cause:** the registry was at capacity when some other client registered,
+and this client's registration had gone unused (no `/authorize`, code
+redemption, or refresh) for over `CLIENT_IDLE_TTL` (one hour) with no live
+session — so it was reclaimed to make room, per the policy described above.
+
+**Fix:** re-register (`POST /register`) and restart the authorization flow
+from scratch — the same recovery as the restart case above. A client that
+authorizes at least once an hour never triggers this.
+
 ## A refresh token "stopped working"
 
 **Symptom:** a client that stored an old refresh token gets `invalid_grant`
