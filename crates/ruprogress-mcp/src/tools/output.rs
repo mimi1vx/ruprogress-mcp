@@ -80,34 +80,86 @@ fn top_level_array(value: &mut Value) -> Option<&mut Vec<Value>> {
         .find_map(|v| v.as_array_mut())
 }
 
+/// A `std::io::Write` sink that only counts bytes written, so probing a
+/// serialised size never allocates the buffer itself.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The serialised byte length of `value`, without materialising the bytes.
+fn serialized_len(value: &Value) -> usize {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.0)
+}
+
+/// Grows or shrinks the top-level array to exactly `k` items, moving
+/// elements to/from `spare` (a LIFO scratch buffer) instead of cloning —
+/// `spare`'s top is always the smallest index not currently in the array, so
+/// shrink/grow calls in any order restore items in their original positions.
+fn set_prefix(value: &mut Value, spare: &mut Vec<Value>, k: usize) {
+    let Some(array) = top_level_array(value) else {
+        return;
+    };
+    while array.len() > k {
+        if let Some(item) = array.pop() {
+            spare.push(item);
+        }
+    }
+    while array.len() < k {
+        let Some(item) = spare.pop() else { break };
+        array.push(item);
+    }
+}
+
 /// Find the first top-level JSON array in an object response — by the
 /// envelope convention every list tool has exactly one — and truncate it to
-/// `caps.max_items`, then to whatever additionally fits in `caps.max_bytes`.
+/// `caps.max_items`, then binary-search the longest remaining prefix whose
+/// serialised size still fits `caps.max_bytes`. The search is only valid
+/// because serialised size is strictly increasing in prefix length (each
+/// extra item adds its own bytes plus a `,` separator), so the sorted
+/// prefix-length/fits relationship the binary search relies on always holds.
 /// Marks `pagination.truncated`/`pagination.hint` when either cap fires.
 /// A no-op for payloads with no top-level array (e.g. `get_current_user`).
 fn apply_caps(value: &mut Value, caps: OutputCaps) {
     let mut truncated = false;
-    let Some(array) = top_level_array(value) else {
-        return;
-    };
-    if array.len() > caps.max_items {
-        array.truncate(caps.max_items);
-        truncated = true;
-    }
-
-    loop {
-        let size = serde_json::to_vec(&*value).map_or(0, |bytes| bytes.len());
-        if size <= caps.max_bytes {
-            break;
-        }
+    let len = {
         let Some(array) = top_level_array(value) else {
-            break;
+            return;
         };
-        if array.is_empty() {
-            break;
+        if array.len() > caps.max_items {
+            array.truncate(caps.max_items);
+            truncated = true;
         }
-        array.pop();
-        truncated = true;
+        array.len()
+    };
+
+    if serialized_len(&*value) > caps.max_bytes {
+        let mut spare: Vec<Value> = Vec::new();
+        let mut lo = 0usize;
+        let mut hi = len;
+        while lo < hi {
+            let mid = usize::midpoint(lo, hi);
+            set_prefix(value, &mut spare, mid);
+            if serialized_len(&*value) <= caps.max_bytes {
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid;
+            }
+        }
+        let answer = lo.saturating_sub(1);
+        set_prefix(value, &mut spare, answer);
+        if answer < len {
+            truncated = true;
+        }
     }
 
     if truncated
@@ -325,6 +377,154 @@ pub(crate) fn err_with(
 )]
 mod tests {
     use super::*;
+
+    /// Verbatim copy of `apply_caps`'s pre-binary-search algorithm: pop one
+    /// item and re-serialise the whole payload every iteration. Kept only so
+    /// the equivalence tests below have an honest, independently-arrived-at
+    /// oracle rather than hand-written expectations.
+    fn apply_caps_reference(value: &mut Value, caps: OutputCaps) {
+        let mut truncated = false;
+        let Some(array) = top_level_array(value) else {
+            return;
+        };
+        if array.len() > caps.max_items {
+            array.truncate(caps.max_items);
+            truncated = true;
+        }
+
+        loop {
+            let size = serde_json::to_vec(&*value).map_or(0, |bytes| bytes.len());
+            if size <= caps.max_bytes {
+                break;
+            }
+            let Some(array) = top_level_array(value) else {
+                break;
+            };
+            if array.is_empty() {
+                break;
+            }
+            array.pop();
+            truncated = true;
+        }
+
+        if truncated
+            && let Some(pagination) = value
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("pagination"))
+                .and_then(Value::as_object_mut)
+        {
+            pagination.insert("truncated".to_string(), Value::Bool(true));
+            pagination.insert(
+                "hint".to_string(),
+                Value::String(TRUNCATION_HINT.to_string()),
+            );
+        }
+    }
+
+    /// Same envelope shape as `benches/output_caps.rs`'s `payload` helper:
+    /// one top-level array plus a sibling `pagination` object.
+    fn shaped_payload(n_items: usize, item_bytes: usize) -> Value {
+        let items: Vec<Value> = (0..n_items)
+            .map(|id| serde_json::json!({ "id": id, "payload": "x".repeat(item_bytes) }))
+            .collect();
+        serde_json::json!({
+            "items": items,
+            "pagination": { "total": n_items, "truncated": false },
+        })
+    }
+
+    /// Runs both algorithms on independent clones of `payload` and asserts
+    /// identical results.
+    fn assert_equivalent(payload: &Value, caps: OutputCaps) {
+        let mut old = payload.clone();
+        let mut new = payload.clone();
+        apply_caps_reference(&mut old, caps);
+        apply_caps(&mut new, caps);
+        assert_eq!(old, new, "caps={caps:?}");
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_on_the_bench_shapes() {
+        // Same shapes as `benches/output_caps.rs`, except shape D's item
+        // size is scaled down from 320 KiB to 2 KiB: the reference loop's
+        // O(n) full-payload reserialisation on the real ~64 MiB shape is a
+        // multi-minute debug-build test, and equivalence does not depend on
+        // the item size — only on the byte cap firing and popping several
+        // items, which this preserves.
+        assert_equivalent(&shaped_payload(50, 1024), caps(200, 256 * 1024));
+        assert_equivalent(&shaped_payload(500, 1024), caps(200, 256 * 1024));
+        assert_equivalent(&shaped_payload(200, 4 * 1024), caps(200, 256 * 1024));
+        assert_equivalent(&shaped_payload(200, 2 * 1024), caps(200, 256 * 1024));
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_at_the_byte_cap_boundary() {
+        let payload = shaped_payload(50, 128);
+        let exact = serialized_len(&payload);
+        assert_equivalent(&payload, caps(200, exact));
+        assert_equivalent(&payload, caps(200, exact.saturating_sub(1)));
+        assert_equivalent(&payload, caps(200, exact.saturating_add(1)));
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_on_degenerate_caps() {
+        let payload = shaped_payload(20, 64);
+        assert_equivalent(&payload, caps(200, 0));
+        assert_equivalent(&payload, caps(0, 256 * 1024));
+        assert_equivalent(&shaped_payload(0, 64), caps(200, 256 * 1024));
+        assert_equivalent(&shaped_payload(0, 64), caps(200, 0));
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_with_no_top_level_array() {
+        let payload = serde_json::json!({ "id": 1, "name": "solo" });
+        assert_equivalent(&payload, caps(200, 5));
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_when_the_array_is_not_the_first_key() {
+        // serde_json's default (non-`preserve_order`) `Map` iterates keys in
+        // sorted order, so "aaa" is visited before "items" regardless of
+        // insertion order — this is the "array isn't the first field" case.
+        let payload = serde_json::json!({
+            "aaa": "not an array",
+            "items": (0..30).map(|id| serde_json::json!({ "id": id, "payload": "x".repeat(200) })).collect::<Vec<_>>(),
+        });
+        assert_equivalent(&payload, caps(200, 1024));
+    }
+
+    /// Minimal linear-congruential generator: no new dev-dependency for a
+    /// fixed-seed pseudo-random equivalence sweep.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // Numerical Recipes LCG constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn next_range(&mut self, max: u64) -> u64 {
+            self.next_u64().checked_rem(max).unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn binary_search_matches_the_reference_loop_on_random_payloads() {
+        let as_usize = |n: u64| usize::try_from(n).expect("test range fits in usize");
+        let mut rng = Lcg(0xC0FF_EE00_1234_5678);
+        for _ in 0..200 {
+            let n_items = as_usize(rng.next_range(40));
+            let item_bytes = as_usize(rng.next_range(300));
+            let max_items = as_usize(rng.next_range(50));
+            let max_bytes = as_usize(rng.next_range(8 * 1024));
+            let payload = shaped_payload(n_items, item_bytes);
+            assert_equivalent(&payload, caps(max_items, max_bytes));
+        }
+    }
 
     #[derive(Debug, Serialize, JsonSchema)]
     struct Widget {
