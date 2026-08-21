@@ -45,3 +45,12 @@ reqwest     = { workspace = true }
 [dev-dependencies]
 rmcp     = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 wiremock = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "output_caps"
+harness = false
+
+[[bench]]
+name    = "ratelimit"
+harness = false

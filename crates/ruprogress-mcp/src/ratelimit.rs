@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 /// *transition* (RL11) — whether this call started or ended a run of
 /// denials for its key — so the caller can log once per transition rather
 /// than once per request.
-#[derive(Clone, Copy)]
-pub(crate) enum Decision {
+#[derive(Debug, Clone, Copy)]
+pub enum Decision {
     Allow {
         recovered: bool,
     },
@@ -28,6 +28,7 @@ pub(crate) enum Decision {
 /// One caller's token bucket. `tokens`/`capacity` are counted in whole
 /// requests but tracked as `f64` so a fractional refill between two calls a
 /// few milliseconds apart is not silently rounded away to zero.
+#[derive(Debug)]
 struct Bucket {
     tokens: f64,
     updated_at: Instant,
@@ -93,7 +94,8 @@ impl Bucket {
 /// tokens/second, `std::time::Instant` as the clock (RL2). The map has a
 /// hard entry cap (RL7): at capacity, a *new* key evicts the
 /// least-recently-touched entry rather than being refused.
-pub(crate) struct Limiter<K> {
+#[derive(Debug)]
+pub struct Limiter<K> {
     buckets: Mutex<HashMap<K, Bucket>>,
     capacity: f64,
     refill_per_sec: f64,
@@ -101,7 +103,8 @@ pub(crate) struct Limiter<K> {
 }
 
 impl<K: Eq + Hash + Clone> Limiter<K> {
-    pub(crate) fn new(rps: u32, burst: u32, max_keys: usize) -> Self {
+    #[must_use]
+    pub fn new(rps: u32, burst: u32, max_keys: usize) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
             capacity: f64::from(burst),
@@ -110,7 +113,7 @@ impl<K: Eq + Hash + Clone> Limiter<K> {
         }
     }
 
-    pub(crate) fn check(&self, key: K, now: Instant) -> Decision {
+    pub fn check(&self, key: K, now: Instant) -> Decision {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(bucket) = buckets.get_mut(&key) {
             return bucket.take(now, self.refill_per_sec, self.capacity);

@@ -8,7 +8,11 @@ pub(crate) mod files;
 pub(crate) mod gantt;
 pub(crate) mod issues;
 pub(crate) mod meta;
-pub(crate) mod output;
+// `#[doc(hidden)] pub`, not `pub(crate)`: `benches/output_caps.rs` needs
+// `output::apply_caps_bench`, and `unreachable_pub` requires the containing
+// module to be `pub` too for a `pub` item inside it to be reachable.
+#[doc(hidden)]
+pub mod output;
 pub(crate) mod plugins;
 pub(crate) mod projects;
 pub(crate) mod schema;

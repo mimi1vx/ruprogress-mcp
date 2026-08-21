@@ -10,7 +10,10 @@ mod health;
 pub mod logging;
 mod oauth;
 mod panic_guard;
-mod ratelimit;
+// `#[doc(hidden)] pub`, not private: `benches/ratelimit.rs` needs
+// `ratelimit::Limiter`/`Decision`.
+#[doc(hidden)]
+pub mod ratelimit;
 pub mod readonly;
 pub mod render;
 pub mod server;

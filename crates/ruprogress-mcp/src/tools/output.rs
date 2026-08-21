@@ -124,6 +124,19 @@ fn apply_caps(value: &mut Value, caps: OutputCaps) {
     }
 }
 
+/// Benchmark seam for `benches/output_caps.rs`: exercises [`apply_caps`]
+/// without exposing `OutputCaps`'s fields or `ok`'s own serialisation.
+#[doc(hidden)]
+pub fn apply_caps_bench(value: &mut Value, max_items: usize, max_bytes: usize) {
+    apply_caps(
+        value,
+        OutputCaps {
+            max_items,
+            max_bytes,
+        },
+    );
+}
+
 /// Wrap a successful tool payload in a `CallToolResult` with structured
 /// content, applying the response-size caps.
 ///
