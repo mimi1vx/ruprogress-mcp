@@ -214,6 +214,23 @@ if this happens after a genuine crash mid-refresh (the client can't tell if
 its own request succeeded), the fix is to re-authorize from scratch, not to
 retry the old refresh token.
 
+## `/token` returns `server_error` in `oauth-proxy` mode
+
+**Symptom:** `POST /token` with `grant_type=authorization_code` answers
+`500`/`server_error`, even though the authorization code itself was valid.
+
+**Cause:** the upstream-session store is at its 10 000-entry capacity. Every
+proxy store degrades by refusing new state rather than evicting a live
+session, so this is a saturated deployment, not a bug. Sessions expire and
+are swept lazily on the next successful authorization: a session with no
+refresh token disappears at its upstream access token's own expiry, and a
+refresh-bearing one after 30 days of last use.
+
+**Fix:** none needed for a transient spike — retry after the next
+authorization sweeps some expired sessions. A deployment that sustains
+10 000 concurrent sessions is not a configuration this mode supports today;
+there is no session-TTL override to tune.
+
 ## `UNEXPECTED_RESPONSE` on `get_redmine_attachment`
 
 **Symptom:** `get_redmine_attachment` returns `{code: "UNEXPECTED_RESPONSE",

@@ -320,7 +320,7 @@ pub(crate) struct UpstreamTokenSet {
 /// URL, not in a response body — so digest-keying would add nothing.
 #[derive(Default)]
 pub(crate) struct UpstreamStore {
-    inner: Mutex<HashMap<String, UpstreamTokenSet>>,
+    inner: Mutex<HashMap<String, (UpstreamTokenSet, Instant)>>,
 }
 
 impl std::fmt::Debug for UpstreamStore {
@@ -339,8 +339,27 @@ impl UpstreamStore {
         Self::default()
     }
 
+    /// The deadline past which a session is swept. Deliberately **not**
+    /// `set.expires_at` when a refresh token is present: that field is the
+    /// *upstream access token's* own expiry, and a session holding a
+    /// refresh token stays legitimately usable long after its access token
+    /// expires — the client just calls `/token`'s `refresh_token` grant,
+    /// and Doorkeeper refresh tokens never expire on their own upstream. So
+    /// this store needs its own bound for a refreshable session, and
+    /// borrows [`REFRESH_TTL`] (the same 30-day clock the proxy's own
+    /// refresh token already uses) rather than inventing a second constant.
+    /// A session with no refresh token has nothing to fall back on once its
+    /// access token expires, so its deadline is exactly `expires_at`.
+    fn session_deadline(set: &UpstreamTokenSet) -> Instant {
+        if set.refresh.is_some() {
+            expires_after(REFRESH_TTL)
+        } else {
+            set.expires_at
+        }
+    }
+
     /// Stores `set`, returning the internal id it was stored under. `None`
-    /// on `OsRng` failure only (C8).
+    /// means the store is full of live sessions, or `OsRng` failed (C8).
     pub(crate) fn insert(&self, set: UpstreamTokenSet) -> Option<String> {
         let mut bytes = [0u8; 16];
         if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
@@ -352,86 +371,112 @@ impl UpstreamStore {
             use std::fmt::Write as _;
             let _ = write!(id, "{byte:02x}");
         }
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.clone(), set);
+        let deadline = Self::session_deadline(&set);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sweep_and_check_capacity(&mut inner, &id) {
+            return None;
+        }
+        inner.insert(id.clone(), (set, deadline));
         Some(id)
     }
 
     /// A clone of the stored access token, for the middleware to hand to
-    /// [`crate::auth::oauth::TokenVerifier::verify`] on every request.
+    /// [`crate::auth::oauth::TokenVerifier::verify`] on every request. Fails
+    /// closed past the session's deadline without removing it — removal
+    /// must go through [`super::store::ProxyState::take_session`] or
+    /// [`super::store::ProxyState::sweep_expired_sessions`] so the
+    /// dependent proxy tokens are purged too.
     pub(crate) fn access_token(&self, id: &str) -> Option<SecretString> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .map(|set| set.access.clone())
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (set, deadline) = inner.get(id)?;
+        (*deadline > Instant::now()).then(|| set.access.clone())
     }
 
     /// A clone of the stored refresh token, if Doorkeeper issued one (R4),
-    /// for the `/token` refresh grant to present upstream.
+    /// for the `/token` refresh grant to present upstream. Fails closed
+    /// past the session's deadline, same reasoning as [`Self::access_token`].
     pub(crate) fn refresh_token(&self, id: &str) -> Option<SecretString> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .and_then(|set| set.refresh.clone())
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (set, deadline) = inner.get(id)?;
+        if *deadline <= Instant::now() {
+            return None;
+        }
+        set.refresh.clone()
     }
 
     /// A clone of the stored granted scopes, for the `/token` refresh grant
     /// to fall back to when Doorkeeper's refresh response omits `scope`
-    /// (RFC 6749 §6: absent means unchanged).
+    /// (RFC 6749 §6: absent means unchanged). Fails closed past the
+    /// session's deadline, same reasoning as [`Self::access_token`].
     pub(crate) fn granted_scopes(&self, id: &str) -> Option<Vec<String>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .map(|set| set.granted_scopes.clone())
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (set, deadline) = inner.get(id)?;
+        (*deadline > Instant::now()).then(|| set.granted_scopes.clone())
     }
 
-    pub(crate) fn remove(&self, id: &str) {
-        self.take(id);
-    }
-
-    /// Removes and returns the stored set, for a caller that needs the
-    /// access token it held to revoke it upstream (R5's `/revoke`, R2's
-    /// reuse containment).
+    /// Removes and returns the stored set regardless of its deadline, for a
+    /// caller that needs the refresh token of an access-expired session to
+    /// revoke it upstream (R5's `/revoke`, R2's reuse containment) — unlike
+    /// [`Self::access_token`] et al., a past-deadline entry is still
+    /// present here, not absent. Does not purge the dependent proxy tokens;
+    /// callers reach this through
+    /// [`super::store::ProxyState::take_session`], which does.
     pub(crate) fn take(&self, id: &str) -> Option<UpstreamTokenSet> {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id)
+            .map(|(set, _)| set)
     }
 
-    /// Replaces the stored set in place, keeping `id` stable across a
-    /// refresh (R1): the proxy access/refresh tokens minted before the
-    /// refresh, and any bookkeeping keyed on `id`, all still resolve to the
-    /// same session afterward. Conditional on `id` still being present
-    /// (finding 2): an in-flight refresh must not resurrect a session a
-    /// concurrent `/revoke` (or reuse-containment path) already removed.
-    /// On `Err`, `set` is handed back unused so the caller can revoke the
+    /// Replaces the stored set in place and renews its deadline, keeping
+    /// `id` stable across a refresh (R1): the proxy access/refresh tokens
+    /// minted before the refresh, and any bookkeeping keyed on `id`, all
+    /// still resolve to the same session afterward. Conditional on `id`
+    /// still being present *and not past its deadline* (finding 2): an
+    /// in-flight refresh must not resurrect a session a concurrent
+    /// `/revoke`, reuse-containment path, or sweep already removed. On
+    /// `Err`, `set` is handed back unused so the caller can revoke the
     /// upstream secret it just obtained instead of it being silently
     /// dropped.
     #[must_use = "Err(set) hands back an unused upstream token set that must be revoked"]
     pub(crate) fn replace(&self, id: &str, set: UpstreamTokenSet) -> Result<(), UpstreamTokenSet> {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match inner.get_mut(id) {
-            Some(existing) => {
+            Some((existing, deadline)) if *deadline > Instant::now() => {
+                *deadline = Self::session_deadline(&set);
                 *existing = set;
                 Ok(())
             }
-            None => Err(set),
+            _ => Err(set),
         }
     }
 
-    /// Live upstream-session count, for `get_mcp_server_info`'s
-    /// `active_sessions` (R7).
+    /// Live (not past its deadline) upstream-session count, for
+    /// `get_mcp_server_info`'s `active_sessions` (R7).
     pub(crate) fn len(&self) -> usize {
+        let now = Instant::now();
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .len()
+            .values()
+            .filter(|(_, deadline)| *deadline > now)
+            .count()
+    }
+
+    /// Removes every session past its deadline, returning what each held.
+    /// Does not purge the dependent proxy tokens or revoke anything
+    /// upstream — callers reach this through
+    /// [`super::store::ProxyState::sweep_expired_sessions`], which does
+    /// both, since neither is reachable from this module.
+    #[must_use]
+    pub(crate) fn sweep_expired(&self) -> Vec<(String, UpstreamTokenSet)> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner
+            .extract_if(|_, (_, deadline)| *deadline <= now)
+            .map(|(id, (set, _))| (id, set))
+            .collect()
     }
 }
 
@@ -742,6 +787,18 @@ impl TokenStore {
             .remove(&key)
             .map(|(entry, _)| entry)
     }
+
+    /// Removes every proxy access token bound to `upstream_id` (session
+    /// removal's referential cleanup, finding 6): a `retain` scan over a
+    /// map capped at [`MAX_ENTRIES`], run only from
+    /// `super::store::ProxyState::take_session`/`sweep_expired_sessions`,
+    /// never the resolve path.
+    pub(crate) fn remove_by_upstream(&self, upstream_id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (entry, _)| entry.upstream_id != upstream_id);
+    }
 }
 
 // --- proxy refresh tokens (R1, R2) ---------------------------------------
@@ -978,6 +1035,20 @@ impl RefreshStore {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&digest);
     }
+
+    /// Removes every *active* refresh token bound to `upstream_id` (session
+    /// removal's referential cleanup, finding 6). `retired` is deliberately
+    /// left untouched: reuse detection (R2) must outlive the session it
+    /// belonged to, and it is already bounded on its own by
+    /// [`RETIRED_REFRESH_TTL`]. Run only from
+    /// `super::store::ProxyState::take_session`/`sweep_expired_sessions`,
+    /// never the resolve path.
+    pub(crate) fn remove_by_upstream(&self, upstream_id: &str) {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (owner, _)| owner.upstream_id != upstream_id);
+    }
 }
 
 // --- the bundle shared by every oauth-proxy route and `get_mcp_server_info` (R7) ---
@@ -1006,6 +1077,40 @@ impl ProxyState {
             upstream_tokens: UpstreamStore::new(),
             refresh_tokens: RefreshStore::new(),
         }
+    }
+
+    /// Removes the session `upstream_id` names, along with every proxy
+    /// access/refresh token bound to it (finding 6's referential cleanup):
+    /// `UpstreamStore`, `TokenStore`, and `RefreshStore` each guard their
+    /// own map and cannot reach across each other to do this themselves.
+    /// `#[must_use]`: the returned set is what the caller needs to revoke
+    /// upstream and purge from the introspection cache, work this module
+    /// cannot do (it has no HTTP client and no `TokenVerifier`).
+    #[must_use]
+    pub(crate) fn take_session(&self, upstream_id: &str) -> Option<UpstreamTokenSet> {
+        let set = self.upstream_tokens.take(upstream_id)?;
+        self.tokens.remove_by_upstream(upstream_id);
+        self.refresh_tokens.remove_by_upstream(upstream_id);
+        Some(set)
+    }
+
+    /// Sweeps every session past its deadline, cross-purging each one's
+    /// dependent proxy tokens the same way [`Self::take_session`] does.
+    /// `#[must_use]`: the returned sets are what the caller needs to purge
+    /// from the introspection cache and, for whichever carry a refresh
+    /// token, revoke upstream (V1/V2/V5: only the refresh token is worth
+    /// revoking on a sweep — see `oauth::proxy::endpoints`).
+    #[must_use]
+    pub(crate) fn sweep_expired_sessions(&self) -> Vec<UpstreamTokenSet> {
+        self.upstream_tokens
+            .sweep_expired()
+            .into_iter()
+            .map(|(upstream_id, set)| {
+                self.tokens.remove_by_upstream(&upstream_id);
+                self.refresh_tokens.remove_by_upstream(&upstream_id);
+                set
+            })
+            .collect()
     }
 }
 
@@ -1364,7 +1469,12 @@ mod refresh_store_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod upstream_store_tests {
     use super::*;
 
@@ -1398,5 +1508,304 @@ mod upstream_store_tests {
         let result = store.replace("never-inserted", upstream_set("orphaned"));
         assert!(result.is_err());
         assert_eq!(store.len(), 0);
+    }
+
+    fn refreshable_upstream_set(access: &str, refresh: &str) -> UpstreamTokenSet {
+        UpstreamTokenSet {
+            access: SecretString::from(access.to_string()),
+            refresh: Some(SecretString::from(refresh.to_string())),
+            granted_scopes: vec![],
+            // Deliberately short: proves the deadline ignores this once a
+            // refresh token is present (V2, V5).
+            expires_at: expires_after(Duration::from_millis(1)),
+        }
+    }
+
+    /// Already at its deadline as soon as it is constructed: every
+    /// `Instant::now()` check after a short sleep sees it as expired.
+    fn already_expired_upstream_set(access: &str) -> UpstreamTokenSet {
+        UpstreamTokenSet {
+            access: SecretString::from(access.to_string()),
+            refresh: None,
+            granted_scopes: vec!["view_project".to_string()],
+            expires_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn session_deadline_is_the_access_expiry_without_a_refresh_token() {
+        let set = upstream_set("access-only");
+        assert_eq!(UpstreamStore::session_deadline(&set), set.expires_at);
+    }
+
+    #[test]
+    fn session_deadline_is_refresh_ttl_when_a_refresh_token_is_present() {
+        let set = refreshable_upstream_set("access", "refresh");
+        let deadline = UpstreamStore::session_deadline(&set);
+        // Far beyond the access token's own (1ms) expiry: a refresh token
+        // keeps the session alive for REFRESH_TTL regardless of how soon
+        // its access token expires.
+        assert!(deadline > set.expires_at + Duration::from_secs(60));
+    }
+
+    #[test]
+    fn getters_fail_closed_past_the_deadline_but_take_still_returns() {
+        let store = UpstreamStore::new();
+        let id = store
+            .insert(already_expired_upstream_set("expiring"))
+            .expect("should insert");
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(store.access_token(&id).is_none());
+        assert!(store.refresh_token(&id).is_none());
+        assert!(store.granted_scopes(&id).is_none());
+        assert_eq!(store.len(), 0);
+
+        let taken = store.take(&id).expect("take ignores the deadline");
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&taken.access),
+            "expiring"
+        );
+    }
+
+    #[test]
+    fn replace_renews_the_deadline_on_a_live_entry() {
+        let store = UpstreamStore::new();
+        let id = store.insert(upstream_set("old")).expect("should insert");
+
+        // Renewed with a refresh-bearing set: the deadline moves from the
+        // original 5-minute access expiry out to `REFRESH_TTL`.
+        let result = store.replace(&id, refreshable_upstream_set("new", "refresh"));
+        assert!(result.is_ok());
+        assert!(store.refresh_token(&id).is_some());
+    }
+
+    #[test]
+    fn replace_rejects_an_entry_already_past_its_deadline() {
+        let store = UpstreamStore::new();
+        let id = store
+            .insert(already_expired_upstream_set("expiring"))
+            .expect("should insert");
+        std::thread::sleep(Duration::from_millis(5));
+
+        let result = store.replace(&id, upstream_set("orphaned"));
+        assert!(
+            result.is_err(),
+            "an in-flight refresh must not resurrect a session already past its deadline"
+        );
+    }
+
+    #[test]
+    fn sweep_expired_returns_exactly_the_expired_entries() {
+        let store = UpstreamStore::new();
+        // Inserted first: a later insert's own sweep would otherwise prune
+        // this one before the explicit `sweep_expired` call below gets to.
+        let live_id = store.insert(upstream_set("live")).expect("should insert");
+        let expired_id = store
+            .insert(already_expired_upstream_set("expired"))
+            .expect("should insert");
+        std::thread::sleep(Duration::from_millis(5));
+
+        let swept = store.sweep_expired();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].0, expired_id);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&swept[0].1.access),
+            "expired"
+        );
+
+        // The live entry is untouched.
+        assert_eq!(store.len(), 1);
+        assert!(store.access_token(&live_id).is_some());
+    }
+
+    #[test]
+    fn len_excludes_expired_entries() {
+        let store = UpstreamStore::new();
+        // Inserted first, same reasoning as the `sweep_expired` test above.
+        store.insert(upstream_set("live")).expect("should insert");
+        store
+            .insert(already_expired_upstream_set("expired"))
+            .expect("should insert");
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(store.len(), 1);
+    }
+
+    /// Same shape as every other store's capacity test: bounded under
+    /// pressure. Every fill entry uses a 5-minute TTL (far longer than this
+    /// test runs) so none self-expires mid-loop.
+    #[test]
+    fn insert_is_refused_once_max_entries_live_sessions_exist() {
+        let store = UpstreamStore::new();
+        for i in 0..MAX_ENTRIES {
+            store
+                .insert(upstream_set(&format!("access-{i}")))
+                .expect("should insert while under capacity");
+        }
+        assert_eq!(store.len(), MAX_ENTRIES);
+        assert!(store.insert(upstream_set("one-too-many")).is_none());
+    }
+
+    /// Populates the map directly (bypassing `insert`'s own per-call sweep)
+    /// so it is deterministically full of already-expired entries, then
+    /// proves a single `insert` call's sweep reclaims all of that room —
+    /// the behaviour every sibling store already had and this one gains.
+    #[test]
+    fn insert_succeeds_again_once_a_sweep_reclaims_expired_sessions() {
+        let store = UpstreamStore::new();
+        {
+            let mut inner = store.inner.lock().expect("lock should not be poisoned");
+            for i in 0..MAX_ENTRIES {
+                inner.insert(
+                    format!("existing-{i}"),
+                    (
+                        already_expired_upstream_set(&format!("access-{i}")),
+                        Instant::now(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(store.len(), 0, "every pre-populated entry is expired");
+
+        let id = store
+            .insert(upstream_set("fits-after-sweep"))
+            .expect("a sweep on insert should reclaim the expired entries");
+        assert!(store.access_token(&id).is_some());
+        assert_eq!(store.len(), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod proxy_state_tests {
+    use super::*;
+
+    fn upstream_set_with_refresh(access: &str, refresh: &str) -> UpstreamTokenSet {
+        UpstreamTokenSet {
+            access: SecretString::from(access.to_string()),
+            refresh: Some(SecretString::from(refresh.to_string())),
+            granted_scopes: vec![],
+            expires_at: expires_after(Duration::from_mins(5)),
+        }
+    }
+
+    fn already_expired_upstream_set(access: &str) -> UpstreamTokenSet {
+        UpstreamTokenSet {
+            access: SecretString::from(access.to_string()),
+            refresh: None,
+            granted_scopes: vec![],
+            expires_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn take_session_removes_the_upstream_set_and_every_bound_proxy_token() {
+        let proxy = ProxyState::new();
+        let upstream_id = proxy
+            .upstream_tokens
+            .insert(upstream_set_with_refresh("access", "refresh"))
+            .expect("should insert");
+        let (access_token, _) = proxy
+            .tokens
+            .mint(
+                "client".to_string(),
+                upstream_id.clone(),
+                Duration::from_mins(5),
+            )
+            .expect("should mint");
+        let (refresh_token, _) = proxy
+            .refresh_tokens
+            .mint("client".to_string(), upstream_id.clone())
+            .expect("should mint");
+
+        let taken = proxy
+            .take_session(&upstream_id)
+            .expect("session should exist");
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&taken.access),
+            "access"
+        );
+
+        assert!(proxy.upstream_tokens.access_token(&upstream_id).is_none());
+        assert!(proxy.tokens.resolve(&access_token).is_none());
+        assert!(proxy.refresh_tokens.take(&refresh_token).is_none());
+    }
+
+    #[test]
+    fn take_session_leaves_a_retired_refresh_digest_reusable_for_replay_detection() {
+        let proxy = ProxyState::new();
+        let upstream_id = proxy
+            .upstream_tokens
+            .insert(upstream_set_with_refresh("access", "refresh"))
+            .expect("should insert");
+        let (refresh_token, _) = proxy
+            .refresh_tokens
+            .mint("client".to_string(), upstream_id.clone())
+            .expect("should mint");
+        proxy
+            .refresh_tokens
+            .retire(&refresh_token, upstream_id.clone());
+
+        proxy
+            .take_session(&upstream_id)
+            .expect("session should exist");
+
+        // R2's reuse detection must outlive the session it belonged to.
+        assert!(matches!(
+            proxy.refresh_tokens.redeem(&refresh_token),
+            RefreshOutcome::Reused { .. }
+        ));
+    }
+
+    #[test]
+    fn sweep_expired_sessions_cross_purges_only_the_expired_sessions_tokens() {
+        let proxy = ProxyState::new();
+        // Inserted first: inserting the expired session afterward would
+        // otherwise prune this one's own already-past deadline as a side
+        // effect before the explicit sweep below gets to it.
+        let live_id = proxy
+            .upstream_tokens
+            .insert(upstream_set_with_refresh("live-access", "live-refresh"))
+            .expect("should insert");
+        let (live_token, _) = proxy
+            .tokens
+            .mint(
+                "client".to_string(),
+                live_id.clone(),
+                Duration::from_mins(5),
+            )
+            .expect("should mint");
+
+        let expired_id = proxy
+            .upstream_tokens
+            .insert(already_expired_upstream_set("expired-access"))
+            .expect("should insert");
+        let (expired_token, _) = proxy
+            .tokens
+            .mint(
+                "client".to_string(),
+                expired_id.clone(),
+                Duration::from_mins(5),
+            )
+            .expect("should mint");
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        let swept = proxy.sweep_expired_sessions();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&swept[0].access),
+            "expired-access"
+        );
+
+        assert!(proxy.tokens.resolve(&expired_token).is_none());
+        assert!(proxy.tokens.resolve(&live_token).is_some());
+        assert!(proxy.upstream_tokens.access_token(&live_id).is_some());
     }
 }

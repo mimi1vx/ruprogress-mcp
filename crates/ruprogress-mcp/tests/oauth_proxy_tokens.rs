@@ -161,13 +161,27 @@ async fn mock_introspect_active(redmine: &wiremock::MockServer, access_token: &s
 }
 
 async fn drive_callback(harness: &support::HttpHarness, transaction_state: &str) -> String {
+    drive_callback_with_upstream_code(
+        harness,
+        transaction_state,
+        "fake-upstream-authorization-code",
+    )
+    .await
+}
+
+/// Like [`drive_callback`], but with a caller-chosen upstream authorization
+/// code — for a test driving two independent flows in the same wiremock
+/// Redmine, which otherwise could not tell the two `/oauth/token` exchanges
+/// apart.
+async fn drive_callback_with_upstream_code(
+    harness: &support::HttpHarness,
+    transaction_state: &str,
+    upstream_code: &str,
+) -> String {
     let response = no_redirect_client()
         .get(url_with_query(
             &harness.url("/auth/callback"),
-            &[
-                ("code", "fake-upstream-authorization-code"),
-                ("state", transaction_state),
-            ],
+            &[("code", upstream_code), ("state", transaction_state)],
         ))
         .send()
         .await
@@ -691,4 +705,108 @@ async fn every_existing_oauth_mode_revoke_test_still_applies_unedited() {
     let harness = support::http_harness(&oauth_proxy_env(&[])).await;
     let response = drive_revoke(&harness, "not-a-recognized-prefix").await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// --- session sweep (finding 6) -----------------------------------------------
+
+/// A session with no refresh token is swept, upstream-silent, by the next
+/// successful authorization (the only session-creating path). Doorkeeper
+/// silently no-ops revoking an already-expired access token (V1), so a
+/// no-refresh sweep must never call `/oauth/revoke` at all — the `.expect(0)`
+/// mock below is the regression proof; the exact deadline math is store.rs's
+/// unit tests' job, not this file's.
+///
+/// A refresh-bearing sweep's revocation is deliberately **not** covered
+/// here: its deadline is `REFRESH_TTL` (30 days), unreachable by wall clock
+/// in an integration test without a seam that would have to be visible in
+/// production code to cross the test-binary boundary. `store.rs`'s
+/// `sweep_expired`/`sweep_expired_sessions` unit tests hold that invariant
+/// deterministically instead.
+#[tokio::test]
+async fn a_no_refresh_session_is_swept_by_the_next_authorization_with_no_upstream_revoke() {
+    let harness = support::http_harness(&oauth_proxy_env(&[])).await;
+    const FIRST_ACCESS: &str = "upstream-access-sweep-no-refresh";
+    const SECOND_ACCESS: &str = "upstream-access-sweep-trigger";
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
+        .and(body_string_contains("code=first-upstream-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": FIRST_ACCESS,
+            "token_type": "Bearer",
+            "expires_in": 0,
+            "scope": "view_project view_issues",
+        })))
+        .mount(&harness.redmine)
+        .await;
+
+    let first_client_id = register_client(&harness).await;
+    let (first_verifier, first_challenge) = pkce_pair();
+    let first_transaction_state =
+        drive_authorize(&harness, &first_client_id, &first_challenge).await;
+    let first_code = drive_callback_with_upstream_code(
+        &harness,
+        &first_transaction_state,
+        "first-upstream-code",
+    )
+    .await;
+    let first_response =
+        drive_token(&harness, &first_code, &first_client_id, &first_verifier).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body: serde_json::Value = first_response.json().await.expect("json body");
+    assert!(first_body.get("refresh_token").is_none());
+    let first_access = first_body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+
+    // No revocation must ever be attempted for a no-refresh sweep.
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&harness.redmine)
+        .await;
+
+    // A second, independent flow: its successful redemption is the sweep
+    // trigger (the only session-creating path).
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(basic_auth(UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET))
+        .and(body_string_contains("code=second-upstream-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": SECOND_ACCESS,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "view_project view_issues",
+        })))
+        .mount(&harness.redmine)
+        .await;
+    mock_introspect_active(&harness.redmine, SECOND_ACCESS).await;
+    support::mock_current_user(&harness.redmine, None).await;
+
+    let second_client_id = register_client(&harness).await;
+    let (second_verifier, second_challenge) = pkce_pair();
+    let second_transaction_state =
+        drive_authorize(&harness, &second_client_id, &second_challenge).await;
+    let second_code = drive_callback_with_upstream_code(
+        &harness,
+        &second_transaction_state,
+        "second-upstream-code",
+    )
+    .await;
+    let second_response =
+        drive_token(&harness, &second_code, &second_client_id, &second_verifier).await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body: serde_json::Value = second_response.json().await.expect("json body");
+    let second_access = second_body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+
+    // The swept session is gone; the new one works. (`harness` drops at the
+    // end of the test, verifying the `.expect(0)` revoke mock above.)
+    assert!(!call_tool_with_token(&harness, &first_access).await);
+    assert!(call_tool_with_token(&harness, &second_access).await);
 }

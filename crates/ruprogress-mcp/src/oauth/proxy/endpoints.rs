@@ -777,6 +777,39 @@ async fn token(State(state): State<FlowState>, request: Request) -> Response {
     }
 }
 
+/// Sweeps every session past its deadline (finding 6), purging each one's
+/// access token from the introspection cache immediately, and — for
+/// whichever carried a refresh token — revoking it upstream in a
+/// best-effort background task kept off the request path. A session with
+/// no refresh token triggers no upstream call at all: Doorkeeper silently
+/// no-ops revoking an already-expired access token (V1), so there is
+/// nothing revocable left. Called once per `authorization_code` grant, the
+/// only session-creating path (finding 6's sweep trigger); an idle server
+/// otherwise retains expired sessions until the next authorization,
+/// bounded by `MAX_ENTRIES` rather than unbounded.
+fn sweep_expired_sessions(state: &FlowState) {
+    let swept = state.proxy.sweep_expired_sessions();
+    if swept.is_empty() {
+        return;
+    }
+    let mut refreshable = Vec::new();
+    for set in swept {
+        state.verifier.purge(&set.access);
+        if set.refresh.is_some() {
+            refreshable.push(set);
+        }
+    }
+    if refreshable.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        for set in refreshable {
+            revoke_upstream_and_purge(&state, &set).await;
+        }
+    });
+}
+
 /// `grant_type=authorization_code` (F7–F9, R1, R4, R6).
 fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>) -> Response {
     let (Some(code), Some(redirect_uri), Some(client_id), Some(code_verifier)) = (
@@ -805,7 +838,7 @@ fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>)
             if let Some(refresh_digest) = minted_refresh_digest {
                 state.proxy.refresh_tokens.delete_by_digest(refresh_digest);
             }
-            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+            if let Some(upstream) = state.proxy.take_session(&upstream_id) {
                 state.verifier.purge(&upstream.access);
             }
             tracing::warn!(
@@ -815,6 +848,7 @@ fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>)
             token_error(StatusCode::BAD_REQUEST, "invalid_grant")
         }
         RedeemOutcome::Ok(upstream) => {
+            sweep_expired_sessions(state);
             let ttl = upstream
                 .expires_at
                 .saturating_duration_since(Instant::now());
@@ -826,7 +860,11 @@ fn authorization_code_grant(state: &FlowState, fields: &HashMap<String, String>)
             let Some(pair) =
                 mint_token_pair(&state.proxy, client_id, &upstream_id, ttl, wants_refresh)
             else {
-                state.proxy.upstream_tokens.remove(&upstream_id);
+                // The access-token mint can already have succeeded when the
+                // refresh-token mint is what failed; `take_session` cleans
+                // up whichever of the two actually landed, not just the
+                // upstream set.
+                let _ = state.proxy.take_session(&upstream_id);
                 return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
             };
             state.proxy.codes.mark_consumed(
@@ -870,7 +908,7 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
                 // containment — is revoked upstream too, since a leaked
                 // refresh token is a far longer-lived threat than a leaked
                 // authorization code.
-                if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+                if let Some(upstream) = state.proxy.take_session(&upstream_id) {
                     revoke_upstream_and_purge(state, &upstream).await;
                 }
                 tracing::warn!(
@@ -917,7 +955,7 @@ async fn refresh_token_grant(state: &FlowState, fields: &HashMap<String, String>
         Err(error) => {
             tracing::warn!(%error, "upstream refresh failed; the session has been cleaned up");
             state.proxy.refresh_tokens.discard(refresh_token);
-            if let Some(upstream) = state.proxy.upstream_tokens.take(&upstream_id) {
+            if let Some(upstream) = state.proxy.take_session(&upstream_id) {
                 state.verifier.purge(&upstream.access);
             }
             return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
@@ -1058,13 +1096,13 @@ async fn revoke(State(state): State<FlowState>, request: Request) -> Response {
             .proxy
             .tokens
             .take(token)
-            .and_then(|entry| state.proxy.upstream_tokens.take(&entry.upstream_id))
+            .and_then(|entry| state.proxy.take_session(&entry.upstream_id))
     } else if token.starts_with(REFRESH_TOKEN_PREFIX) {
         state
             .proxy
             .refresh_tokens
             .take(token)
-            .and_then(|(_client_id, upstream_id)| state.proxy.upstream_tokens.take(&upstream_id))
+            .and_then(|(_client_id, upstream_id)| state.proxy.take_session(&upstream_id))
     } else {
         None
     };

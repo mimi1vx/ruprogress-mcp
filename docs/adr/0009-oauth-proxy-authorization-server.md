@@ -78,3 +78,12 @@ expired until the client asks for a new one.
   counts in this mode**, `null` elsewhere — enough for an operator to tell
   whether a restart dropped state, without exposing a client id, name, or
   subject that would let one caller learn who else is connected.
+- **Upstream sessions are capped and expire, like every other proxy store.**
+  A session with no refresh token is bounded by its upstream access token's
+  own expiry; a refresh-bearing one is bounded by the same 30-day
+  `REFRESH_TTL` the proxy's own refresh token already uses, since Doorkeeper
+  refresh tokens never expire on their own. Swept lazily on the next
+  successful authorization (this mode's only session-creating path), with
+  the swept session's refresh token — never its already-expired access
+  token — revoked upstream in a best-effort background task, only when the
+  session carried one.
