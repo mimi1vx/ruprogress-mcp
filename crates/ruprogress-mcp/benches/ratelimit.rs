@@ -28,6 +28,15 @@ fn unlimited(max_keys: usize) -> Limiter<u64> {
     Limiter::new(u32::MAX, u32::MAX, max_keys)
 }
 
+/// A limiter using the shipped defaults (`rps = 10`, `burst = 40`). A
+/// pre-filled bucket sits at 39/40 tokens after its first hit — not
+/// pristine — so this is the pessimistic case for a pristine-bucket sweep
+/// before eviction: `unlimited` above makes every pre-filled bucket
+/// pristine and would flatter such a sweep.
+fn realistic(max_keys: usize) -> Limiter<u64> {
+    Limiter::new(10, 40, max_keys)
+}
+
 fn case_a_warm_key(c: &mut Criterion) {
     let limiter = unlimited(MAX_KEYS);
     let mut now = Instant::now();
@@ -67,6 +76,30 @@ fn case_c_new_key_at_capacity(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let limiter = unlimited(MAX_KEYS);
+                let now = Instant::now();
+                for k in 0..u64::try_from(MAX_KEYS).unwrap() {
+                    limiter.check(k, now);
+                }
+                next_key += 1;
+                (limiter, next_key)
+            },
+            |(limiter, key)| limiter.check(key, Instant::now()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+/// Same as `case_c_new_key_at_capacity`, but against `realistic()` so the
+/// pre-filled buckets are not pristine.
+fn case_c_new_key_at_capacity_realistic(c: &mut Criterion) {
+    let mut next_key: u64 = u64::try_from(MAX_KEYS).unwrap();
+    let mut group = c.benchmark_group("ratelimit");
+    group.sample_size(20);
+    group.bench_function("c_new_key_at_capacity_realistic", |b| {
+        b.iter_batched(
+            || {
+                let limiter = realistic(MAX_KEYS);
                 let now = Instant::now();
                 for k in 0..u64::try_from(MAX_KEYS).unwrap() {
                     limiter.check(k, now);
@@ -147,11 +180,38 @@ fn case_d_contention(c: &mut Criterion) {
     group.finish();
 }
 
+/// Same as `case_d_contention`'s saturated legs, but against `realistic()`.
+/// The warm legs are not duplicated: they never evict, so pristine-sweep
+/// cost cannot show up in them regardless of limiter parameters.
+fn case_d_contention_saturated_realistic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ratelimit/d_contention_realistic");
+    for threads in [1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(format!("{threads}_threads_saturated"), |b| {
+            b.iter_custom(|iters| {
+                let limiter = Arc::new(realistic(MAX_KEYS));
+                let now = Instant::now();
+                for k in 0..u64::try_from(MAX_KEYS).unwrap() {
+                    limiter.check(k, now);
+                }
+                let next = Arc::new(AtomicU64::new(u64::try_from(MAX_KEYS).unwrap()));
+                let per_thread = (iters / u64::try_from(threads).unwrap()).max(1);
+                run_parallel(&limiter, threads, per_thread, move |_, _| {
+                    next.fetch_add(1, Ordering::Relaxed)
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     case_a_warm_key,
     case_b_new_key_below_capacity,
     case_c_new_key_at_capacity,
+    case_c_new_key_at_capacity_realistic,
     case_d_contention,
+    case_d_contention_saturated_realistic,
 );
 criterion_main!(benches);

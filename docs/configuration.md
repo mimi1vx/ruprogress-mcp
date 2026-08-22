@@ -72,7 +72,7 @@ Both allowlists reject a value that is set but contains no usable entries
 | `REDMINE_MCP_RATE_LIMIT_BURST` | no | `40` | The standard class's bucket capacity. Must be >= `REDMINE_MCP_RATE_LIMIT_RPS`. |
 | `REDMINE_MCP_RATE_LIMIT_AUTH_RPS` | no | `1` | The **strict** class's refill rate (`/register`, `/authorize`, `/auth/callback`, `/token`, `/revoke` — `oauth-proxy` mode only). Must be > 0. |
 | `REDMINE_MCP_RATE_LIMIT_AUTH_BURST` | no | `10` | The strict class's bucket capacity. Must be >= `REDMINE_MCP_RATE_LIMIT_AUTH_RPS`. |
-| `REDMINE_MCP_RATE_LIMIT_MAX_KEYS` | no | `10000` | Hard cap on each class's bucket map. At capacity, a new key evicts the least-recently-touched entry rather than being refused. |
+| `REDMINE_MCP_RATE_LIMIT_MAX_KEYS` | no | `10000` | Hard cap on each class's bucket map. At capacity, a new key evicts the least-recently-touched entry rather than being refused. The map is sharded (up to 16 shards) to bound lock contention, and the cap is enforced per shard, so effective total capacity under a skewed key distribution can be slightly below this value. |
 
 Both classes key by the request's peer IP address, never a header
 (`X-Forwarded-For`/`X-Real-IP` are never read — see "Rate limiting" below); the
