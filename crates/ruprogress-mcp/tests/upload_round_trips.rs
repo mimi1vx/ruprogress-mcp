@@ -1,8 +1,14 @@
-//! Finding 11 baseline: counts and orders the sequential upstream round
-//! trips `create_redmine_issue`'s `uploads[]` flow issues, and freezes the
-//! current partial-failure output shape as a golden the follow-up
-//! implementation must not silently change. See
-//! `plans/finding-09-11-performance-baselines.md`.
+//! Finding 11: measures the upstream round trips `create_redmine_issue`'s
+//! and `update_redmine_issue`'s `uploads[]` flows issue, after the fix —
+//! `create_redmine_issue` folds attachment metadata into its issue POST via
+//! `include=attachments` (`create_issue_with_attachments`, no per-id GETs
+//! at all); `update_redmine_issue` cannot do that (the include would also
+//! return the issue's pre-existing attachments) and instead runs
+//! `fetch_attachments`' per-id GETs up to `MAX_CONCURRENT_ATTACHMENT_
+//! FETCHES` at a time. Also freezes the current partial-failure output
+//! shape as a golden the follow-up implementation must not silently
+//! change. See `plans/finding-09-11-performance-baselines.md` and
+//! `plans/finding-11-concurrent-attachment-fetch.md`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 fn base64_of(bytes: &[u8]) -> String {
@@ -54,10 +60,18 @@ fn issue_json(id: u64) -> Value {
 
 const RTT: Duration = Duration::from_millis(20);
 
-/// Every upstream call this flow can make responds after a fixed 20ms
-/// delay, regardless of which file it belongs to — enough to tell
-/// sequential execution from concurrent by wall-clock alone.
-async fn mount_delayed(h: &support::Harness) {
+fn uploads_of(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| json!({"content_base64": base64_of(b"x"), "filename": format!("f{i}.txt")}))
+        .collect()
+}
+
+/// Every upstream call `create_redmine_issue`'s upload flow can make
+/// responds after a fixed 20ms delay — enough to tell sequential execution
+/// from concurrent by wall-clock alone. The issue POST returns 201 with no
+/// `attachments` key; that's fine here, since these tests only count and
+/// order requests.
+async fn mount_delayed_create(h: &support::Harness) {
     Mock::given(method("POST"))
         .and(path("/uploads.json"))
         .respond_with(
@@ -69,6 +83,7 @@ async fn mount_delayed(h: &support::Harness) {
         .await;
     Mock::given(method("POST"))
         .and(path("/issues.json"))
+        .and(query_param("include", "attachments"))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_delay(RTT)
@@ -76,8 +91,111 @@ async fn mount_delayed(h: &support::Harness) {
         )
         .mount(&h.redmine)
         .await;
+}
+
+/// Not a CI gate — a measurement. Run explicitly:
+/// `cargo test -p ruprogress-mcp --test upload_round_trips -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "prints measured round-trip counts and wall-clock; not a pass/fail gate"]
+async fn create_issue_upload_flow_is_n_plus_one_round_trips_with_no_attachment_gets() {
+    for n in [1usize, 5, 10] {
+        let h = support::harness(&[]).await;
+        mount_delayed_create(&h).await;
+
+        let start = Instant::now();
+        let result = call(
+            &h,
+            "create_redmine_issue",
+            json!({"project_id": 1, "subject": "s", "uploads": uploads_of(n)}),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{:?}",
+            result.structured_content
+        );
+
+        let requests = h.redmine.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+
+        // Ordering: n sequential POST /uploads.json (resolve_and_mint_
+        // issue_uploads's minting loop, unchanged), then exactly one issue
+        // POST with attachments folded in — no attachment GETs at all
+        // (issues.rs's create_redmine_issue/create_issue_with_attachments).
+        let uploads_seen = paths
+            .iter()
+            .take(n)
+            .filter(|p| p.as_str() == "/uploads.json")
+            .count();
+        assert_eq!(
+            uploads_seen, n,
+            "expected {n} /uploads.json calls first: {paths:?}"
+        );
+        assert_eq!(
+            paths.get(n),
+            Some(&"/issues.json".to_string()),
+            "expected the issue POST right after the uploads: {paths:?}"
+        );
+        assert_eq!(
+            paths.len(),
+            n + 1,
+            "expected no attachment GETs after the issue POST: {paths:?}"
+        );
+
+        let expected_round_trips = n + 1;
+        assert_eq!(
+            requests.len(),
+            expected_round_trips,
+            "round-trip count for {n} files"
+        );
+
+        // Sequential minting, then one combined write: wall-clock should
+        // scale linearly with (uploads + 1) x RTT.
+        let expected_wall_clock = RTT * u32::try_from(expected_round_trips).unwrap();
+        println!(
+            "create n={n}: {expected_round_trips} round trips, wall-clock={elapsed:?} \
+             (arithmetic expectation {expected_wall_clock:?})"
+        );
+        assert!(
+            elapsed >= expected_wall_clock.mul_f64(0.8),
+            "n={n}: wall-clock {elapsed:?} is far below the sequential expectation \
+             {expected_wall_clock:?} — uploads may be running concurrently"
+        );
+    }
+}
+
+/// Every upstream call `update_redmine_issue`'s upload flow can make
+/// responds after a fixed 20ms delay: the PUT (204), the follow-up GET
+/// `update_issue` always does to return the full resource, and every
+/// attachment GET (`fetch_attachments`).
+async fn mount_delayed_update(h: &support::Harness, issue_id: u64) {
+    Mock::given(method("POST"))
+        .and(path("/uploads.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(RTT)
+                .set_body_json(json!({"upload": {"id": 900, "token": "900.token"}})),
+        )
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/issues/{issue_id}.json")))
+        .respond_with(ResponseTemplate::new(204).set_delay(RTT))
+        .mount(&h.redmine)
+        .await;
     Mock::given(method("GET"))
-        .and(path("/attachments/900.json"))
+        .and(path(format!("/issues/{issue_id}.json")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(RTT)
+                .set_body_json(issue_json(issue_id)),
+        )
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/attachments/\d+\.json$"))
         .respond_with(ResponseTemplate::new(200).set_delay(RTT).set_body_json(json!({
             "attachment": {
                 "id": 900, "filename": "f.txt", "filesize": 1,
@@ -94,20 +212,16 @@ async fn mount_delayed(h: &support::Harness) {
 /// `cargo test -p ruprogress-mcp --test upload_round_trips -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "prints measured round-trip counts and wall-clock; not a pass/fail gate"]
-async fn upload_flow_round_trips_scale_linearly_and_run_sequentially() {
+async fn update_issue_attachment_fetches_are_bounded_concurrent() {
     for n in [1usize, 5, 10] {
         let h = support::harness(&[]).await;
-        mount_delayed(&h).await;
-
-        let uploads: Vec<Value> = (0..n)
-            .map(|i| json!({"content_base64": base64_of(b"x"), "filename": format!("f{i}.txt")}))
-            .collect();
+        mount_delayed_update(&h, 7).await;
 
         let start = Instant::now();
         let result = call(
             &h,
-            "create_redmine_issue",
-            json!({"project_id": 1, "subject": "s", "uploads": uploads}),
+            "update_redmine_issue",
+            json!({"issue_id": 7, "uploads": uploads_of(n)}),
         )
         .await;
         let elapsed = start.elapsed();
@@ -119,54 +233,69 @@ async fn upload_flow_round_trips_scale_linearly_and_run_sequentially() {
         );
 
         let requests = h.redmine.received_requests().await.unwrap_or_default();
-        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        let calls: Vec<(String, String)> = requests
+            .iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_string()))
+            .collect();
 
-        // Ordering: n sequential POST /uploads.json (resolve_and_mint_
-        // issue_uploads's minting loop), then the one issue POST, then n
-        // sequential GET /attachments/*.json (fetch_attachments) —
-        // issues.rs:1568-1625.
-        let uploads_seen = paths
+        // Ordering: n sequential POST /uploads.json, then the PUT, then the
+        // GET `update_issue` always does, then n attachment GETs (run
+        // concurrently, but `buffered` still delivers them in id order —
+        // here that's just "last" since they all share one id/path).
+        let uploads_seen = calls
             .iter()
             .take(n)
-            .filter(|p| p.as_str() == "/uploads.json")
+            .filter(|(m, p)| m == "POST" && p == "/uploads.json")
             .count();
         assert_eq!(
             uploads_seen, n,
-            "expected {n} /uploads.json calls first: {paths:?}"
+            "expected {n} /uploads.json calls first: {calls:?}"
         );
         assert_eq!(
-            paths[n], "/issues.json",
-            "expected the issue POST right after the uploads: {paths:?}"
+            calls.get(n),
+            Some(&("PUT".to_string(), "/issues/7.json".to_string())),
+            "expected the PUT right after the uploads: {calls:?}"
         );
-        let attachment_gets = paths[n + 1..]
+        assert_eq!(
+            calls.get(n + 1),
+            Some(&("GET".to_string(), "/issues/7.json".to_string())),
+            "expected update_issue's follow-up GET right after the PUT: {calls:?}"
+        );
+        let attachment_gets = calls[n + 2..]
             .iter()
-            .filter(|p| p.starts_with("/attachments/"))
+            .filter(|(m, p)| m == "GET" && p.starts_with("/attachments/"))
             .count();
         assert_eq!(
             attachment_gets, n,
-            "expected {n} attachment GETs after the issue POST: {paths:?}"
+            "expected {n} attachment GETs after the follow-up GET: {calls:?}"
         );
 
-        let expected_round_trips = 2 * n + 1;
+        let expected_round_trips = n + 2 + n;
         assert_eq!(
             requests.len(),
             expected_round_trips,
             "round-trip count for {n} files"
         );
 
-        // Sequential, not concurrent: every round trip pays the mock's
-        // fixed 20ms delay, so wall-clock should scale linearly with the
-        // count — (uploads + 1 + attachments) x RTT — rather than staying
-        // flat as it would if the mint/fetch loops ran concurrently.
-        let expected_wall_clock = RTT * u32::try_from(expected_round_trips).unwrap();
+        // n sequential uploads, then PUT, then GET, then
+        // ceil(n / MAX_CONCURRENT_ATTACHMENT_FETCHES) buffered phases —
+        // issues.rs's fetch_attachments/MAX_CONCURRENT_ATTACHMENT_FETCHES.
+        let attachment_phases = n.div_ceil(4);
+        let expected_phases = n + 2 + attachment_phases;
+        let expected_wall_clock = RTT * u32::try_from(expected_phases).unwrap();
         println!(
-            "n={n}: {expected_round_trips} round trips, wall-clock={elapsed:?} \
-             (arithmetic expectation {expected_wall_clock:?})"
+            "update n={n}: {expected_round_trips} round trips over {expected_phases} phases, \
+             wall-clock={elapsed:?} (arithmetic expectation {expected_wall_clock:?})"
         );
         assert!(
             elapsed >= expected_wall_clock.mul_f64(0.8),
-            "n={n}: wall-clock {elapsed:?} is far below the sequential expectation \
-             {expected_wall_clock:?} — uploads or attachment fetches may be running concurrently"
+            "n={n}: wall-clock {elapsed:?} is far below the expected {expected_phases} \
+             sequential phases ({expected_wall_clock:?}) — the concurrency bound may be gone"
+        );
+        assert!(
+            elapsed <= expected_wall_clock.mul_f64(1.35),
+            "n={n}: wall-clock {elapsed:?} is far above the expected {expected_phases} \
+             phases ({expected_wall_clock:?}) — attachment fetches may be re-serialised"
         );
     }
 }

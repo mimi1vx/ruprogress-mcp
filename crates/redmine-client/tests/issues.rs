@@ -93,6 +93,41 @@ async fn create_issue_happy_path_sends_expected_body() {
 }
 
 #[tokio::test]
+async fn create_issue_with_attachments_sends_include_query_and_returns_attachments() {
+    let (server, client) = support::mock_redmine().await;
+    let project: redmine_client::ProjectIdentifier = "demo".parse().unwrap();
+    let mut body = issue_json(1, "New issue");
+    body["issue"]["attachments"] = serde_json::json!([
+        {
+            "id": 900, "filename": "f.txt", "filesize": 1,
+            "content_type": "text/plain",
+            "content_url": "http://example.test/attachments/download/900/f.txt",
+            "created_on": "2026-01-01T00:00:00Z"
+        }
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .and(query_param("include", "attachments"))
+        .and(body_json(serde_json::json!({
+            "issue": { "project_id": "demo", "subject": "New issue" }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    let create = IssueCreate::new(ProjectIdent::Identifier(project), "New issue");
+    let issue = client
+        .as_user(&cred)
+        .create_issue_with_attachments(&create)
+        .await
+        .unwrap();
+    let attachments = issue.attachments.unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].id, 900);
+}
+
+#[tokio::test]
 async fn update_issue_happy_path() {
     let (server, client) = support::mock_redmine().await;
     Mock::given(method("PUT"))

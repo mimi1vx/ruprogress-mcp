@@ -534,6 +534,20 @@ impl Scoped<'_> {
         self.read_json(resp, "response").await
     }
 
+    /// Like [`Self::post_json`], with query parameters (e.g.
+    /// `?include=attachments`).
+    pub(crate) async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        q: &Query,
+        body: &B,
+    ) -> crate::Result<T> {
+        let url = self.build_url(path, Some(q))?;
+        let template = self.credential.apply(self.inner.http.post(url)).json(body);
+        let resp = self.send_with_retry(&http::Method::POST, &template).await?;
+        self.read_json(resp, "response").await
+    }
+
     /// Send `form` as `application/x-www-form-urlencoded`, returning the raw
     /// response for the caller to decode (or discard). Not covered by the
     /// retry policy for a different reason than the JSON POST helpers: it
@@ -1145,6 +1159,42 @@ impl Scoped<'_> {
     pub async fn create_issue(&self, new: &issue::IssueCreate) -> crate::Result<issue::Issue> {
         let env: issue::IssueEnvelope = self
             .post_json("issues.json", &issue::IssueCreateEnvelope { issue: new })
+            .await?;
+        Ok(env.issue)
+    }
+
+    /// `POST /issues.json?include=attachments` — same wire format and
+    /// response shape as [`Self::create_issue`], but the created issue's
+    /// `attachments` are populated inline, saving one
+    /// `GET /attachments/{id}.json` per upload on the caller's side.
+    ///
+    /// This is a **create-only** shortcut, not a general `include=` option
+    /// for `POST`: `IssuesController#create` re-renders `show.api.rsb` (the
+    /// same template `GET /issues/{id}.json` uses), gated on
+    /// `params[:include]` exactly as `GET` is — undocumented for `POST`, but
+    /// verified against `redmine/redmine` master and `5.1-stable`
+    /// (2026-08-22). It must never be generalised to a caller-chosen
+    /// [`issue::IssueInclude`] list: `include=journals` on create 500s,
+    /// because `@journals` is `nil` in the create action (also verified
+    /// live) — only `attachments` is safe here, hardcoded rather than
+    /// exposed as a parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Redmine rejects the payload
+    /// (e.g. 422 with validation errors).
+    pub async fn create_issue_with_attachments(
+        &self,
+        new: &issue::IssueCreate,
+    ) -> crate::Result<issue::Issue> {
+        let mut q = Query::default();
+        q.insert("include", "attachments");
+        let env: issue::IssueEnvelope = self
+            .post_json_with_query(
+                "issues.json",
+                &q,
+                &issue::IssueCreateEnvelope { issue: new },
+            )
             .await?;
         Ok(env.issue)
     }

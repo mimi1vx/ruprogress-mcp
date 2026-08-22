@@ -18,7 +18,7 @@ mod support;
 
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 fn body_of(result: &rmcp::model::CallToolResult) -> Value {
@@ -143,8 +143,16 @@ async fn create_redmine_issue_without_uploads_sends_a_byte_identical_body() {
 async fn create_redmine_issue_with_uploads_happy_path() {
     let h = support::harness(&[]).await;
     mock_upload_token(&h.redmine, 99, "99.token").await;
+    let mut created = issue_json(42, "New issue");
+    created["issue"]["attachments"] = json!([{
+        "id": 99, "filename": "notes.txt", "filesize": 11,
+        "content_type": "text/plain",
+        "content_url": format!("{}/attachments/download/99/notes.txt", h.redmine.uri()),
+        "created_on": "2026-01-01T00:00:00Z"
+    }]);
     Mock::given(method("POST"))
         .and(path("/issues.json"))
+        .and(query_param("include", "attachments"))
         .and(body_json(json!({
             "issue": {
                 "project_id": "1",
@@ -152,10 +160,17 @@ async fn create_redmine_issue_with_uploads_happy_path() {
                 "uploads": [{"token": "99.token"}]
             }
         })))
-        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created))
         .mount(&h.redmine)
         .await;
-    mock_attachment_metadata(&h.redmine, 99, "notes.txt").await;
+    // `create_redmine_issue` gets attachments inline from the POST above —
+    // this proves it never falls back to a per-id metadata GET.
+    Mock::given(method("GET"))
+        .and(path("/attachments/99.json"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&h.redmine)
+        .await;
 
     let result = call(
         &h,

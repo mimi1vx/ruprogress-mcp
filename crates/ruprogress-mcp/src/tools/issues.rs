@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use redmine_client::model::IdName;
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
@@ -1485,6 +1486,11 @@ enum IssueUploadOutcome {
 /// decoded bytes; this bounds the same call to ≈ 100 MiB.
 const ISSUE_UPLOADS_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Bounds how many `GET /attachments/{id}.json` requests `fetch_attachments`
+/// has in flight at once. `uploads[]` is capped at 10 items, so this only
+/// ever shortens 2-4 sequential phases into 1.
+const MAX_CONCURRENT_ATTACHMENT_FETCHES: usize = 4;
+
 /// Resolves one `uploads[]` item to its raw bytes and effective filename,
 /// touching no network (the first of two passes): a validation failure here
 /// — on any item — means zero `POST /uploads.json` requests are ever sent
@@ -1561,10 +1567,15 @@ async fn resolve_issue_upload(
 /// network — a validation failure on item N means zero `POST /uploads.json`
 /// requests were sent for *any* item), then mint one upload token per
 /// resolved item, sequentially. Returns the `UploadRef`s to embed in the
-/// create/update payload and the minted attachment ids, in the same order,
-/// for the post-success metadata refetch. `uploads: None` and
-/// `uploads: Some(vec![])` both short-circuit to empty results with no
-/// network calls at all.
+/// create/update payload and the minted attachment ids, in the same order.
+/// `update_redmine_issue` uses the ids for `fetch_attachments`'
+/// post-success metadata refetch; `create_redmine_issue` uses only whether
+/// the list is non-empty, to pick `create_issue_with_attachments` over
+/// `create_issue` — the order still matters there, since it's what proves
+/// (with upstream's `created_on ASC, id ASC` attachment ordering) that a
+/// freshly created issue's inline `attachments` are exactly these uploads.
+/// `uploads: None` and `uploads: Some(vec![])` both short-circuit to empty
+/// results with no network calls at all.
 async fn resolve_and_mint_issue_uploads(
     scoped: &redmine_client::Scoped<'_>,
     roots: &[PathBuf],
@@ -1612,16 +1623,39 @@ async fn resolve_and_mint_issue_uploads(
 /// Fetches full metadata for a batch of just-minted upload ids — each
 /// `Upload::id` from `resolve_and_mint_issue_uploads` is already the
 /// resulting attachment's id, so this is a plain `GET` per id, no search
-/// needed.
+/// needed. Used only by `update_redmine_issue`: `create_redmine_issue` gets
+/// its attachments inline from `create_issue_with_attachments` instead.
+///
+/// Runs up to `MAX_CONCURRENT_ATTACHMENT_FETCHES` of these `GET`s
+/// concurrently via `buffered` (not `buffer_unordered`): `buffered` yields
+/// results in *input* order regardless of completion order, so the returned
+/// `Vec<Attachment>` stays in `ids`' order — callers rely on this to keep
+/// `uploads[]`'s order in the response without re-sorting.
 async fn fetch_attachments(
     scoped: &redmine_client::Scoped<'_>,
     ids: &[u64],
 ) -> redmine_client::Result<Vec<Attachment>> {
-    let mut attachments = Vec::with_capacity(ids.len());
-    for &id in ids {
-        attachments.push(scoped.get_attachment(AttachmentId(id)).await?);
+    futures_util::stream::iter(ids.to_vec())
+        .map(|id| scoped.get_attachment(AttachmentId(id)))
+        .buffered(MAX_CONCURRENT_ATTACHMENT_FETCHES)
+        .try_collect()
+        .await
+}
+
+/// Sends the create-issue POST via `create_issue_with_attachments` when the
+/// call has uploads (so attachments come back inline), or plain
+/// `create_issue` otherwise (no reason to ask Redmine to render an
+/// always-empty `attachments` array).
+async fn send_create(
+    scoped: &redmine_client::Scoped<'_>,
+    create: &IssueCreate,
+    has_uploads: bool,
+) -> redmine_client::Result<Issue> {
+    if has_uploads {
+        scoped.create_issue_with_attachments(create).await
+    } else {
+        scoped.create_issue(create).await
     }
-    Ok(attachments)
 }
 
 #[tool_router(router = issues_tool_router, vis = "pub(crate)")]
@@ -1974,7 +2008,13 @@ impl RedmineMcp {
             custom_fields,
         };
 
-        let (mut issue, autofilled) = match scoped.create_issue(&create).await {
+        // A freshly created issue's inline `attachments` (via `include=
+        // attachments`) *are* the just-minted uploads, so this skips
+        // `fetch_attachments` entirely rather than combining it with a
+        // per-id refetch — see `create_issue_with_attachments`'s doc
+        // comment for why this is create-only.
+        let has_uploads = !attachment_ids.is_empty();
+        let (issue, autofilled) = match send_create(&scoped, &create, has_uploads).await {
             Ok(issue) => (issue, None),
             Err(e) => match recover_required_fields(
                 &scoped,
@@ -1989,7 +2029,7 @@ impl RedmineMcp {
                 Some(RequiredFieldRecovery::GiveUp(result)) => return Ok(result),
                 Some(RequiredFieldRecovery::Retry { merged, fills }) => {
                     create.custom_fields = Some(merged);
-                    match scoped.create_issue(&create).await {
+                    match send_create(&scoped, &create, has_uploads).await {
                         Ok(issue) => (issue, Some(fills)),
                         Err(e2) => {
                             return Ok(retry_still_missing_required_fields(&e2)
@@ -1999,12 +2039,6 @@ impl RedmineMcp {
                 }
             },
         };
-        if !attachment_ids.is_empty() {
-            match fetch_attachments(&scoped, &attachment_ids).await {
-                Ok(attachments) => issue.attachments = Some(attachments),
-                Err(e) => return Ok(to_tool_error(e)),
-            }
-        }
 
         let boundary = Boundary::new();
         let rewrite = self.content_url_rewrite();
