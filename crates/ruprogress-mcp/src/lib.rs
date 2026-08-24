@@ -1,6 +1,11 @@
-//! MCP server library for `ruprogress-mcp`. `main.rs` is a thin CLI/bootstrap
-//! wrapper; integration tests import this crate directly to build in-process
-//! servers over `tokio::io::duplex` (see `tests/support/mod.rs`).
+// The README is the crate docs, so any Rust example added to it becomes a
+// doctest. `tests/readme_cli_flags.rs` pins its CLI table to `--help`.
+#![doc = include_str!("../README.md")]
+//! # Internals
+//!
+//! `main.rs` is a thin CLI/bootstrap wrapper around this library; integration
+//! tests import the crate directly to build in-process servers over
+//! `tokio::io::duplex` (see `tests/support/mod.rs`).
 
 pub mod attachments;
 pub mod auth;

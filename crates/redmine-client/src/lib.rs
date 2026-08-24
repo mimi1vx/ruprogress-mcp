@@ -1,9 +1,7 @@
 #![warn(missing_docs)]
-//! Pure Redmine REST client. No MCP dependencies.
-//!
-//! Every public response struct is `#[non_exhaustive]`: it can only be
-//! obtained by deserializing a real Redmine response, never built as a
-//! struct literal by downstream code (including this crate's own tests).
+// The README is the crate docs, which makes its Rust examples doctests —
+// the only thing that keeps them compiling as this API changes.
+#![doc = include_str!("../README.md")]
 
 pub mod auth;
 pub mod client;
