@@ -196,16 +196,18 @@ async fn no_content_length_204_still_succeeds_through_put_json() {
 #[tokio::test]
 async fn chunked_over_limit_body_with_no_content_length_is_aborted_mid_stream() {
     const LIMIT: u64 = 4 * 1024; // 4 KiB
-    const TOTAL_BODY: usize = 4 * 1024 * 1024; // 4 MiB, far above LIMIT
+    const TOTAL_BODY: usize = 64 * 1024 * 1024; // 64 MiB, far above LIMIT
     const CHUNK: usize = 16 * 1024;
+    // Measured kernel send/receive buffer floor for a stalled loopback
+    // connection: ~2 MiB on Linux (autotuned tcp_wmem/tcp_rmem), ~64 KiB on
+    // macOS. Keep this well above either floor so it never re-triggers on a
+    // kernel-tuning change; `!completed` below is the real invariant.
+    const SENT_SANITY_CEILING: usize = 16 * 1024 * 1024;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback listener");
     let addr = listener.local_addr().expect("local addr");
-
-    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let written_writer = written.clone();
 
     let server_task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept connection");
@@ -217,7 +219,7 @@ async fn chunked_over_limit_body_with_no_content_length_is_aborted_mid_stream() 
         let header =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n";
         if socket.write_all(header).await.is_err() {
-            return;
+            return (false, 0_usize);
         }
 
         let chunk_data = vec![b'a'; CHUNK];
@@ -225,19 +227,19 @@ async fn chunked_over_limit_body_with_no_content_length_is_aborted_mid_stream() 
         while total_sent < TOTAL_BODY {
             let framed = format!("{:x}\r\n", chunk_data.len());
             if socket.write_all(framed.as_bytes()).await.is_err() {
-                break;
+                return (false, total_sent);
             }
             if socket.write_all(&chunk_data).await.is_err() {
-                break;
+                return (false, total_sent);
             }
             if socket.write_all(b"\r\n").await.is_err() {
-                break;
+                return (false, total_sent);
             }
             total_sent = total_sent.saturating_add(chunk_data.len());
-            written_writer.store(total_sent, std::sync::atomic::Ordering::SeqCst);
         }
         // Terminating chunk, if the client is still connected.
         let _ = socket.write_all(b"0\r\n\r\n").await;
+        (true, total_sent)
     });
 
     let base: url::Url = format!("http://{addr}/").parse().expect("valid url");
@@ -262,10 +264,16 @@ async fn chunked_over_limit_body_with_no_content_length_is_aborted_mid_stream() 
         "expected Error::LimitExceeded, got {err:?}"
     );
 
-    let _ = server_task.await;
-    let sent = written.load(std::sync::atomic::Ordering::SeqCst);
+    let (completed, sent) = tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+        .await
+        .expect("fake server task should finish well before the timeout (client stalled without closing?)")
+        .expect("fake server task should not panic");
     assert!(
-        sent < TOTAL_BODY / 4,
+        !completed,
+        "server finished writing the full body — the client never aborted the connection"
+    );
+    assert!(
+        sent < SENT_SANITY_CEILING,
         "client should have aborted well before the server finished writing \
          the full body (sent {sent} of {TOTAL_BODY} bytes)"
     );
