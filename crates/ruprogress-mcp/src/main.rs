@@ -237,7 +237,7 @@ async fn run_stdio(server: RedmineMcp) -> anyhow::Result<()> {
     // SIGTERM can also interrupt (EINTR), nondeterministically finishing
     // that branch with a spurious transport error instead of letting the
     // signal branch win outright. Aborting the task on shutdown sidesteps
-    // that race entirely — the process is about to exit either way.
+    // that race entirely.
     let mut handle = tokio::spawn(transport::stdio::serve(server));
     tokio::select! {
         result = &mut handle => match result {
@@ -248,6 +248,13 @@ async fn run_stdio(server: RedmineMcp) -> anyhow::Result<()> {
         () = wait_for_shutdown_signal() => {
             tracing::info!("shutdown signal received, exiting");
             handle.abort();
+            // `tokio::io::stdin()` (used by `transport::stdio::serve`) reads
+            // on an uncancellable blocking OS thread by its own documented
+            // design. If the client hasn't closed stdin, that thread is
+            // still parked in a blocking read and the runtime's `Drop`
+            // would hang forever waiting to join it. Exit immediately
+            // instead of falling through to that shutdown path.
+            std::process::exit(0);
         }
     }
     Ok(())

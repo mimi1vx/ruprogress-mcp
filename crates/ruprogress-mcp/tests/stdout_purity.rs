@@ -5,7 +5,7 @@
 //! and asserting every non-empty stdout line parses as JSON.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Command, Stdio};
 
 #[test]
@@ -68,13 +68,38 @@ fn sigterm_shuts_the_server_down_cleanly() {
         .env("REDMINE_API_KEY", "test-key")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("binary should spawn");
 
-    // Give the async runtime a moment to install the signal handler before
-    // sending the signal.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "stdout-purity-test", "version": "0.0.1" }
+        }
+    });
+
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin should be piped");
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .expect("write initialize frame");
+    }
+    // Keep stdin open: the process must exit on the signal, not on EOF.
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout should be piped"));
+    let mut response = String::new();
+    stdout
+        .read_line(&mut response)
+        .expect("read initialize response");
+    assert!(
+        !response.trim().is_empty(),
+        "expected a JSON-RPC response proving run_stdio's select! was entered before signalling"
+    );
 
     let status = Command::new("kill")
         .arg("-TERM")
@@ -82,6 +107,10 @@ fn sigterm_shuts_the_server_down_cleanly() {
         .status()
         .expect("kill command should run");
     assert!(status.success(), "failed to send SIGTERM");
+
+    // Drain any remaining stdout before wait() so a full pipe cannot deadlock.
+    let mut rest = String::new();
+    let _ = std::io::Read::read_to_string(&mut stdout, &mut rest);
 
     let exit_status = child.wait().expect("child should exit after SIGTERM");
     assert!(
