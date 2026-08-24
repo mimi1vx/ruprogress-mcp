@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRngCore as _;
-use rand::rngs::OsRng;
+use rand::TryRng as _;
+use rand::rngs::SysRng;
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 
@@ -74,14 +74,14 @@ impl ClientRegistry {
         }
     }
 
-    /// 128 bits of `OsRng`, hex-encoded (C7): public by specification, so a
-    /// plain map key rather than a digest. `OsRng` in `rand` 0.9 is
-    /// fallible (`TryRngCore`); a failure is exceedingly rare (a broken
+    /// 128 bits of `SysRng`, hex-encoded (C7): public by specification, so a
+    /// plain map key rather than a digest. `SysRng` in `rand` 0.9 is
+    /// fallible (`TryRng`); a failure is exceedingly rare (a broken
     /// host, not caller input) and is reported as `None` rather than a
     /// panic — the caller treats it the same as a full store.
     fn mint_client_id() -> Option<String> {
         let mut bytes = [0u8; 16];
-        if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+        if let Err(error) = SysRng.try_fill_bytes(&mut bytes) {
             tracing::error!(%error, "OS RNG unavailable; cannot mint a DCR client_id");
             return None;
         }
@@ -98,7 +98,7 @@ impl ClientRegistry {
     /// ([`TokenStore::live_client_ids`], [`RefreshStore::live_client_ids`]),
     /// built by the caller ([`ProxyState::register_client`]) before this
     /// lock is taken. `None` means the store is still full once reclaimable
-    /// entries are swept, or `OsRng` failed (C8) — the caller turns either
+    /// entries are swept, or `SysRng` failed (C8) — the caller turns either
     /// into a `503` with `Retry-After`.
     pub(crate) fn register(
         &self,
@@ -210,13 +210,13 @@ fn digest(value: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// 256 bits of `OsRng`, base64url-encoded (no padding), prefixed with
+/// 256 bits of `SysRng`, base64url-encoded (no padding), prefixed with
 /// `prefix`. Shared mint routine for transaction ids, authorization codes,
 /// and access tokens — all opaque CSPRNG handles per P2. `None` only on OS
 /// RNG failure (C8's failure mode), never a caller-input failure.
 fn mint_opaque_token(prefix: &str) -> Option<String> {
     let mut bytes = [0u8; 32];
-    if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+    if let Err(error) = SysRng.try_fill_bytes(&mut bytes) {
         tracing::error!(%error, prefix, "OS RNG unavailable; cannot mint an opaque token");
         return None;
     }
@@ -296,7 +296,7 @@ impl TransactionStore {
     }
 
     /// Stores `transaction`, returning the raw id to send upstream as
-    /// `state`. `None` means the store is full or `OsRng` failed (C8); the
+    /// `state`. `None` means the store is full or `SysRng` failed (C8); the
     /// caller turns either into a `503`.
     pub(crate) fn create(&self, transaction: Transaction) -> Option<String> {
         let id = mint_opaque_token("")?;
@@ -377,10 +377,10 @@ impl UpstreamStore {
     }
 
     /// Stores `set`, returning the internal id it was stored under. `None`
-    /// means the store is full of live sessions, or `OsRng` failed (C8).
+    /// means the store is full of live sessions, or `SysRng` failed (C8).
     pub(crate) fn insert(&self, set: UpstreamTokenSet) -> Option<String> {
         let mut bytes = [0u8; 16];
-        if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+        if let Err(error) = SysRng.try_fill_bytes(&mut bytes) {
             tracing::error!(%error, "OS RNG unavailable; cannot mint an upstream-token-set id");
             return None;
         }
@@ -580,7 +580,7 @@ impl CodeStore {
 
     /// Mints a `rup_ac_`-prefixed authorization code bound to `client_id` +
     /// `redirect_uri` + `code_challenge` + `upstream` (F6). `None` means the
-    /// store is full or `OsRng` failed (C8).
+    /// store is full or `SysRng` failed (C8).
     pub(crate) fn mint(
         &self,
         client_id: String,
@@ -735,7 +735,7 @@ impl TokenStore {
     /// expiring after `ttl` (P10: never longer than the upstream token's own
     /// remaining lifetime). Returns the raw token and its digest — the
     /// caller needs the digest to hand to [`CodeStore::mark_consumed`] for
-    /// F8's replay containment. `None` means the store is full or `OsRng`
+    /// F8's replay containment. `None` means the store is full or `SysRng`
     /// failed (C8).
     pub(crate) fn mint(
         &self,
@@ -945,7 +945,7 @@ impl RefreshStore {
     /// Mints a `rup_rt_`-prefixed proxy refresh token bound to `client_id` +
     /// `upstream_id`. Returns the raw token and its digest — the caller
     /// needs the digest to hand to [`CodeStore::mark_consumed`] for F8's
-    /// replay containment. `None` means the store is full or `OsRng`
+    /// replay containment. `None` means the store is full or `SysRng`
     /// failed (C8).
     pub(crate) fn mint(
         &self,
@@ -1131,7 +1131,7 @@ impl ProxyState {
     /// [`ClientRegistry::register`] — each store's lock is released before
     /// the next is acquired, so no lock here is ever held across another.
     /// `None` means the registry is full even after sweeping reclaimable
-    /// entries, or `OsRng` failed (C8); the caller turns either into a
+    /// entries, or `SysRng` failed (C8); the caller turns either into a
     /// `503` with `Retry-After`.
     pub(crate) fn register_client(
         &self,

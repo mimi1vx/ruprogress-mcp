@@ -703,7 +703,7 @@ struct MintedPair {
 
 /// Mints a fresh proxy access token, plus a fresh proxy refresh token when
 /// `wants_refresh` is true (R1, R4). `None` means a store was full or
-/// `OsRng` failed (C8); the caller turns that into a `server_error`. Shared
+/// `SysRng` failed (C8); the caller turns that into a `server_error`. Shared
 /// by the `authorization_code` and `refresh_token` grants so the two mint
 /// exactly the same shape of pair.
 fn mint_token_pair(

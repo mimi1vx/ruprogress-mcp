@@ -5,17 +5,17 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRngCore as _;
-use rand::rngs::OsRng;
+use rand::TryRng as _;
+use rand::rngs::SysRng;
 use sha2::{Digest as _, Sha256};
 
-/// Generates a fresh `code_verifier`: 32 bytes of `OsRng`, base64url-encoded
+/// Generates a fresh `code_verifier`: 32 bytes of `SysRng`, base64url-encoded
 /// (no padding) to the 43-character form RFC 7636 §4.1 recommends. `None`
 /// only if the OS RNG itself is unavailable (C8's same failure mode as
 /// `store::ClientRegistry::mint_client_id`) — never a caller-input failure.
 pub(crate) fn generate_verifier() -> Option<String> {
     let mut bytes = [0u8; 32];
-    if let Err(error) = OsRng.try_fill_bytes(&mut bytes) {
+    if let Err(error) = SysRng.try_fill_bytes(&mut bytes) {
         tracing::error!(%error, "OS RNG unavailable; cannot generate a PKCE verifier");
         return None;
     }
