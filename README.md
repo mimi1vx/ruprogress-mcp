@@ -38,6 +38,7 @@ npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8000/mcp \
 | `--env-file <PATH>` | `.env` if present | Env file to load; the real process environment still wins. |
 | `--log-level <FILTER>` | `RUST_LOG`, else `info` | Tracing filter. |
 | `--print-config` | — | Print the resolved, redacted config as JSON and exit 0. |
+| `--healthcheck` | — | `GET /livez` on the local `SERVER_PORT` and exit 0/1; the container `HEALTHCHECK`. |
 
 Everything else is environment-driven — see [docs/configuration.md](docs/configuration.md).
 
@@ -163,9 +164,10 @@ caveat this IP-keying implies.
 
 ## Docker
 
-A distroless, non-root image, built locally (no registry push, no multi-arch
-matrix). On Apple silicon, pin the build to `arm64` explicitly — an unpinned
-build silently produces `amd64` under emulation:
+A distroless, non-root image, published as a multi-arch (amd64/arm64) manifest
+at `ghcr.io/mimi1vx/ruprogress-mcp` on every release. To build it locally on
+Apple silicon, pin the build to `arm64` explicitly — an unpinned build silently
+produces `amd64` under emulation:
 
 ```sh
 docker build --platform linux/arm64 -t ruprogress-mcp:dev .

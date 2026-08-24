@@ -407,6 +407,31 @@ them.
 prompt-injected will happily relay it. `/readyz` is unauthenticated, so it
 answers only the question it exists to answer.
 
+## `--healthcheck`
+
+`ruprogress-mcp --healthcheck` sends one `GET http://127.0.0.1:<port>/livez`,
+prints nothing, and exits `0` if it answered with a success status or `1`
+otherwise. The container image's `HEALTHCHECK` is exactly this — the distroless
+runtime has no shell and no `curl`, so the binary has to probe itself:
+
+```yaml
+healthcheck:
+  test: ["CMD", "/usr/local/bin/ruprogress-mcp", "--healthcheck"]
+```
+
+Three properties matter when wiring it up:
+
+1. **It reads only `SERVER_PORT` (default `8000`), straight from the process
+   environment.** The flag is handled before config resolution, so an
+   `--env-file`/`.env` is not consulted and no Redmine credential, attachments
+   directory, or anything else is required — the probe answers in a container
+   that would fail to *start* a server.
+2. **It targets `/livez`, never `/readyz`.** A Redmine outage must not become
+   a container restart loop. Point an orchestrator's readiness probe at
+   `/readyz` separately — see "Health endpoints".
+3. **It gives up after 2 seconds** and reports failure, so a hung probe never
+   outlasts the orchestrator's own timeout.
+
 ## Deliberately conservative defaults
 
 Four choices that trade convenience for a safer default. A silent behaviour

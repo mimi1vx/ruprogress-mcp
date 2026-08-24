@@ -21,7 +21,7 @@ services:
       # publication above is the real control on reach.
       REDMINE_MCP_ALLOW_UNAUTHENTICATED_NETWORK: "true"
 
-      # Rate limiting (9.2) defaults — uncomment to override.
+      # Rate limiting defaults — uncomment to override.
       # REDMINE_MCP_RATE_LIMIT_ENABLED: "true"
       # REDMINE_MCP_RATE_LIMIT_RPS: "10"
       # REDMINE_MCP_RATE_LIMIT_BURST: "40"
