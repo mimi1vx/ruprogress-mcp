@@ -21,7 +21,7 @@ repository   = "https://github.com/mimi1vx/ruprogress-mcp"
 
 [workspace.dependencies]
 redmine-client = { path = "crates/redmine-client", version = "0.9.0" }
-rmcp        = { version = "=3.1.1", default-features = false }
+rmcp        = { version = "=3.1.4", default-features = false }
 tokio       = { version = "1.53",  default-features = false }
 reqwest     = { version = "0.13",  default-features = false, features = ["json", "stream", "rustls", "form"] }
 serde       = { version = "1", features = ["derive"] }
@@ -34,21 +34,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 axum        = "0.8"
 # Held at 0.6 deliberately: reqwest 0.13 depends on `tower-http ^0.6.8`, so
 # asking for 0.7 here resolves to two copies of the crate in every build.
-tower-http  = { version = "0.6", default-features = false }
+tower-http  = { version = "0.7", default-features = false }
 secrecy     = "0.10"
 url         = "2.5"
 chrono      = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 uuid        = { version = "1", features = ["v4"] }
 clap        = { version = "4", features = ["derive"] }
 tokio-util  = "0.7"
-rand        = "0.9"
+rand        = "0.10"
 dotenvy     = "0.15"
 http        = "1"
 bytes       = "1"
 wiremock    = "0.6"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-base64      = "0.22"
+base64      = "0.23"
 sha2        = "0.11"
 criterion   = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
