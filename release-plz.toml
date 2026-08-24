@@ -1,0 +1,14 @@
+[workspace]
+publish            = false   # cargo publish happens via OIDC in release.yml
+git_release_enable = false
+git_tag_enable     = false
+changelog_update   = false
+changelog_path     = "./CHANGELOG.md"
+
+[[package]]
+name               = "ruprogress-mcp"
+git_tag_enable     = true
+git_tag_name       = "v{{ version }}"
+git_release_enable = true
+changelog_update   = true
+changelog_include  = ["redmine-client"]

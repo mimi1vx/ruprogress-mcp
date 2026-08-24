@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-24
+
 ### Security
 
 - `redmine-client` now refuses to send credentials anywhere but the
@@ -94,9 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strands an orphaned upload token on the Redmine server. **Breaking:** a
   caller relying on a `content_base64` upload over 50 MiB on stdio, or a
   `uploads[]` batch over 100 MiB aggregate, is now refused with an in-band
-  `FILE_TOO_LARGE` instead of succeeding.
-
-## [0.1.0] - 2026-08-19
+   `FILE_TOO_LARGE` instead of succeeding.
 
 ### Added
 

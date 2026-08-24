@@ -13,13 +13,14 @@ strip         = "debuginfo"
 panic         = "unwind"
 
 [workspace.package]
-version      = "0.1.0"
+version      = "0.9.0"
 edition      = "2024"
 rust-version = "1.96"          # raised from rmcp 3.x's 1.88 floor; see docs/adr/0003
 license      = "MIT"
 repository   = "https://github.com/mimi1vx/ruprogress-mcp"
 
 [workspace.dependencies]
+redmine-client = { path = "crates/redmine-client", version = "0.9.0" }
 rmcp        = { version = "=3.1.1", default-features = false }
 tokio       = { version = "1.53",  default-features = false }
 reqwest     = { version = "0.13",  default-features = false, features = ["json", "stream", "rustls", "form"] }

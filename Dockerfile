@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage, distroless runtime, local build only (no registry push, no
-# multi-arch matrix). Build pinned to a single arch on the command line, e.g.:
+# Multi-stage, distroless runtime. Released as a multi-arch (amd64/arm64)
+# image at ghcr.io/mimi1vx/ruprogress-mcp by .github/workflows/release.yml;
+# for a local build pin a single arch on the command line, e.g.:
 #   docker build --platform linux/arm64 -t ruprogress-mcp:dev .
 #
 # Both base images are pinned by digest so a rebuild is a rebuild, not a
 # lottery: the digests correspond to rust:1.96-bookworm and
 # gcr.io/distroless/cc-debian12:nonroot at the time this file was written.
-# Pinned digests go stale over time — bumping them is a maintenance task, not
-# a CI job, for v1.0.
+# Both are multi-arch OCI indexes (amd64/arm64/…), so the release matrix needs
+# no digest change per arch. Pinned digests go stale over time — bumping them
+# is a maintenance task, not a CI job, for v1.0.
 
 FROM rust@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 WORKDIR /build
@@ -19,6 +21,11 @@ RUN cargo build --locked --release --bin ruprogress-mcp
 RUN mkdir -p /build/attachments-seed && chmod 700 /build/attachments-seed
 
 FROM gcr.io/distroless/cc-debian12@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/mimi1vx/ruprogress-mcp" \
+      org.opencontainers.image.description="MCP server exposing Redmine's REST API to MCP clients over stdio and streamable HTTP" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 
 COPY --from=builder /build/target/release/ruprogress-mcp /usr/local/bin/ruprogress-mcp
 # uid/gid 65532 is the image's built-in "nonroot" user.

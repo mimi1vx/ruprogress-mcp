@@ -14,6 +14,15 @@ cargo run                            # stdio (the default)
 cargo run -- --transport http        # http on 127.0.0.1:8000
 ```
 
+Or install the published crate, or run the container image:
+
+```sh
+cargo install ruprogress-mcp
+docker run --rm -p 8000:8000 \
+  -e REDMINE_URL=https://redmine.example.com -e REDMINE_API_KEY=... \
+  ghcr.io/mimi1vx/ruprogress-mcp:latest --transport http
+```
+
 Point MCP Inspector at it:
 
 ```sh
@@ -258,3 +267,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo deny check
 ```
+
+## Releasing
+
+Versions, the changelog, tags, GitHub Releases, and both crates.io
+publishes are automated — see [docs/releasing.md](docs/releasing.md).

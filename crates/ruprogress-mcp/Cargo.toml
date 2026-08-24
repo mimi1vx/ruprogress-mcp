@@ -1,19 +1,29 @@
 [package]
-name         = "ruprogress-mcp"
-version      = { workspace = true }
-edition      = { workspace = true }
-rust-version = { workspace = true }
-license      = { workspace = true }
-repository   = { workspace = true }
-# The deployable binary, not a library for crates.io: never published, so a
-# workspace path dependency on redmine-client needs no version pin.
-publish      = false
+name          = "ruprogress-mcp"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+description   = "A Redmine MCP server: stdio/HTTP tools, four auth modes, read-only mode, bounded responses, and a local attachment store."
+readme        = "README.md"
+homepage      = "https://github.com/mimi1vx/ruprogress-mcp"
+documentation = "https://docs.rs/ruprogress-mcp"
+keywords      = ["mcp", "redmine", "api-bindings", "server"]
+categories    = ["command-line-utilities", "api-bindings", "development-tools"]
+# `tests/tool_reference_doc.rs` reads `docs/tool-reference.md` from the repo
+# root, outside this package — it cannot pass from the `.crate` alone.
+exclude       = ["/tests"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
 
 [dependencies]
-redmine-client = { path = "../redmine-client" }
+redmine-client = { workspace = true }
 rmcp        = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio       = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "fs", "io-util"] }
 tokio-util  = { workspace = true, features = ["rt", "io"] }
