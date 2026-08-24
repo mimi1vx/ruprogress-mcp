@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.1...v0.9.2) - 2026-08-24
+
+### Other
+
+- fail the build when either README drifts from the code
+- correct the Docker publish claim and expand both crate READMEs
+
 ## [0.9.1](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.0...v0.9.1) - 2026-08-24
 
 ### Fixed
