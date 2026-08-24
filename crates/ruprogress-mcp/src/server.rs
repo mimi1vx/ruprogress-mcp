@@ -245,6 +245,45 @@ impl RedmineMcp {
             .oauth_resource()
             .is_some_and(|oauth| oauth.scope_enforcement)
     }
+
+    /// Synchronous body of `list_tools` (S7/S8): pulled out so the trait
+    /// method itself can stay non-`async` (nothing in here ever awaits) and
+    /// return `std::future::ready(..)` directly instead of boxing a
+    /// zero-`.await` `async fn`.
+    fn list_tools_sync(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let all = self.tool_router.list_all();
+
+        if !self.scope_enforcement_active() {
+            return Ok(ListToolsResult {
+                result_type: Some(ResultType::COMPLETE),
+                tools: all,
+                meta: None,
+                next_cursor: None,
+                ttl_ms: supports_cache_hints.then_some(0),
+                cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+            });
+        }
+
+        let auth = crate::auth::oauth::auth_context(context)?;
+        let tools = all
+            .into_iter()
+            .filter(|tool| scope::visible_for(&tool.name, &auth.scopes))
+            .collect();
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Private),
+        })
+    }
 }
 
 /// Classifies a finished `call_tool` result into the bounded outcome set
@@ -309,40 +348,14 @@ impl ServerHandler for RedmineMcp {
     /// sibling, the `list_tools` generator) would have; the one
     /// behavioural difference (S8) is `cache_scope: Private` when filtering
     /// is active, since a per-token list must never be cached publicly.
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        let supports_cache_hints = context
-            .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
-        let all = self.tool_router.list_all();
-
-        if !self.scope_enforcement_active() {
-            return Ok(ListToolsResult {
-                result_type: Some(ResultType::COMPLETE),
-                tools: all,
-                meta: None,
-                next_cursor: None,
-                ttl_ms: supports_cache_hints.then_some(0),
-                cache_scope: supports_cache_hints.then_some(CacheScope::Public),
-            });
-        }
-
-        let auth = crate::auth::oauth::auth_context(&context)?;
-        let tools = all
-            .into_iter()
-            .filter(|tool| scope::visible_for(&tool.name, &auth.scopes))
-            .collect();
-        Ok(ListToolsResult {
-            result_type: Some(ResultType::COMPLETE),
-            tools,
-            meta: None,
-            next_cursor: None,
-            ttl_ms: supports_cache_hints.then_some(0),
-            cache_scope: supports_cache_hints.then_some(CacheScope::Private),
-        })
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        std::future::ready(self.list_tools_sync(&context))
     }
 
     /// Hand-written for the same reason as `list_tools` above (S7). Outside
