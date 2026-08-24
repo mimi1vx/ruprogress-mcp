@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.0...v0.9.1) - 2026-08-24
+
+### Fixed
+
+- *(main)* exit immediately on SIGTERM instead of falling through runtime drop
+- *(server)* drop the unused async from list_tools
+
+### Other
+
+- *(redmine-client)* make the chunked-abort limits test buffer-independent
+
 ## [0.9.0] - 2026-08-24
 
 ### Security
