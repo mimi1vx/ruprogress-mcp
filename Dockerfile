@@ -12,7 +12,7 @@
 # no digest change per arch. Pinned digests go stale over time — bumping them
 # is a maintenance task, not a CI job, for v1.0.
 
-FROM rust@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+FROM rust@sha256:7f7a53a25a0319dd8284e279d529d45759cb384d59b14cc6806132910f45522e AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --locked --release --bin ruprogress-mcp
