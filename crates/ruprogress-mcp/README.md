@@ -1,5 +1,8 @@
 # ruprogress-mcp
 
+<img src="https://raw.githubusercontent.com/mimi1vx/ruprogress-mcp/main/docs/assets/logo.svg"
+     align="right" width="130" alt="ruprogress-mcp logo">
+
 A Redmine MCP server in Rust. Exposes Redmine's REST API to MCP clients as 41
 tools over stdio and streamable HTTP (47 with every plugin flag on), with four
 authentication modes, a read-only mode, bounded responses, and a local
