@@ -8,6 +8,11 @@ updates:
       cargo-dependencies:
         patterns:
           - "*"
+    ignore:
+      # reqwest 0.13 still requires tower-http ^0.6.8; taking 0.7 here puts
+      # two copies of the crate in every build. Drop this once reqwest moves.
+      - dependency-name: "tower-http"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
