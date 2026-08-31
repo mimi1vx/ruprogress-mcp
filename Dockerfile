@@ -5,14 +5,16 @@
 # for a local build pin a single arch on the command line, e.g.:
 #   docker build --platform linux/arm64 -t ruprogress-mcp:dev .
 #
-# Both base images are pinned by digest so a rebuild is a rebuild, not a
-# lottery: the digests correspond to rust:1.96-bookworm and
-# gcr.io/distroless/cc-debian12:nonroot at the time this file was written.
-# Both are multi-arch OCI indexes (amd64/arm64/…), so the release matrix needs
-# no digest change per arch. Pinned digests go stale over time — bumping them
-# is a maintenance task, not a CI job, for v1.0.
+# Both base images are pinned by tag *and* digest: the tag fixes the distro
+# (so Dependabot can only bump the digest within it, never silently jump
+# distro the way an untagged `rust@sha256:` reference tracks `:latest`), and
+# the digest makes a rebuild a rebuild, not a lottery. Builder and runtime are
+# both Debian trixie deliberately, so the shipped binary's glibc matches what
+# it was linked against. Both are multi-arch OCI indexes (amd64/arm64/…), so
+# the release matrix needs no digest change per arch. .github/workflows/docker.yml
+# smoke-tests every base-image bump before it reaches main.
 
-FROM rust@sha256:7f7a53a25a0319dd8284e279d529d45759cb384d59b14cc6806132910f45522e AS builder
+FROM rust:1.98-trixie@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --locked --release --bin ruprogress-mcp
@@ -20,7 +22,7 @@ RUN cargo build --locked --release --bin ruprogress-mcp
 # with the right owner, so seed it here and copy it across with --chown.
 RUN mkdir -p /build/attachments-seed && chmod 700 /build/attachments-seed
 
-FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/mimi1vx/ruprogress-mcp" \
       org.opencontainers.image.description="MCP server exposing Redmine's REST API to MCP clients over stdio and streamable HTTP" \
