@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 axum        = "0.8"
 # Held at 0.6 deliberately: reqwest 0.13 depends on `tower-http ^0.6.8`, so
 # asking for 0.7 here resolves to two copies of the crate in every build.
-tower-http  = { version = "0.6", default-features = false }
+tower-http  = { version = "0.7", default-features = false }
 secrecy     = "0.10"
 url         = "2.5"
 chrono      = { version = "0.4", default-features = false, features = ["serde", "clock"] }
