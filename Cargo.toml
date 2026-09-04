@@ -21,7 +21,7 @@ repository   = "https://github.com/mimi1vx/ruprogress-mcp"
 
 [workspace.dependencies]
 redmine-client = { path = "crates/redmine-client", version = "0.10.0" }
-rmcp        = { version = "=3.1.4", default-features = false }
+rmcp        = { version = "=3.2.0", default-features = false }
 tokio       = { version = "1.53",  default-features = false }
 reqwest     = { version = "0.13",  default-features = false, features = ["json", "stream", "rustls", "form"] }
 serde       = { version = "1", features = ["derive"] }
