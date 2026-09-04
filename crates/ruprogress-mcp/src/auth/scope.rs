@@ -284,7 +284,8 @@ fn has_agile_field(args: &JsonObject) -> bool {
 
 /// `update_redmine_issue`'s requirement (S5, T7): the notes-only carve-out,
 /// otherwise the `edit_issues` base case plus `manage_subtasks` when
-/// `parent_issue_id` is present (reparenting is its own Redmine permission)
+/// `parent_issue_id` is present (whether set directly or unset via
+/// `clear_fields`; reparenting is its own Redmine permission)
 /// and/or `view_agile_queries` when an agile field is present (its
 /// mandatory read hits the agile endpoint even though the write shares
 /// `update_redmine_issue`'s own `PUT`), and/or the [`TAG_LIST_SCOPES`]
@@ -299,7 +300,12 @@ fn update_redmine_issue_requirement(args: Option<&JsonObject>) -> Requirement {
         return Requirement::Scopes(UPDATE_ISSUE_NOTES_ONLY);
     }
     let agile = has_agile_field(args);
-    let base: &'static [&'static str] = if args.contains_key("parent_issue_id") {
+    let reparenting = args.contains_key("parent_issue_id")
+        || args
+            .get("clear_fields")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("parent_issue_id")));
+    let base: &'static [&'static str] = if reparenting {
         if agile {
             UPDATE_ISSUE_WITH_SUBTASKS_AND_AGILE
         } else {
@@ -585,6 +591,18 @@ mod tests {
             Some(&args(&[
                 ("issue_id", serde_json::json!(1)),
                 ("parent_issue_id", serde_json::json!(2)),
+            ])),
+        );
+        assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_WITH_SUBTASKS));
+    }
+
+    #[test]
+    fn unparenting_via_clear_fields_requires_manage_subtasks_in_addition_to_edit_issues() {
+        let req = required_for_call(
+            "update_redmine_issue",
+            Some(&args(&[
+                ("issue_id", serde_json::json!(1)),
+                ("clear_fields", serde_json::json!(["parent_issue_id"])),
             ])),
         );
         assert_eq!(req, Requirement::Scopes(UPDATE_ISSUE_WITH_SUBTASKS));

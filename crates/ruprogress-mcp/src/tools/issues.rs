@@ -914,9 +914,9 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// this a valid update — it does not need another field or `notes`.
     #[serde(default)]
     pub(crate) custom_fields: Option<Vec<IssueCustomFieldEntry>>,
-    /// Fields to unset back to empty, named here rather than given a
-    /// value. Naming a field and also passing a value for it is rejected.
-    /// A non-empty array alone is enough to make this a valid update — it
+    /// Fields to unset back to empty (e.g. unassign, detach version).
+    /// Naming a field and also passing a value for it is rejected. A
+    /// non-empty array alone is enough to make this a valid update — it
     /// does not need another field or `notes`.
     #[serde(default)]
     pub(crate) clear_fields: Option<Vec<ClearableField>>,
@@ -1038,7 +1038,7 @@ where
 /// `FieldUpdate::Clear` when `field` is named in `clear_fields`, otherwise
 /// whatever the field's own parameter says. A field named in both is
 /// rejected by [`update_clear_conflict`] before this runs.
-fn clear_or<T>(
+fn clear_or<T: Copy>(
     clear: &[ClearableField],
     field: ClearableField,
     value: Option<T>,

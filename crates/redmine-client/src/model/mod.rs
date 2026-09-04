@@ -43,7 +43,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// [`Unchanged`](Self::Unchanged) is the [`Default`], so a payload built with
 /// `..Default::default()` omits every field it does not name.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum FieldUpdate<T> {
     /// Leave the field as it is. The key is omitted from the payload.
     #[default]
@@ -58,15 +58,26 @@ impl<T> FieldUpdate<T> {
     /// Whether this leaves the field alone. Every [`FieldUpdate`] field of a
     /// payload struct needs
     /// `#[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]`.
+    #[must_use]
     pub const fn is_unchanged(&self) -> bool {
         matches!(*self, Self::Unchanged)
     }
+}
 
+impl<T: Copy> FieldUpdate<T> {
     /// `Some(value)` sets the field, `None` leaves it **unchanged** — not
     /// cleared. Clearing has no `Option` spelling on purpose: a caller that
     /// means it says [`FieldUpdate::Clear`].
-    pub fn from_option(value: Option<T>) -> Self {
-        value.map_or(Self::Unchanged, Self::Set)
+    ///
+    /// `const` (and thus the `T: Copy` bound) because dropping a generic
+    /// `Option<T>` is not const-evaluable otherwise; every current
+    /// `FieldUpdate<T>` is a `Copy` type.
+    #[must_use]
+    pub const fn from_option(value: Option<T>) -> Self {
+        match value {
+            Some(v) => Self::Set(v),
+            None => Self::Unchanged,
+        }
     }
 }
 

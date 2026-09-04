@@ -329,8 +329,28 @@ impl IssueUpdate {
     /// change; the struct is `#[non_exhaustive]`, so a struct literal is not
     /// available outside this crate.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            subject: None,
+            description: None,
+            tracker_id: None,
+            status_id: None,
+            priority_id: None,
+            category_id: FieldUpdate::Unchanged,
+            fixed_version_id: FieldUpdate::Unchanged,
+            assigned_to_id: FieldUpdate::Unchanged,
+            parent_issue_id: FieldUpdate::Unchanged,
+            start_date: FieldUpdate::Unchanged,
+            due_date: FieldUpdate::Unchanged,
+            done_ratio: None,
+            estimated_hours: FieldUpdate::Unchanged,
+            is_private: None,
+            notes: None,
+            private_notes: None,
+            uploads: Vec::new(),
+            tag_list: None,
+            custom_fields: None,
+        }
     }
 }
 
