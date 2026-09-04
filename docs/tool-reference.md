@@ -414,21 +414,21 @@ Update fields on an existing issue, or add a note to its history. Use this when 
 |---|---|---|---|
 | `agile_position` | integer \| null | no | New position within its sprint/board (`RedmineUP` Agile plugin). |
 | `agile_sprint_id` | integer \| null | no | New sprint id (`RedmineUP` Agile plugin). `0` removes the issue from |
-| `assigned_to_id` | integer \| null | no | New assignee user id. |
-| `category_id` | integer \| null | no | New category id. |
+| `assigned_to_id` | integer \| null | no | New assignee user id. `null` unassigns the issue. |
+| `category_id` | integer \| null | no | New category id. `null` uncategorises the issue. |
 | `custom_fields` | array<object> | no | Custom field values to set, if changing any. Each entry gives |
 | `description` | string \| null | no | New description. An empty string clears it; omit to leave unchanged. |
 | `done_ratio` | integer \| null | no | New percent done, 0-100. |
-| `due_date` | string \| null | no | New planned due date. |
-| `estimated_hours` | number \| null | no | New estimated hours. |
-| `fixed_version_id` | integer \| null | no | New target version id. |
+| `due_date` | string \| null | no | New planned due date. `null` removes it. |
+| `estimated_hours` | number \| null | no | New estimated hours. `null` removes the estimate. |
+| `fixed_version_id` | integer \| null | no | New target version id. `null` detaches the issue from its version. |
 | `is_private` | boolean \| null | no | New privacy flag. |
 | `issue_id` | integer | yes | The id of the issue to update. |
 | `notes` | string \| null | no | A note to add to the issue's history, independent of any field |
-| `parent_issue_id` | integer \| null | no | New parent issue id, to reparent this issue. |
+| `parent_issue_id` | integer \| null | no | New parent issue id, to reparent this issue. `null` makes it a |
 | `priority_id` | integer \| null | no | New priority id. |
 | `private_notes` | boolean \| null | no | Whether the note added via `notes` is private. Requires the "set |
-| `start_date` | string \| null | no | New planned start date. |
+| `start_date` | string \| null | no | New planned start date. `null` removes it. |
 | `status_id` | integer \| null | no | New status id. |
 | `story_points` | integer \| null | no | New story points (`RedmineUP` Agile plugin). Omit to leave unchanged, |
 | `subject` | string \| null | no | New subject, if changing it. |

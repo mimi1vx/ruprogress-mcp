@@ -559,6 +559,99 @@ async fn update_redmine_issue_with_uploads_only_is_not_a_no_op() {
 }
 
 #[tokio::test]
+async fn update_redmine_issue_clears_the_clearable_fields_with_an_empty_string() {
+    let h = support::harness(&[]).await;
+    // Redmine unsets a field when it receives an empty string for it. A JSON
+    // `null` is not a synonym: it leaves `assigned_to_id` alone and still
+    // answers 204, so a clear that went out as `null` would silently no-op.
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {
+                "assigned_to_id": "",
+                "category_id": "",
+                "due_date": "",
+                "estimated_hours": "",
+                "fixed_version_id": "",
+                "parent_issue_id": "",
+                "start_date": ""
+            }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Existing")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({
+            "issue_id": 7,
+            "assigned_to_id": null,
+            "category_id": null,
+            "due_date": null,
+            "estimated_hours": null,
+            "fixed_version_id": null,
+            "parent_issue_id": null,
+            "start_date": null
+        }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_sets_a_clearable_field_to_a_bare_value() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .and(body_json(json!({
+            "issue": {
+                "assigned_to_id": 46_875,
+                "due_date": "2026-09-02",
+                "estimated_hours": 1.5,
+                "parent_issue_id": 206_352
+            }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.redmine)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "Existing")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({
+            "issue_id": 7,
+            "assigned_to_id": 46_875,
+            "due_date": "2026-09-02",
+            "estimated_hours": 1.5,
+            "parent_issue_id": 206_352
+        }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+}
+
+#[tokio::test]
 async fn update_redmine_issue_rejects_an_empty_notes_string_as_an_argument_error() {
     let h = support::harness(&[]).await;
     let mut request = CallToolRequestParams::new("update_redmine_issue".to_string());

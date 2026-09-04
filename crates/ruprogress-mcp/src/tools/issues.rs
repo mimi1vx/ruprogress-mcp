@@ -10,12 +10,12 @@
 //! past the response-size byte cap. Revisit if a concrete need for it surfaces.
 
 use std::collections::{BTreeMap, HashMap};
+use std::convert::identity;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::{StreamExt as _, TryStreamExt as _};
-use redmine_client::model::IdName;
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
 use redmine_client::model::issue::{
@@ -29,6 +29,7 @@ use redmine_client::model::relation::{IssueRelation as ClientIssueRelation, Issu
 use redmine_client::model::search::{SearchQuery, SearchScope};
 use redmine_client::model::time_entry::TimeEntryQuery;
 use redmine_client::model::upload::UploadRef;
+use redmine_client::model::{FieldUpdate, IdName};
 use redmine_client::{
     AttachmentId, IssueCategoryId, IssueId, JournalId, ProjectId, ProjectIdent, RelationId, UserId,
 };
@@ -814,7 +815,7 @@ pub(crate) struct CreateRedmineIssueOutput {
 )]
 #[allow(
     clippy::option_option,
-    reason = "story_points needs three states (absent/null/value); see its field doc comment"
+    reason = "the clearable fields need three states (absent/null/value); see their field doc comments"
 )]
 pub(crate) struct UpdateRedmineIssueParams {
     /// The id of the issue to update.
@@ -834,30 +835,38 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// New priority id.
     #[serde(default)]
     pub(crate) priority_id: Option<u64>,
-    /// New assignee user id.
-    #[serde(default)]
-    pub(crate) assigned_to_id: Option<u64>,
-    /// New category id.
-    #[serde(default)]
-    pub(crate) category_id: Option<u64>,
-    /// New target version id.
-    #[serde(default)]
-    pub(crate) fixed_version_id: Option<u64>,
-    /// New parent issue id, to reparent this issue.
-    #[serde(default)]
-    pub(crate) parent_issue_id: Option<u64>,
-    /// New planned start date.
-    #[serde(default)]
-    pub(crate) start_date: Option<NaiveDate>,
-    /// New planned due date.
-    #[serde(default)]
-    pub(crate) due_date: Option<NaiveDate>,
+    /// New assignee user id. `null` unassigns the issue.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<u64>")]
+    pub(crate) assigned_to_id: Option<Option<u64>>,
+    /// New category id. `null` uncategorises the issue.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<u64>")]
+    pub(crate) category_id: Option<Option<u64>>,
+    /// New target version id. `null` detaches the issue from its version.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<u64>")]
+    pub(crate) fixed_version_id: Option<Option<u64>>,
+    /// New parent issue id, to reparent this issue. `null` makes it a
+    /// top-level issue again.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<u64>")]
+    pub(crate) parent_issue_id: Option<Option<u64>>,
+    /// New planned start date. `null` removes it.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<NaiveDate>")]
+    pub(crate) start_date: Option<Option<NaiveDate>>,
+    /// New planned due date. `null` removes it.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<NaiveDate>")]
+    pub(crate) due_date: Option<Option<NaiveDate>>,
     /// New percent done, 0-100.
     #[serde(default)]
     pub(crate) done_ratio: Option<u8>,
-    /// New estimated hours.
-    #[serde(default)]
-    pub(crate) estimated_hours: Option<f64>,
+    /// New estimated hours. `null` removes the estimate.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schemars(with = "Option<f64>")]
+    pub(crate) estimated_hours: Option<Option<f64>>,
     /// New privacy flag.
     #[serde(default)]
     pub(crate) is_private: Option<bool>,
@@ -975,9 +984,9 @@ fn update_has_core_change(params: &UpdateRedmineIssueParams) -> bool {
             .is_some_and(|cf| !cf.is_empty())
 }
 
-/// Distinguishes an absent `story_points` key (`None`, leave unchanged) from
-/// a present `null` (`Some(None)`, clear) from a present value
-/// (`Some(Some(n))`, set) — the standard serde double-`Option` idiom.
+/// Distinguishes an absent key (`None`, leave unchanged) from a present
+/// `null` (`Some(None)`, clear) from a present value (`Some(Some(v))`, set)
+/// — the standard serde double-`Option` idiom.
 /// Combined with `#[serde(default)]` on the field: `default` alone would
 /// collapse "absent" and "present `null`" to the same `None`.
 #[allow(
@@ -990,6 +999,22 @@ where
     T: Deserialize<'de>,
 {
     Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Carries a three-state parameter over to the client's clearing convention:
+/// an absent key leaves the field alone, `null` clears it, a value sets it.
+/// `map` adapts a bare id to its newtype, and is `identity` for the fields
+/// that have none.
+#[allow(
+    clippy::option_option,
+    reason = "the three-state parameter this converts from; see deserialize_double_option"
+)]
+fn field_update<T, U>(param: Option<Option<T>>, map: impl FnOnce(T) -> U) -> FieldUpdate<U> {
+    match param {
+        None => FieldUpdate::Unchanged,
+        Some(None) => FieldUpdate::Clear,
+        Some(Some(value)) => FieldUpdate::Set(map(value)),
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2154,14 +2179,14 @@ impl RedmineMcp {
             tracker_id: params.tracker_id,
             status_id: params.status_id,
             priority_id: params.priority_id,
-            category_id: params.category_id,
-            fixed_version_id: params.fixed_version_id,
-            assigned_to_id: params.assigned_to_id.map(UserId),
-            parent_issue_id: params.parent_issue_id.map(IssueId),
-            start_date: params.start_date,
-            due_date: params.due_date,
+            category_id: field_update(params.category_id, identity),
+            fixed_version_id: field_update(params.fixed_version_id, identity),
+            assigned_to_id: field_update(params.assigned_to_id, UserId),
+            parent_issue_id: field_update(params.parent_issue_id, IssueId),
+            start_date: field_update(params.start_date, identity),
+            due_date: field_update(params.due_date, identity),
             done_ratio: params.done_ratio,
-            estimated_hours: params.estimated_hours,
+            estimated_hours: field_update(params.estimated_hours, identity),
             is_private: params.is_private,
             notes: params.notes,
             private_notes: params.private_notes,
