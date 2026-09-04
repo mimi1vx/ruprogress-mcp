@@ -416,7 +416,7 @@ Update fields on an existing issue, or add a note to its history. Use this when 
 | `agile_sprint_id` | integer \| null | no | New sprint id (`RedmineUP` Agile plugin). `0` removes the issue from |
 | `assigned_to_id` | integer \| null | no | New assignee user id. Unassign with `clear_fields`. |
 | `category_id` | integer \| null | no | New category id. Uncategorise with `clear_fields`. |
-| `clear_fields` | array<string> | no | Fields to unset back to empty, named here rather than given a |
+| `clear_fields` | array<string> | no | Fields to unset back to empty (e.g. unassign, detach version). |
 | `custom_fields` | array<object> | no | Custom field values to set, if changing any. Each entry gives |
 | `description` | string \| null | no | New description. An empty string clears it; omit to leave unchanged. |
 | `done_ratio` | integer \| null | no | New percent done, 0-100. |
