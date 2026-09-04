@@ -74,9 +74,12 @@ impl<T: Serialize> Serialize for FieldUpdate<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             // Only reachable through a field that forgot its
-            // `skip_serializing_if`; the `*_omits_every_unchanged_field`
-            // tests exist to catch exactly that.
-            Self::Unchanged => serializer.serialize_none(),
+            // `skip_serializing_if`. Emitting `null` there would put the one
+            // value this type exists to keep off the wire back on it, and
+            // Redmine would answer 204 having done nothing.
+            Self::Unchanged => Err(serde::ser::Error::custom(
+                "FieldUpdate::Unchanged serialized without skip_serializing_if",
+            )),
             Self::Clear => serializer.serialize_str(""),
             Self::Set(value) => value.serialize(serializer),
         }
@@ -191,6 +194,18 @@ mod tests {
             "2026-08-05T10:00:00Z"
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn field_update_unchanged_refuses_to_serialize() {
+        // A field that forgot its `skip_serializing_if` fails here rather
+        // than sending a `null` Redmine would accept and ignore.
+        let error = serde_json::to_value(FieldUpdate::<u64>::Unchanged)
+            .expect_err("Unchanged must not serialize");
+        assert!(
+            error.to_string().contains("skip_serializing_if"),
+            "unexpected error: {error}"
         );
     }
 }

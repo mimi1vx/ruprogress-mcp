@@ -142,10 +142,8 @@ async fn update_issue_happy_path() {
         .await;
 
     let cred = Credential::ApiKey(SecretString::from("k"));
-    let patch = IssueUpdate {
-        notes: Some("done".to_string()),
-        ..Default::default()
-    };
+    let mut patch = IssueUpdate::new();
+    patch.notes = Some("done".to_string());
     let issue = client
         .as_user(&cred)
         .update_issue(IssueId(7), &patch)
@@ -172,10 +170,8 @@ async fn update_issue_sends_tag_list_as_the_full_replacement_array() {
         .await;
 
     let cred = Credential::ApiKey(SecretString::from("k"));
-    let patch = IssueUpdate {
-        tag_list: Some(vec!["a".to_string(), "b".to_string()]),
-        ..Default::default()
-    };
+    let mut patch = IssueUpdate::new();
+    patch.tag_list = Some(vec!["a".to_string(), "b".to_string()]);
     client
         .as_user(&cred)
         .update_issue(IssueId(7), &patch)
@@ -265,23 +261,21 @@ async fn update_issue_sends_custom_fields_with_string_null_and_array_values() {
         .await;
 
     let cred = Credential::ApiKey(SecretString::from("k"));
-    let patch = IssueUpdate {
-        custom_fields: Some(vec![
-            CustomFieldWrite {
-                id: 1,
-                value: CustomFieldValue::Single(Some("blue".to_string())),
-            },
-            CustomFieldWrite {
-                id: 2,
-                value: CustomFieldValue::Single(None),
-            },
-            CustomFieldWrite {
-                id: 3,
-                value: CustomFieldValue::Multiple(vec!["a".to_string(), "b".to_string()]),
-            },
-        ]),
-        ..Default::default()
-    };
+    let mut patch = IssueUpdate::new();
+    patch.custom_fields = Some(vec![
+        CustomFieldWrite {
+            id: 1,
+            value: CustomFieldValue::Single(Some("blue".to_string())),
+        },
+        CustomFieldWrite {
+            id: 2,
+            value: CustomFieldValue::Single(None),
+        },
+        CustomFieldWrite {
+            id: 3,
+            value: CustomFieldValue::Multiple(vec!["a".to_string(), "b".to_string()]),
+        },
+    ]);
     client
         .as_user(&cred)
         .update_issue(IssueId(7), &patch)
@@ -307,10 +301,8 @@ async fn update_issue_omits_custom_fields_key_when_none() {
         .await;
 
     let cred = Credential::ApiKey(SecretString::from("k"));
-    let patch = IssueUpdate {
-        subject: Some("Updated".to_string()),
-        ..Default::default()
-    };
+    let mut patch = IssueUpdate::new();
+    patch.subject = Some("Updated".to_string());
     client
         .as_user(&cred)
         .update_issue(IssueId(7), &patch)
@@ -330,10 +322,8 @@ async fn update_issue_dominant_error_422() {
         .await;
 
     let cred = Credential::ApiKey(SecretString::from("k"));
-    let patch = IssueUpdate {
-        status_id: Some(9999),
-        ..Default::default()
-    };
+    let mut patch = IssueUpdate::new();
+    patch.status_id = Some(9999);
     let err = client
         .as_user(&cred)
         .update_issue(IssueId(7), &patch)

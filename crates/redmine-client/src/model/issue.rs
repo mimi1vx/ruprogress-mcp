@@ -245,12 +245,18 @@ impl IssueCreate {
     }
 }
 
-/// Payload for `PUT /issues/{id}.json`. All fields optional: only those set
-/// are changed. `notes` adds a journal entry without changing any field.
-/// The fields that can be unset again — the assignee, category, target
-/// version, parent, dates and estimate — are [`FieldUpdate`]s, which
-/// distinguish leaving a field alone from clearing it.
+/// Payload for `PUT /issues/{id}.json`. Nothing is changed unless the
+/// corresponding field says so. `notes` adds a journal entry without changing
+/// any field. The fields that can be unset again — the assignee, category,
+/// target version, parent, dates and estimate — are [`FieldUpdate`]s, which
+/// distinguish leaving a field alone from clearing it; the rest are `Option`s
+/// that only ever leave a field alone or set it.
+///
+/// Build one with [`IssueUpdate::new`] and assign the fields you mean to
+/// change: the struct is `#[non_exhaustive]`, so a later field is a minor
+/// release rather than another break.
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct IssueUpdate {
     /// New subject, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,6 +322,16 @@ pub struct IssueUpdate {
     /// Custom field values to set, if changing any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_fields: Option<Vec<CustomFieldWrite>>,
+}
+
+impl IssueUpdate {
+    /// An empty update, changing nothing. Assign the fields you mean to
+    /// change; the struct is `#[non_exhaustive]`, so a struct literal is not
+    /// available outside this crate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// `include=` values accepted by the issue endpoints.
@@ -618,6 +634,7 @@ mod tests {
             due_date: FieldUpdate::Set(NaiveDate::from_ymd_opt(2026, 9, 2).unwrap()),
             estimated_hours: FieldUpdate::Set(1.5),
             fixed_version_id: FieldUpdate::Set(1566),
+            parent_issue_id: FieldUpdate::Set(IssueId(206_352)),
             ..Default::default()
         };
         let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
@@ -627,7 +644,8 @@ mod tests {
                 "assigned_to_id": 46_875,
                 "due_date": "2026-09-02",
                 "estimated_hours": 1.5,
-                "fixed_version_id": 1566
+                "fixed_version_id": 1566,
+                "parent_issue_id": 206_352
             }})
         );
     }

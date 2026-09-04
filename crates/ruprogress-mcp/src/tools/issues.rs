@@ -2173,27 +2173,26 @@ impl RedmineMcp {
             Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
         };
 
-        let mut patch = IssueUpdate {
-            subject: params.subject,
-            description: params.description,
-            tracker_id: params.tracker_id,
-            status_id: params.status_id,
-            priority_id: params.priority_id,
-            category_id: field_update(params.category_id, identity),
-            fixed_version_id: field_update(params.fixed_version_id, identity),
-            assigned_to_id: field_update(params.assigned_to_id, UserId),
-            parent_issue_id: field_update(params.parent_issue_id, IssueId),
-            start_date: field_update(params.start_date, identity),
-            due_date: field_update(params.due_date, identity),
-            done_ratio: params.done_ratio,
-            estimated_hours: field_update(params.estimated_hours, identity),
-            is_private: params.is_private,
-            notes: params.notes,
-            private_notes: params.private_notes,
-            uploads,
-            tag_list,
-            custom_fields,
-        };
+        let mut patch = IssueUpdate::new();
+        patch.subject = params.subject;
+        patch.description = params.description;
+        patch.tracker_id = params.tracker_id;
+        patch.status_id = params.status_id;
+        patch.priority_id = params.priority_id;
+        patch.category_id = field_update(params.category_id, identity);
+        patch.fixed_version_id = field_update(params.fixed_version_id, identity);
+        patch.assigned_to_id = field_update(params.assigned_to_id, UserId);
+        patch.parent_issue_id = field_update(params.parent_issue_id, IssueId);
+        patch.start_date = field_update(params.start_date, identity);
+        patch.due_date = field_update(params.due_date, identity);
+        patch.done_ratio = params.done_ratio;
+        patch.estimated_hours = field_update(params.estimated_hours, identity);
+        patch.is_private = params.is_private;
+        patch.notes = params.notes;
+        patch.private_notes = params.private_notes;
+        patch.uploads = uploads;
+        patch.tag_list = tag_list;
+        patch.custom_fields = custom_fields;
 
         // The core PUT and the agile PUT are separate requests to endpoints
         // with different validation: skip the core one when only agile
