@@ -29,7 +29,59 @@ pub mod version;
 pub mod wiki;
 
 pub use custom_field::CustomField;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// One field of a write payload: left alone, cleared, or set to a value.
+///
+/// Redmine clears a field when it receives an **empty string** for it, and
+/// JSON `null` is not a synonym. Against progress.opensuse.org (Redmine 6.x),
+/// `{"issue": {"assigned_to_id": null}}` answers `204` and leaves the
+/// assignee untouched, while `{"issue": {"assigned_to_id": ""}}` unassigns
+/// the issue; `null` happens to clear the dates and the estimate, but a
+/// per-field rule is not something a caller should have to know. This type
+/// always sends `""`.
+///
+/// [`Unchanged`](Self::Unchanged) is the [`Default`], so a payload built with
+/// `..Default::default()` omits every field it does not name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum FieldUpdate<T> {
+    /// Leave the field as it is. The key is omitted from the payload.
+    #[default]
+    Unchanged,
+    /// Clear the field back to unset, by sending an empty string.
+    Clear,
+    /// Set the field to this value.
+    Set(T),
+}
+
+impl<T> FieldUpdate<T> {
+    /// Whether this leaves the field alone. Every [`FieldUpdate`] field of a
+    /// payload struct needs
+    /// `#[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]`.
+    pub const fn is_unchanged(&self) -> bool {
+        matches!(*self, Self::Unchanged)
+    }
+
+    /// `Some(value)` sets the field, `None` leaves it **unchanged** — not
+    /// cleared. Clearing has no `Option` spelling on purpose: a caller that
+    /// means it says [`FieldUpdate::Clear`].
+    pub fn from_option(value: Option<T>) -> Self {
+        value.map_or(Self::Unchanged, Self::Set)
+    }
+}
+
+impl<T: Serialize> Serialize for FieldUpdate<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Only reachable through a field that forgot its
+            // `skip_serializing_if`; the `*_omits_every_unchanged_field`
+            // tests exist to catch exactly that.
+            Self::Unchanged => serializer.serialize_none(),
+            Self::Clear => serializer.serialize_str(""),
+            Self::Set(value) => value.serialize(serializer),
+        }
+    }
+}
 
 /// The ubiquitous Redmine `{ "id": 3, "name": "Bug" }` shape.
 #[non_exhaustive]

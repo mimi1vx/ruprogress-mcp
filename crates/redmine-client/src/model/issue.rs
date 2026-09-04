@@ -12,7 +12,8 @@ use super::plugins::tags::IssueTag;
 use super::relation::IssueRelation;
 use super::upload::UploadRef;
 use super::{
-    Collection, CustomField, IdName, IdOnly, permissive_datetime, permissive_datetime_opt,
+    Collection, CustomField, FieldUpdate, IdName, IdOnly, permissive_datetime,
+    permissive_datetime_opt,
 };
 use crate::ids::{IssueId, ProjectIdent, UserId};
 
@@ -246,10 +247,9 @@ impl IssueCreate {
 
 /// Payload for `PUT /issues/{id}.json`. All fields optional: only those set
 /// are changed. `notes` adds a journal entry without changing any field.
-/// There is no supported way to *clear* `assigned_to_id`/`category_id`/
-/// `fixed_version_id`/`parent_issue_id` back to unset through this type —
-/// Redmine accepts an empty string for that over the wire, but this client
-/// only ever sends a present value or omits the field entirely.
+/// The fields that can be unset again — the assignee, category, target
+/// version, parent, dates and estimate — are [`FieldUpdate`]s, which
+/// distinguish leaving a field alone from clearing it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IssueUpdate {
     /// New subject, if changing it.
@@ -267,30 +267,32 @@ pub struct IssueUpdate {
     /// New priority id, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority_id: Option<u64>,
-    /// New category id, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category_id: Option<u64>,
-    /// New target version id, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fixed_version_id: Option<u64>,
-    /// New assignee, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assigned_to_id: Option<UserId>,
-    /// New parent issue, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_issue_id: Option<IssueId>,
-    /// New planned start date, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_date: Option<NaiveDate>,
-    /// New planned due date, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub due_date: Option<NaiveDate>,
+    /// New category id. [`FieldUpdate::Clear`] uncategorises the issue.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub category_id: FieldUpdate<u64>,
+    /// New target version id. [`FieldUpdate::Clear`] detaches the issue from
+    /// whatever version it is in.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub fixed_version_id: FieldUpdate<u64>,
+    /// New assignee. [`FieldUpdate::Clear`] unassigns the issue.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub assigned_to_id: FieldUpdate<UserId>,
+    /// New parent issue. [`FieldUpdate::Clear`] makes the issue top-level
+    /// again.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub parent_issue_id: FieldUpdate<IssueId>,
+    /// New planned start date. [`FieldUpdate::Clear`] removes it.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub start_date: FieldUpdate<NaiveDate>,
+    /// New planned due date. [`FieldUpdate::Clear`] removes it.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub due_date: FieldUpdate<NaiveDate>,
     /// New done ratio, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_ratio: Option<u8>,
-    /// New estimated hours, if changing it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_hours: Option<f64>,
+    /// New estimated hours. [`FieldUpdate::Clear`] removes the estimate.
+    #[serde(skip_serializing_if = "FieldUpdate::is_unchanged")]
+    pub estimated_hours: FieldUpdate<f64>,
     /// New privacy flag, if changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_private: Option<bool>,
@@ -574,6 +576,69 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .unwrap();
         assert!(!obj.contains_key("uploads"));
+    }
+
+    #[test]
+    fn issue_update_omits_every_unchanged_field() {
+        let patch = IssueUpdate::default();
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        // Not just the `FieldUpdate` fields: an empty patch must be an empty
+        // object, or some field is serializing a `null` that Redmine would
+        // read as a clear.
+        assert_eq!(value, serde_json::json!({"issue": {}}));
+    }
+
+    #[test]
+    fn issue_update_clears_a_field_with_an_empty_string_not_a_null() {
+        // Redmine ignores `{"assigned_to_id": null}` outright (204, assignee
+        // unchanged) and only unassigns on `""`.
+        let patch = IssueUpdate {
+            assigned_to_id: FieldUpdate::Clear,
+            due_date: FieldUpdate::Clear,
+            estimated_hours: FieldUpdate::Clear,
+            parent_issue_id: FieldUpdate::Clear,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"issue": {
+                "assigned_to_id": "",
+                "due_date": "",
+                "estimated_hours": "",
+                "parent_issue_id": ""
+            }})
+        );
+    }
+
+    #[test]
+    fn issue_update_set_serializes_the_bare_value() {
+        let patch = IssueUpdate {
+            assigned_to_id: FieldUpdate::Set(UserId(46_875)),
+            due_date: FieldUpdate::Set(NaiveDate::from_ymd_opt(2026, 9, 2).unwrap()),
+            estimated_hours: FieldUpdate::Set(1.5),
+            fixed_version_id: FieldUpdate::Set(1566),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(IssueUpdateEnvelope { issue: &patch }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"issue": {
+                "assigned_to_id": 46_875,
+                "due_date": "2026-09-02",
+                "estimated_hours": 1.5,
+                "fixed_version_id": 1566
+            }})
+        );
+    }
+
+    #[test]
+    fn field_update_from_option_leaves_none_unchanged_rather_than_clearing() {
+        assert_eq!(
+            FieldUpdate::from_option(None::<u64>),
+            FieldUpdate::Unchanged
+        );
+        assert_eq!(FieldUpdate::from_option(Some(7)), FieldUpdate::Set(7));
     }
 
     #[test]
