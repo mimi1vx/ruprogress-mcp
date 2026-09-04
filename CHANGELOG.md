@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.3...v0.10.0) - 2026-09-04
+
+### Added
+
+- clear issue fields by name so portable-schema clients can too
+- [**breaking**] seal IssueUpdate and reject a stray Unchanged at serialization
+- [**breaking**] clear issue fields that could previously only be set
+
+### Fixed
+
+- close manage_subtasks bypass via clear_fields reparenting
+
 ## [0.9.3](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.2...v0.9.3) - 2026-08-25
 
 ### Other
