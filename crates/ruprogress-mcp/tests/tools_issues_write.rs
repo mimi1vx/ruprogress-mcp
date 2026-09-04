@@ -561,9 +561,10 @@ async fn update_redmine_issue_with_uploads_only_is_not_a_no_op() {
 #[tokio::test]
 async fn update_redmine_issue_clears_the_clearable_fields_with_an_empty_string() {
     let h = support::harness(&[]).await;
-    // Redmine unsets a field when it receives an empty string for it. A JSON
-    // `null` is not a synonym: it leaves `assigned_to_id` alone and still
-    // answers 204, so a clear that went out as `null` would silently no-op.
+    // A named field goes out as an empty string, which is what unsets a
+    // field in Redmine. A JSON `null` is not a synonym: it leaves
+    // `assigned_to_id` alone and still answers 204, so a clear that went out
+    // as `null` would silently no-op. Clearing alone is also a valid update.
     Mock::given(method("PUT"))
         .and(path("/issues/7.json"))
         .and(body_json(json!({
@@ -591,13 +592,15 @@ async fn update_redmine_issue_clears_the_clearable_fields_with_an_empty_string()
         "update_redmine_issue",
         json!({
             "issue_id": 7,
-            "assigned_to_id": null,
-            "category_id": null,
-            "due_date": null,
-            "estimated_hours": null,
-            "fixed_version_id": null,
-            "parent_issue_id": null,
-            "start_date": null
+            "clear_fields": [
+                "assigned_to_id",
+                "category_id",
+                "due_date",
+                "estimated_hours",
+                "fixed_version_id",
+                "parent_issue_id",
+                "start_date"
+            ]
         }),
     )
     .await;
@@ -648,6 +651,40 @@ async fn update_redmine_issue_sets_a_clearable_field_to_a_bare_value() {
         Some(true),
         "{:?}",
         result.structured_content
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_rejects_a_field_that_is_both_set_and_cleared() {
+    let h = support::harness(&[]).await;
+    let mut request = CallToolRequestParams::new("update_redmine_issue".to_string());
+    request.arguments = json!({
+        "issue_id": 7,
+        "due_date": "2026-09-02",
+        "clear_fields": ["due_date"]
+    })
+    .as_object()
+    .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(
+        result.is_err(),
+        "setting and clearing the same field must not pick one silently"
+    );
+}
+
+#[tokio::test]
+async fn update_redmine_issue_rejects_an_empty_clear_fields_as_a_no_op() {
+    let h = support::harness(&[]).await;
+    // The opposite of `tag_list: []`, which clears every tag and is a
+    // change: naming no field to clear changes nothing.
+    let mut request = CallToolRequestParams::new("update_redmine_issue".to_string());
+    request.arguments = json!({"issue_id": 7, "clear_fields": []})
+        .as_object()
+        .cloned();
+    let result = h.client.call_tool(request).await;
+    assert!(
+        result.is_err(),
+        "clearing nothing should be rejected before any request is sent"
     );
 }
 

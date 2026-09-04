@@ -10,7 +10,6 @@
 //! past the response-size byte cap. Revisit if a concrete need for it surfaces.
 
 use std::collections::{BTreeMap, HashMap};
-use std::convert::identity;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -815,7 +814,7 @@ pub(crate) struct CreateRedmineIssueOutput {
 )]
 #[allow(
     clippy::option_option,
-    reason = "the clearable fields need three states (absent/null/value); see their field doc comments"
+    reason = "story_points needs three states (absent/null/value); see its field doc comment"
 )]
 pub(crate) struct UpdateRedmineIssueParams {
     /// The id of the issue to update.
@@ -835,38 +834,31 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// New priority id.
     #[serde(default)]
     pub(crate) priority_id: Option<u64>,
-    /// New assignee user id. `null` unassigns the issue.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<u64>")]
-    pub(crate) assigned_to_id: Option<Option<u64>>,
-    /// New category id. `null` uncategorises the issue.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<u64>")]
-    pub(crate) category_id: Option<Option<u64>>,
-    /// New target version id. `null` detaches the issue from its version.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<u64>")]
-    pub(crate) fixed_version_id: Option<Option<u64>>,
-    /// New parent issue id, to reparent this issue. `null` makes it a
-    /// top-level issue again.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<u64>")]
-    pub(crate) parent_issue_id: Option<Option<u64>>,
-    /// New planned start date. `null` removes it.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<NaiveDate>")]
-    pub(crate) start_date: Option<Option<NaiveDate>>,
-    /// New planned due date. `null` removes it.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<NaiveDate>")]
-    pub(crate) due_date: Option<Option<NaiveDate>>,
+    /// New assignee user id. Unassign with `clear_fields`.
+    #[serde(default)]
+    pub(crate) assigned_to_id: Option<u64>,
+    /// New category id. Uncategorise with `clear_fields`.
+    #[serde(default)]
+    pub(crate) category_id: Option<u64>,
+    /// New target version id. Detach from the version with `clear_fields`.
+    #[serde(default)]
+    pub(crate) fixed_version_id: Option<u64>,
+    /// New parent issue id, to reparent this issue. Make it top-level again
+    /// with `clear_fields`.
+    #[serde(default)]
+    pub(crate) parent_issue_id: Option<u64>,
+    /// New planned start date. Remove it with `clear_fields`.
+    #[serde(default)]
+    pub(crate) start_date: Option<NaiveDate>,
+    /// New planned due date. Remove it with `clear_fields`.
+    #[serde(default)]
+    pub(crate) due_date: Option<NaiveDate>,
     /// New percent done, 0-100.
     #[serde(default)]
     pub(crate) done_ratio: Option<u8>,
-    /// New estimated hours. `null` removes the estimate.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    #[schemars(with = "Option<f64>")]
-    pub(crate) estimated_hours: Option<Option<f64>>,
+    /// New estimated hours. Remove the estimate with `clear_fields`.
+    #[serde(default)]
+    pub(crate) estimated_hours: Option<f64>,
     /// New privacy flag.
     #[serde(default)]
     pub(crate) is_private: Option<bool>,
@@ -922,6 +914,46 @@ pub(crate) struct UpdateRedmineIssueParams {
     /// this a valid update — it does not need another field or `notes`.
     #[serde(default)]
     pub(crate) custom_fields: Option<Vec<IssueCustomFieldEntry>>,
+    /// Fields to unset back to empty, named here rather than given a
+    /// value. Naming a field and also passing a value for it is rejected.
+    /// A non-empty array alone is enough to make this a valid update — it
+    /// does not need another field or `notes`.
+    #[serde(default)]
+    pub(crate) clear_fields: Option<Vec<ClearableField>>,
+}
+
+/// A field `update_redmine_issue` can unset back to empty.
+// Clearing is a named field rather than a `null` value because the portable
+// schema dialect collapses `{"type": ["integer", "null"]}` to
+// `{"type": "integer"}` (ADR 0007), which would leave the clear
+// unrepresentable for exactly the clients that dialect exists to serve. A
+// string enum survives both dialects intact. Kept out of the doc comment so
+// it stays out of the schema every client sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClearableField {
+    AssignedToId,
+    CategoryId,
+    FixedVersionId,
+    ParentIssueId,
+    StartDate,
+    DueDate,
+    EstimatedHours,
+}
+
+impl ClearableField {
+    /// The parameter this clears, for error messages.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::AssignedToId => "assigned_to_id",
+            Self::CategoryId => "category_id",
+            Self::FixedVersionId => "fixed_version_id",
+            Self::ParentIssueId => "parent_issue_id",
+            Self::StartDate => "start_date",
+            Self::DueDate => "due_date",
+            Self::EstimatedHours => "estimated_hours",
+        }
+    }
 }
 
 /// Validates and trims a `tag_list` parameter (T1): a name that is empty
@@ -973,6 +1005,8 @@ fn update_has_core_change(params: &UpdateRedmineIssueParams) -> bool {
         || params.is_private.is_some()
         || params.notes.is_some()
         || params.tag_list.is_some()
+        // clearing alone is a change like any other; an empty array is not
+        || params.clear_fields.as_ref().is_some_and(|c| !c.is_empty())
         // uploads alone (no other field, no notes) is a legitimate
         // update, not a no-op; same for a non-empty custom_fields (F18) —
         // both change the core PUT's body without touching any of the
@@ -1001,20 +1035,35 @@ where
     Deserialize::deserialize(deserializer).map(Some)
 }
 
-/// Carries a three-state parameter over to the client's clearing convention:
-/// an absent key leaves the field alone, `null` clears it, a value sets it.
-/// `map` adapts a bare id to its newtype, and is `identity` for the fields
-/// that have none.
-#[allow(
-    clippy::option_option,
-    reason = "the three-state parameter this converts from; see deserialize_double_option"
-)]
-fn field_update<T, U>(param: Option<Option<T>>, map: impl FnOnce(T) -> U) -> FieldUpdate<U> {
-    match param {
-        None => FieldUpdate::Unchanged,
-        Some(None) => FieldUpdate::Clear,
-        Some(Some(value)) => FieldUpdate::Set(map(value)),
+/// `FieldUpdate::Clear` when `field` is named in `clear_fields`, otherwise
+/// whatever the field's own parameter says. A field named in both is
+/// rejected by [`update_clear_conflict`] before this runs.
+fn clear_or<T>(
+    clear: &[ClearableField],
+    field: ClearableField,
+    value: Option<T>,
+) -> FieldUpdate<T> {
+    if clear.contains(&field) {
+        FieldUpdate::Clear
+    } else {
+        FieldUpdate::from_option(value)
     }
+}
+
+/// The first field that is both set and named in `clear_fields`, if any.
+/// The two mean opposite things, and honouring one of them silently would
+/// hide the mistake.
+fn update_clear_conflict(params: &UpdateRedmineIssueParams) -> Option<ClearableField> {
+    let clear = params.clear_fields.as_deref()?;
+    clear.iter().copied().find(|field| match field {
+        ClearableField::AssignedToId => params.assigned_to_id.is_some(),
+        ClearableField::CategoryId => params.category_id.is_some(),
+        ClearableField::FixedVersionId => params.fixed_version_id.is_some(),
+        ClearableField::ParentIssueId => params.parent_issue_id.is_some(),
+        ClearableField::StartDate => params.start_date.is_some(),
+        ClearableField::DueDate => params.due_date.is_some(),
+        ClearableField::EstimatedHours => params.estimated_hours.is_some(),
+    })
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2119,6 +2168,16 @@ impl RedmineMcp {
                 None,
             ));
         }
+        if let Some(field) = update_clear_conflict(&params) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{} is both set and named in clear_fields; pass a value to set it or name \
+                     it to clear it, not both",
+                    field.name()
+                ),
+                None,
+            ));
+        }
         let has_core_change = update_has_core_change(&params);
         let has_agile_change = params.story_points.is_some()
             || params.agile_sprint_id.is_some()
@@ -2173,20 +2232,37 @@ impl RedmineMcp {
             Err(IssueUploadOutcome::InBand(r)) => return Ok(r),
         };
 
+        let clear = params.clear_fields.unwrap_or_default();
         let mut patch = IssueUpdate::new();
         patch.subject = params.subject;
         patch.description = params.description;
         patch.tracker_id = params.tracker_id;
         patch.status_id = params.status_id;
         patch.priority_id = params.priority_id;
-        patch.category_id = field_update(params.category_id, identity);
-        patch.fixed_version_id = field_update(params.fixed_version_id, identity);
-        patch.assigned_to_id = field_update(params.assigned_to_id, UserId);
-        patch.parent_issue_id = field_update(params.parent_issue_id, IssueId);
-        patch.start_date = field_update(params.start_date, identity);
-        patch.due_date = field_update(params.due_date, identity);
+        patch.category_id = clear_or(&clear, ClearableField::CategoryId, params.category_id);
+        patch.fixed_version_id = clear_or(
+            &clear,
+            ClearableField::FixedVersionId,
+            params.fixed_version_id,
+        );
+        patch.assigned_to_id = clear_or(
+            &clear,
+            ClearableField::AssignedToId,
+            params.assigned_to_id.map(UserId),
+        );
+        patch.parent_issue_id = clear_or(
+            &clear,
+            ClearableField::ParentIssueId,
+            params.parent_issue_id.map(IssueId),
+        );
+        patch.start_date = clear_or(&clear, ClearableField::StartDate, params.start_date);
+        patch.due_date = clear_or(&clear, ClearableField::DueDate, params.due_date);
         patch.done_ratio = params.done_ratio;
-        patch.estimated_hours = field_update(params.estimated_hours, identity);
+        patch.estimated_hours = clear_or(
+            &clear,
+            ClearableField::EstimatedHours,
+            params.estimated_hours,
+        );
         patch.is_private = params.is_private;
         patch.notes = params.notes;
         patch.private_notes = params.private_notes;
