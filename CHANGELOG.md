@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.10.0...v0.10.1) - 2026-09-04
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.10.0](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.9.3...v0.10.0) - 2026-09-04
 
 ### Added
