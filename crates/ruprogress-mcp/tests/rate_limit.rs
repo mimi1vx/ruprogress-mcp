@@ -13,12 +13,22 @@
 
 mod support;
 
+use std::sync::OnceLock;
+
 use reqwest::StatusCode;
 
+/// One client for the whole binary: building a fresh `reqwest::Client` per
+/// request can cost more than the limiter's refill interval on a loaded
+/// runner, which would give the bucket time to recover mid-"burst".
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .build()
-        .expect("build a test HTTP client")
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .expect("build a test HTTP client")
+        })
+        .clone()
 }
 
 fn initialize_body() -> serde_json::Value {
@@ -59,7 +69,11 @@ fn oauth_proxy_env(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str,
 
 #[tokio::test]
 async fn a_burst_to_mcp_gets_429_with_retry_after_while_livez_stays_up() {
-    let harness = support::http_harness(&[]).await;
+    // Refill pinned to 1/s, capacity left at its default 40: at the default
+    // 10/s a 100-request loop only ever empties the bucket if every request
+    // completes within 60ms, so a slow runner refills faster than the loop
+    // drains and the burst never trips.
+    let harness = support::http_harness(&[("REDMINE_MCP_RATE_LIMIT_RPS", "1")]).await;
 
     let mut saw_429 = false;
     for _ in 0..100 {
