@@ -22,7 +22,7 @@ RUN cargo build --locked --release --bin ruprogress-mcp
 # with the right owner, so seed it here and copy it across with --chown.
 RUN mkdir -p /build/attachments-seed && chmod 700 /build/attachments-seed
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/mimi1vx/ruprogress-mcp" \
       org.opencontainers.image.description="MCP server exposing Redmine's REST API to MCP clients over stdio and streamable HTTP" \
