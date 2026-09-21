@@ -10,7 +10,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities, ServerInfo,
+    PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
@@ -335,8 +335,8 @@ const BOUNDARY_INSTRUCTIONS: &str = "Read-only Redmine access: current user, pro
 
 #[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for RedmineMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(BOUNDARY_INSTRUCTIONS.to_string())
     }
