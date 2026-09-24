@@ -89,7 +89,7 @@ schema didn't specify the schema type field`) rather than warning like Ajv
 does for the `uint*` `format` case above.
 
 `tools::schema::to_portable` extends this module's central-normalizer
-pattern with two more transforms, gated behind
+pattern with three more transforms, gated behind
 `REDMINE_MCP_SCHEMA_DIALECT=portable` (`crate::config::SchemaDialect`,
 default `strict`):
 
@@ -99,17 +99,18 @@ default `strict`):
   entry — even shrinks `tools/list` slightly).
 - Collapse `{"type":["T","null"]}` (every `Option<T>` for a scalar `T`) to
   `{"type":"T"}`.
+- **Stage 2, confirmed necessary**: collapse a bare untagged `anyOf` (no
+  sibling `type`) into `{"type": "string"}` when every branch is a leaf
+  scalar schema. Covers `ProjectRef`/`AssignedToRef`/`UserRef`. See
+  `tools::schema::collapse_scalar_any_of`.
 
 This is opt-in, not the default, because the portable form is **lossy**: a
 model can no longer see that an optional field may be explicitly `null`, nor
-— for the untagged `integer | string` unions (`ProjectRef`, `AssignedToRef`,
-`UserRef`) still expressed as a bare `anyOf` node with no `type` of its own
-— that Vertex might still reject it (deferred to a stage 2 scalar-union
-collapse, landed only if that turns out to be necessary). Runtime
-deserialization is unaffected either way; the worst case for a client that
-handles the rich form correctly (Claude, GPT) is that switching to `portable`
-would degrade its view of the schema for no reason, hence the flag defaults
-to `strict`.
+distinguish "numeric id" from "slug identifier" beyond what survives in the
+joined `description` (see the stage-2 tests). Runtime deserialization is
+unaffected either way; the worst case for a client that handles the rich
+form correctly (Claude, GPT) is that switching to `portable` would degrade
+its view of the schema for no reason, hence the flag defaults to `strict`.
 
 `outputSchema` is untouched by either dialect: Gemini never sees it, and
 opencode validates `structuredContent` against it with Ajv, where the richer
