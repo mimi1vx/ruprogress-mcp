@@ -175,11 +175,14 @@ fn collapse_nullable_types(schema: &mut Value) {
 fn collapse_scalar_any_of(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            // `null` is accepted too (`Option<ProjectRef>` etc. serialize as
+            // `anyOf: [ProjectRef, {"type": "null"}]`, not a `type` array),
+            // but at least one branch must be non-null.
             let is_leaf_scalar = |branch: &Value| {
                 branch.as_object().is_some_and(|b| {
                     matches!(
                         b.get("type").and_then(Value::as_str),
-                        Some("integer" | "number" | "string" | "boolean")
+                        Some("integer" | "number" | "string" | "boolean" | "null")
                     ) && b.keys().all(|k| {
                         matches!(k.as_str(), "type" | "description" | "minimum" | "maximum")
                     })
@@ -190,7 +193,11 @@ fn collapse_scalar_any_of(value: &mut Value) {
                     .get("anyOf")
                     .and_then(Value::as_array)
                     .is_some_and(|branches| {
-                        !branches.is_empty() && branches.iter().all(is_leaf_scalar)
+                        !branches.is_empty()
+                            && branches.iter().all(is_leaf_scalar)
+                            && branches
+                                .iter()
+                                .any(|b| b.get("type").and_then(Value::as_str) != Some("null"))
                     });
             if should_collapse {
                 let Some(Value::Array(branches)) = map.remove("anyOf") else {
@@ -528,5 +535,27 @@ mod tests {
 
         let portable = to_portable(&schema);
         assert!(portable["properties"]["thing"].get("anyOf").is_some());
+    }
+
+    #[test]
+    fn to_portable_collapses_an_optional_scalar_ref_anyof_with_null_branch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "anyOf": [
+                        {"type": "string", "description": "numeric id or slug"},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(portable["properties"]["project_id"]["type"], "string");
+        assert!(portable["properties"]["project_id"].get("anyOf").is_none());
     }
 }
