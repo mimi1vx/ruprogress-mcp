@@ -173,11 +173,16 @@ fn collapse_nullable_types(schema: &mut Value) {
 /// `#[serde(untagged)]`, so this loses no functionality. A non-leaf
 /// (`object`/`array`) branch is left untouched.
 fn collapse_scalar_any_of(value: &mut Value) {
+    // Post-order: collapse children first. `Option<ProjectRef>` nests one
+    // anyOf inside another (`anyOf: [ProjectRef's own anyOf, {"type":
+    // "null"}]` once `$ref` is inlined) — the inner one only becomes a flat
+    // `{"type": "string"}` leaf after its own children are visited, and the
+    // outer collapse below only fires once every branch already is one.
     match value {
         Value::Object(map) => {
-            // `null` is accepted too (`Option<ProjectRef>` etc. serialize as
-            // `anyOf: [ProjectRef, {"type": "null"}]`, not a `type` array),
-            // but at least one branch must be non-null.
+            for v in map.values_mut() {
+                collapse_scalar_any_of(v);
+            }
             let is_leaf_scalar = |branch: &Value| {
                 branch.as_object().is_some_and(|b| {
                     matches!(
@@ -214,9 +219,6 @@ fn collapse_scalar_any_of(value: &mut Value) {
                     }
                 }
                 map.insert("type".to_string(), Value::String("string".to_string()));
-            }
-            for v in map.values_mut() {
-                collapse_scalar_any_of(v);
             }
         }
         Value::Array(items) => {
@@ -312,6 +314,11 @@ mod tests {
     #[derive(Debug, Deserialize, JsonSchema)]
     struct RefParams {
         r#ref: Ref,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct OptionalRefParams {
+        r#ref: Option<Ref>,
     }
 
     /// Every `"format"` string found anywhere in `value`.
@@ -557,5 +564,17 @@ mod tests {
         let portable = to_portable(&schema);
         assert_eq!(portable["properties"]["project_id"]["type"], "string");
         assert!(portable["properties"]["project_id"].get("anyOf").is_none());
+    }
+
+    /// `Option<ProjectRef>`'s real shape: the outer `Option` `anyOf` nests
+    /// the untagged union's own `anyOf` as one branch (post-\$ref-inlining),
+    /// not a flat leaf — reproduces the bug `copy_issue.project_id` hit.
+    #[test]
+    fn to_portable_collapses_option_of_an_untagged_ref() {
+        let schema = input::<OptionalRefParams>();
+        let portable = to_portable(&schema);
+        let text = serde_json::to_string(&portable).unwrap();
+        assert!(!text.contains("anyOf"), "expected no anyOf, got {text}");
+        assert_eq!(portable["properties"]["ref"]["type"], "string");
     }
 }
