@@ -183,13 +183,18 @@ fn collapse_scalar_any_of(value: &mut Value) {
             for v in map.values_mut() {
                 collapse_scalar_any_of(v);
             }
+            // `enum` covers a closed string enum (e.g. `status_filter`'s
+            // `Option<StatusFilterParam>`), still a scalar leaf.
             let is_leaf_scalar = |branch: &Value| {
                 branch.as_object().is_some_and(|b| {
                     matches!(
                         b.get("type").and_then(Value::as_str),
                         Some("integer" | "number" | "string" | "boolean" | "null")
                     ) && b.keys().all(|k| {
-                        matches!(k.as_str(), "type" | "description" | "minimum" | "maximum")
+                        matches!(
+                            k.as_str(),
+                            "type" | "description" | "minimum" | "maximum" | "enum"
+                        )
                     })
                 })
             };
@@ -217,6 +222,9 @@ fn collapse_scalar_any_of(value: &mut Value) {
                     if !joined.is_empty() {
                         map.insert("description".to_string(), Value::String(joined));
                     }
+                }
+                if let Some(values) = branches.iter().find_map(|b| b.get("enum")) {
+                    map.insert("enum".to_string(), values.clone());
                 }
                 map.insert("type".to_string(), Value::String("string".to_string()));
             }
@@ -576,5 +584,33 @@ mod tests {
         let text = serde_json::to_string(&portable).unwrap();
         assert!(!text.contains("anyOf"), "expected no anyOf, got {text}");
         assert_eq!(portable["properties"]["ref"]["type"], "string");
+    }
+
+    /// `Option<enum>` (e.g. `status_filter: Option<StatusFilterParam>`)
+    /// carries `enum` alongside `type`/`description` — must still collapse,
+    /// keeping the enum values.
+    #[test]
+    fn to_portable_collapses_optional_enum_keeping_its_values() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status_filter": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["open", "locked", "closed"], "description": "status"},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(portable["properties"]["status_filter"]["type"], "string");
+        assert_eq!(
+            portable["properties"]["status_filter"]["enum"],
+            serde_json::json!(["open", "locked", "closed"])
+        );
     }
 }
