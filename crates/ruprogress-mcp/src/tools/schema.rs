@@ -166,16 +166,70 @@ fn collapse_nullable_types(schema: &mut Value) {
     }
 }
 
-/// Convert a rich JSON Schema 2020-12 `inputSchema` (as normalized by
-/// [`input`]) to the lossy, `Portable`-dialect form some clients require
-/// (`REDMINE_MCP_SCHEMA_DIALECT=portable`; see `crate::config::SchemaDialect`
-/// and `docs/adr/0007-json-schema-format-normalization.md`). Only inlines
-/// `$ref`/`$defs` and collapses nullable `type` arrays — `additionalProperties`,
-/// `default`, `enum`, `format`, `$schema`, and `anyOf` unions all survive.
+/// Stage 2 of ADR 0007's portable dialect: collapse a bare untagged `anyOf`
+/// (no sibling `type`) into `{"type": "string"}` when every branch is a leaf
+/// scalar schema. Covers `ProjectRef`/`AssignedToRef`/`UserRef`, whose
+/// `String` branch already accepts a stringified id via
+/// `#[serde(untagged)]`, so this loses no functionality. A non-leaf
+/// (`object`/`array`) branch is left untouched.
+fn collapse_scalar_any_of(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let is_leaf_scalar = |branch: &Value| {
+                branch.as_object().is_some_and(|b| {
+                    matches!(
+                        b.get("type").and_then(Value::as_str),
+                        Some("integer" | "number" | "string" | "boolean")
+                    ) && b.keys().all(|k| {
+                        matches!(k.as_str(), "type" | "description" | "minimum" | "maximum")
+                    })
+                })
+            };
+            let should_collapse = !map.contains_key("type")
+                && map
+                    .get("anyOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|branches| {
+                        !branches.is_empty() && branches.iter().all(is_leaf_scalar)
+                    });
+            if should_collapse {
+                let Some(Value::Array(branches)) = map.remove("anyOf") else {
+                    unreachable!("should_collapse just confirmed anyOf is a non-empty array");
+                };
+                if !map.contains_key("description") {
+                    let joined = branches
+                        .iter()
+                        .filter_map(|b| b.get("description").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" — ");
+                    if !joined.is_empty() {
+                        map.insert("description".to_string(), Value::String(joined));
+                    }
+                }
+                map.insert("type".to_string(), Value::String("string".to_string()));
+            }
+            for v in map.values_mut() {
+                collapse_scalar_any_of(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collapse_scalar_any_of(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a rich JSON Schema 2020-12 `inputSchema` to the lossy `Portable`
+/// dialect (`REDMINE_MCP_SCHEMA_DIALECT=portable`). Inlines `$ref`/`$defs`,
+/// collapses nullable `type` arrays, and collapses untagged scalar `anyOf`
+/// unions (see [`collapse_scalar_any_of`]).
 pub(crate) fn to_portable(schema: &JsonObject) -> JsonObject {
     let mut value = Value::Object(schema.clone());
     inline_defs(&mut value);
     collapse_nullable_types(&mut value);
+    collapse_scalar_any_of(&mut value);
     match value {
         Value::Object(object) => object,
         _ => unreachable!("schema root is always a JSON object"),
@@ -415,19 +469,64 @@ mod tests {
         );
     }
 
-    /// Stage 1's deliberate limit: an untagged-union `$def` (`ProjectRef`'s
-    /// shape) keeps its `anyOf` — union collapsing is stage 2, gated on
-    /// whether stage 1 alone satisfies Vertex.
     #[test]
-    fn to_portable_keeps_an_untagged_ref_anyof() {
+    fn to_portable_collapses_an_untagged_scalar_ref_anyof_to_string() {
         let schema = input::<RefParams>();
         let portable = to_portable(&schema);
         let text = serde_json::to_string(&portable).unwrap();
         assert!(!text.contains("$ref"), "expected no $ref, got {text}");
         assert!(!text.contains("$defs"), "expected no $defs, got {text}");
         assert!(
-            text.contains("anyOf"),
-            "expected the untagged union's anyOf to survive stage 1, got {text}"
+            !text.contains("anyOf"),
+            "expected the untagged union's anyOf to collapse in stage 2, got {text}"
         );
+        assert_eq!(portable["properties"]["ref"]["type"], "string");
+    }
+
+    #[test]
+    fn to_portable_joins_scalar_any_of_branch_descriptions() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "anyOf": [
+                        {"type": "integer", "description": "The project's numeric id, e.g. `5`."},
+                        {"type": "string", "description": "The project's slug identifier, e.g. `\"my-project\"`."}
+                    ]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert_eq!(portable["properties"]["project_id"]["type"], "string");
+        let description = portable["properties"]["project_id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("numeric id"));
+        assert!(description.contains("slug identifier"));
+    }
+
+    #[test]
+    fn to_portable_leaves_a_non_scalar_any_of_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thing": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "object", "properties": {"id": {"type": "integer"}}}
+                    ]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let portable = to_portable(&schema);
+        assert!(portable["properties"]["thing"].get("anyOf").is_some());
     }
 }
