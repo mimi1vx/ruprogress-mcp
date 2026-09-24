@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.10.2...v0.10.3) - 2026-09-24
+
+### Fixed
+
+- *(schema)* also collapse a scalar anyOf branch carrying enum
+- *(schema)* process anyOf collapse post-order, not pre-order
+
 ## [0.10.2](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.10.1...v0.10.2) - 2026-09-24
 
 ### Fixed
