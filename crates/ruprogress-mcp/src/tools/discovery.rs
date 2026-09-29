@@ -88,6 +88,7 @@ pub(crate) struct IssueStatusOut {
     pub(crate) id: u64,
     pub(crate) name: String,
     pub(crate) is_closed: Option<bool>,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -294,6 +295,10 @@ impl RedmineMcp {
                 id: s.id,
                 name: boundary.wrap("issue_status.name", &s.name),
                 is_closed: s.is_closed,
+                description: s
+                    .description
+                    .as_deref()
+                    .map(|d| boundary.wrap("issue_status.description", d)),
             })
             .collect();
 
