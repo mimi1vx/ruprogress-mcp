@@ -281,6 +281,7 @@ Retrieve full details of one Redmine issue by numeric id, including by default j
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
+| `include_allowed_statuses` | boolean | no | Include the statuses the current credential may move this issue to; |
 | `include_attachments` | boolean | no | Include attachment metadata. Default true. |
 | `include_children` | boolean | no | Include direct sub-issues, nested one level deep. Default false. Use |
 | `include_custom_fields` | boolean | no | Include custom field values. Default true. |
@@ -291,7 +292,7 @@ Retrieve full details of one Redmine issue by numeric id, including by default j
 | `journal_limit` | integer \| null | no | Maximum number of journals to return, applied client-side after |
 | `journal_offset` | integer \| null | no | Number of journals to skip, used with `journal_limit`. Default 0. |
 
-**Output:** object: `agile_position`, `agile_sprint_id`, `assigned_to`, `attachments`, `author`, `category`, `children`, `closed_on`, `created_on`, `custom_fields`, `description`, `done_ratio`, `due_date`, `estimated_hours`, `fixed_version`, `id`, `is_private`, `journal_pagination`, `journals`, `parent`, `priority`, `project`, `relations`, `spent_hours`, `start_date`, `status`, `story_points`, `subject`, `tags`, `tracker`, `updated_on`, `watchers`
+**Output:** object: `agile_position`, `agile_sprint_id`, `allowed_statuses`, `assigned_to`, `attachments`, `author`, `category`, `children`, `closed_on`, `created_on`, `custom_fields`, `description`, `done_ratio`, `due_date`, `estimated_hours`, `fixed_version`, `id`, `is_private`, `journal_pagination`, `journals`, `parent`, `priority`, `project`, `relations`, `spent_hours`, `start_date`, `status`, `story_points`, `subject`, `tags`, `tracker`, `updated_on`, `watchers`
 
 ### `list_redmine_issues`
 

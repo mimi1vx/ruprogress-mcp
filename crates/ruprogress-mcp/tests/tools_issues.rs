@@ -187,6 +187,68 @@ async fn get_redmine_issue_without_journal_limit_has_no_journal_pagination() {
 }
 
 #[tokio::test]
+async fn get_redmine_issue_include_allowed_statuses_requests_and_returns_them() {
+    let h = support::harness(&[]).await;
+    let mut issue = base_issue(1);
+    issue["allowed_statuses"] = json!([
+        {"id": 2, "name": "In Progress", "is_closed": false},
+        {"id": 5, "name": "Closed", "is_closed": true}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .and(query_param("include", "allowed_statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": issue})))
+        .expect(1)
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(
+        &call(
+            &h,
+            "get_redmine_issue",
+            json!({
+                "issue_id": 1, "include_journals": false, "include_attachments": false,
+                "include_allowed_statuses": true
+            }),
+        )
+        .await,
+    );
+    let allowed = body["allowed_statuses"].as_array().unwrap();
+    assert_eq!(allowed.len(), 2);
+    assert_eq!(allowed[1]["id"], 5);
+    assert!(allowed[1]["name"].as_str().unwrap().contains("Closed"));
+    assert!(
+        allowed[1]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<<untrusted:issue_status.name:")
+    );
+    assert_eq!(allowed[1]["is_closed"], true);
+    assert_eq!(allowed[0]["is_closed"], false);
+}
+
+#[tokio::test]
+async fn get_redmine_issue_omits_allowed_statuses_by_default() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": base_issue(1)})))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(&call(&h, "get_redmine_issue", json!({"issue_id": 1})).await);
+    assert!(body.get("allowed_statuses").is_none());
+    let requests = h.redmine.received_requests().await.unwrap();
+    let include = requests[0]
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == "include")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    assert!(!include.contains("allowed_statuses"), "include={include}");
+}
+
+#[tokio::test]
 async fn get_redmine_issue_dominant_error_is_in_band_not_found() {
     let h = support::harness(&[]).await;
     Mock::given(method("GET"))
