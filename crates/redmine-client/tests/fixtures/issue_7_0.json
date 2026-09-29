@@ -14,6 +14,9 @@
     "done_ratio": 0,
     "is_private": false,
     "estimated_hours": null,
+    "total_estimated_hours": 6.0,
+    "spent_hours": 1.5,
+    "total_spent_hours": 4.25,
     "custom_fields": [
       { "id": 1, "name": "Severity", "value": ["High", "Regression"] }
     ],

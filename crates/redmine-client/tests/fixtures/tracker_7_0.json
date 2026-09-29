@@ -1,6 +1,6 @@
 {
   "trackers": [
-    { "id": 1, "name": "Bug", "description": "Software defect", "default_status": { "id": 1, "name": "New" } },
-    { "id": 2, "name": "Feature", "description": "New capability", "default_status": { "id": 1, "name": "New" } }
+    { "id": 1, "name": "Bug", "description": "Software defect", "default_status": { "id": 1, "name": "New" }, "enabled_standard_fields": ["assigned_to_id", "category_id", "fixed_version_id", "parent_issue_id", "start_date", "due_date", "estimated_hours", "done_ratio", "description", "priority_id"] },
+    { "id": 2, "name": "Feature", "description": "New capability", "default_status": { "id": 1, "name": "New" }, "enabled_standard_fields": [] }
   ]
 }
