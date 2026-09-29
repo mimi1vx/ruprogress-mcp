@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{IdName, permissive_datetime};
+use super::{IdName, permissive_datetime, permissive_datetime_opt};
 
 /// One field change recorded on a [`Journal`]. Redmine calls the wire field
 /// `name` the `prop_key` internally; `property` distinguishes an attribute
@@ -41,6 +41,12 @@ pub struct Journal {
     /// When the entry was created.
     #[serde(deserialize_with = "permissive_datetime")]
     pub created_on: DateTime<Utc>,
+    /// When the note was last edited.
+    #[serde(default, deserialize_with = "permissive_datetime_opt")]
+    pub updated_on: Option<DateTime<Utc>>,
+    /// Who last edited the note. `None` when it was never edited.
+    #[serde(default)]
+    pub updated_by: Option<IdName>,
     /// `true` when this entry is a private note, visible only to users with
     /// the "View private notes" permission. Redmine's own visibility
     /// filtering (`Issue#visible_journals_with_index`) already excludes
@@ -128,9 +134,25 @@ mod tests {
     fn unknown_field_does_not_fail_parsing() {
         let json = r#"{
             "id": 1, "created_on": "2026-01-01T00:00:00Z",
-            "updated_by": {"id": 1, "name": "Alice"}
+            "a_field_from_a_future_redmine_version": 42
         }"#;
         let journal: Journal = serde_json::from_str(json).expect("should parse");
         assert_eq!(journal.id, 1);
+    }
+
+    #[test]
+    fn parses_edit_metadata() {
+        let json = r#"{
+            "id": 1, "created_on": "2026-01-01T00:00:00Z",
+            "updated_on": "2026-01-02T08:30:00Z",
+            "updated_by": {"id": 7, "name": "Bob"}
+        }"#;
+        let journal: Journal = serde_json::from_str(json).expect("should parse");
+        assert_eq!(
+            journal.updated_on.unwrap().to_rfc3339(),
+            "2026-01-02T08:30:00+00:00"
+        );
+        let editor = journal.updated_by.unwrap();
+        assert_eq!((editor.id, editor.name.as_str()), (7, "Bob"));
     }
 }

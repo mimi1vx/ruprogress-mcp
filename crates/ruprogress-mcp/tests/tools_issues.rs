@@ -187,6 +187,32 @@ async fn get_redmine_issue_without_journal_limit_has_no_journal_pagination() {
 }
 
 #[tokio::test]
+async fn get_redmine_issue_journal_edit_metadata_appears_only_on_edited_notes() {
+    let h = support::harness(&[]).await;
+    let mut issue = base_issue(1);
+    issue["journals"] = json!([
+        {"id": 1, "notes": "original", "created_on": "2026-01-01T00:00:00Z"},
+        {"id": 2, "notes": "edited", "created_on": "2026-01-01T00:00:00Z",
+         "updated_on": "2026-01-02T08:30:00Z", "updated_by": {"id": 7, "name": "Bob"}}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issue": issue})))
+        .mount(&h.redmine)
+        .await;
+
+    let body = body_of(&call(&h, "get_redmine_issue", json!({"issue_id": 1})).await);
+    let journals = body["journals"].as_array().unwrap();
+    assert!(journals[0].get("updated_on").is_none());
+    assert!(journals[0].get("updated_by").is_none());
+    assert_eq!(journals[1]["updated_on"], "2026-01-02T08:30:00Z");
+    assert_eq!(journals[1]["updated_by"]["id"], 7);
+    let editor = journals[1]["updated_by"]["name"].as_str().unwrap();
+    assert!(editor.starts_with("<<<untrusted:user.name:"));
+    assert!(editor.contains("Bob"));
+}
+
+#[tokio::test]
 async fn get_redmine_issue_include_allowed_statuses_requests_and_returns_them() {
     let h = support::harness(&[]).await;
     let mut issue = base_issue(1);

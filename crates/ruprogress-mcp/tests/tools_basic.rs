@@ -794,9 +794,9 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// tools or wider input schemas (like `manage_redmine_wiki_page`'s
 /// six-action parameter set or `upload_file`'s/`uploads[]`'s multi-field
 /// shapes) push the observed size close to the current limit; currently
-/// 140 000 bytes for 41 tools (~139 869 observed after `get_redmine_issue`
-/// gained `include_allowed_statuses`), leaving headroom for future growth at
-/// a similar per-tool rate.
+/// 140 500 bytes for 41 tools (~140 393 observed after `get_redmine_issue`
+/// gained `include_allowed_statuses` and journal `updated_on`/`updated_by`),
+/// leaving headroom for future growth at a similar per-tool rate.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
     let h = support::harness(&[]).await;
@@ -807,8 +807,8 @@ async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
-        bytes.len() < 140_000,
-        "tools/list is {} bytes for {} tools; over the 140000 baseline threshold",
+        bytes.len() < 140_500,
+        "tools/list is {} bytes for {} tools; over the 140500 baseline threshold",
         bytes.len(),
         tools.tools.len()
     );
