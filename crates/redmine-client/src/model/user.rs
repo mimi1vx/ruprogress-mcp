@@ -138,6 +138,7 @@ mod tests {
             serde_json::from_str(FIXTURE_USERS_LIST_6_1).expect("6.1 fixture should parse");
         assert_eq!(env.users.len(), 1);
         assert_eq!(env.total_count, 1);
+        assert_eq!(env.users.first().unwrap().admin, Some(false));
     }
 
     #[test]

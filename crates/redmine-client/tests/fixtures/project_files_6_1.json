@@ -8,7 +8,7 @@
       "description": "Foo App for Windows",
       "content_url": "https://redmine.example.com/attachments/download/12/foo-1.0-setup.exe",
       "author": { "id": 1, "name": "Redmine Admin" },
-      "created_on": "2026-01-04T09:12:32",
+      "created_on": "2026-01-04T09:12:32Z",
       "version": { "id": 2, "name": "1.0" },
       "digest": "1276481102f218c981e0324180bafd9f",
       "downloads": 12

@@ -149,8 +149,9 @@ pub(crate) trait BareCollection: serde::de::DeserializeOwned {
 }
 
 /// Parse a Redmine timestamp that may or may not carry a UTC suffix.
-/// Some configurations emit `"2025-01-15T10:00:00"` (naive, assumed UTC)
-/// instead of RFC 3339's `"...Z"`.
+/// Every supported Redmine version (6.0–7.0) sends RFC 3339 `"...Z"`
+/// (`xmlschema(0)`); the naive `"2025-01-15T10:00:00"` form (assumed UTC) is
+/// accepted only defensively.
 fn parse_permissive_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&chrono::Utc));

@@ -6,7 +6,7 @@
     "description": "An example project.",
     "status": 1,
     "is_public": true,
-    "created_on": "2026-01-01T09:00:00",
-    "updated_on": "2026-01-01T09:00:00"
+    "created_on": "2026-01-01T09:00:00Z",
+    "updated_on": "2026-01-01T09:00:00Z"
   }
 }
