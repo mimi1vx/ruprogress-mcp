@@ -1,6 +1,6 @@
 {
   "issue_statuses": [
-    { "id": 1, "name": "New", "is_closed": false },
-    { "id": 5, "name": "Closed", "is_closed": true }
+    { "id": 1, "name": "New", "is_closed": false, "description": "Awaiting triage" },
+    { "id": 5, "name": "Closed", "is_closed": true, "description": "Work finished" }
   ]
 }

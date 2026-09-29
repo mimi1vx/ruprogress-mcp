@@ -7,6 +7,6 @@
     "description": "This is an attachment",
     "content_url": "https://redmine.example.com/attachments/download/6243/test.txt",
     "author": { "id": 1, "name": "Redmine Admin" },
-    "created_on": "2026-01-01T00:00:00"
+    "created_on": "2026-01-01T00:00:00Z"
   }
 }

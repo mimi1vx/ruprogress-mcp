@@ -16,10 +16,9 @@ pub struct IssueStatus {
     /// defensive parse, even though every supported version emits it.
     #[serde(default)]
     pub is_closed: Option<bool>,
-    /// Whether this is the default status for a new issue. `Option` because
-    /// Redmine dropped this field from this endpoint in some versions.
+    /// The admin-authored status description.
     #[serde(default)]
-    pub is_default: Option<bool>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,20 +43,21 @@ mod tests {
     const FIXTURE_7_0: &str = include_str!("../../tests/fixtures/issue_status_7_0.json");
 
     #[test]
-    fn round_trips_against_6_1_fixture_with_is_default() {
+    fn round_trips_against_6_1_fixture() {
         let env: IssueStatusesEnvelope =
             serde_json::from_str(FIXTURE_6_1).expect("6.1 fixture should parse");
         let first = env.issue_statuses.first().unwrap();
         assert_eq!(first.name, "New");
-        assert_eq!(first.is_default, Some(true));
+        assert_eq!(first.description.as_deref(), Some("Newly reported"));
+        assert_eq!(env.issue_statuses.get(1).unwrap().description, None);
     }
 
     #[test]
-    fn round_trips_against_7_0_fixture_without_is_default() {
+    fn round_trips_against_7_0_fixture() {
         let env: IssueStatusesEnvelope =
             serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
         let first = env.issue_statuses.first().unwrap();
         assert_eq!(first.is_closed, Some(false));
-        assert_eq!(first.is_default, None);
+        assert_eq!(first.description.as_deref(), Some("Awaiting triage"));
     }
 }

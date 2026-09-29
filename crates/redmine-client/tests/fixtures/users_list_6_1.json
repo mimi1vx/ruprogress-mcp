@@ -1,6 +1,6 @@
 {
   "users": [
-    { "id": 2, "login": "alice", "firstname": "Alice", "lastname": "Example", "created_on": "2025-06-01T08:00:00" }
+    { "id": 2, "login": "alice", "admin": false, "firstname": "Alice", "lastname": "Example", "created_on": "2025-06-01T08:00:00Z" }
   ],
   "total_count": 1,
   "offset": 0,

@@ -17,7 +17,7 @@
     "custom_fields": [
       { "id": 1, "name": "Severity", "value": "High" }
     ],
-    "created_on": "2026-01-01T10:00:00",
-    "updated_on": "2026-01-02T11:30:00"
+    "created_on": "2026-01-01T10:00:00Z",
+    "updated_on": "2026-01-02T11:30:00Z"
   }
 }
