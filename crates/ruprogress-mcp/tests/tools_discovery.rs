@@ -194,15 +194,22 @@ async fn list_redmine_issue_statuses_happy_path() {
     Mock::given(method("GET"))
         .and(path("/issue_statuses.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "issue_statuses": [{"id": 1, "name": "New", "is_closed": false}]
+            "issue_statuses": [
+                {"id": 1, "name": "New", "is_closed": false, "description": "Awaiting triage"},
+                {"id": 5, "name": "Closed", "is_closed": true, "description": null}
+            ]
         })))
         .mount(&h.redmine)
         .await;
 
     let body = body_of(&call(&h, "list_redmine_issue_statuses").await);
     let statuses = body["issue_statuses"].as_array().unwrap();
-    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses.len(), 2);
     assert_eq!(statuses[0]["is_closed"], false);
+    let description = statuses[0]["description"].as_str().unwrap();
+    assert!(description.starts_with("<<<untrusted:issue_status.description:"));
+    assert!(description.contains("Awaiting triage"));
+    assert!(statuses[1]["description"].is_null());
 }
 
 #[tokio::test]
