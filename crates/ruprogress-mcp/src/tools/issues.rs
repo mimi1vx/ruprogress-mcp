@@ -18,8 +18,8 @@ use futures_util::{StreamExt as _, TryStreamExt as _};
 use redmine_client::model::attachment::Attachment;
 use redmine_client::model::custom_field::CustomFieldValue;
 use redmine_client::model::issue::{
-    Issue, IssueChild as ClientIssueChild, IssueChildLeaf as ClientIssueChildLeaf, IssueCreate,
-    IssueInclude, IssueQuery, IssueUpdate, StatusFilter, UserFilter,
+    AllowedStatus, Issue, IssueChild as ClientIssueChild, IssueChildLeaf as ClientIssueChildLeaf,
+    IssueCreate, IssueInclude, IssueQuery, IssueUpdate, StatusFilter, UserFilter,
 };
 use redmine_client::model::issue_category::{IssueCategoryCreate, IssueCategoryUpdate};
 use redmine_client::model::journal::{Journal as ClientJournal, JournalUpdate};
@@ -261,7 +261,7 @@ const fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "mirrors the reference contract's six independent include_* flags exactly"
+    reason = "the reference contract's six independent include_* flags plus include_allowed_statuses"
 )]
 pub(crate) struct GetRedmineIssueParams {
     /// The id of the issue to retrieve.
@@ -294,6 +294,10 @@ pub(crate) struct GetRedmineIssueParams {
     /// `list_subtasks` to walk a deeper tree.
     #[serde(default)]
     pub(crate) include_children: bool,
+    /// Include the statuses the current credential may move this issue to;
+    /// use before `update_redmine_issue` `status_id`. Default false.
+    #[serde(default)]
+    pub(crate) include_allowed_statuses: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -508,6 +512,8 @@ pub(crate) struct IssueDetailOutput {
     pub(crate) relations: Option<Vec<RelationOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) children: Option<Vec<IssueChildOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_statuses: Option<Vec<AllowedStatusOut>>,
     /// `RedmineUP` Agile plugin fields. Three-way: the key is **absent**
     /// when `REDMINE_AGILE_ENABLED` is off or the agile fetch failed
     /// (logged, never fatal to this tool); it is present and `null` when
@@ -530,6 +536,28 @@ pub(crate) struct IssueDetailOutput {
     /// "nothing to report", never "no tags".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<TagOut>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct AllowedStatusOut {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) is_closed: Option<bool>,
+}
+
+fn allowed_statuses_out(
+    boundary: &Boundary,
+    statuses: Option<&[AllowedStatus]>,
+) -> Option<Vec<AllowedStatusOut>> {
+    statuses.map(|ss| {
+        ss.iter()
+            .map(|s| AllowedStatusOut {
+                id: s.id,
+                name: boundary.wrap("issue_status.name", &s.name),
+                is_closed: s.is_closed,
+            })
+            .collect()
+    })
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1509,6 +1537,7 @@ fn issue_detail_out(
             .children
             .as_ref()
             .map(|cs| cs.iter().map(|c| issue_child_out(boundary, c)).collect()),
+        allowed_statuses: allowed_statuses_out(boundary, issue.allowed_statuses.as_deref()),
         story_points: agile.map(|a| a.story_points),
         agile_sprint_id: agile.map(|a| a.agile_sprint_id),
         agile_position: agile.map(|a| a.position),
@@ -1762,6 +1791,9 @@ impl RedmineMcp {
         }
         if params.include_children {
             includes.push(IssueInclude::Children);
+        }
+        if params.include_allowed_statuses {
+            includes.push(IssueInclude::AllowedStatuses);
         }
 
         let scoped = self.scoped(&ctx)?;

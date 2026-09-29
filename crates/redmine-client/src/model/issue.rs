@@ -115,6 +115,23 @@ pub struct Issue {
     /// itself makes no distinction, so this client doesn't invent one.
     #[serde(default)]
     pub tags: Option<Vec<IssueTag>>,
+    /// Statuses the current credential may move this issue to. `None` =
+    /// not requested (`include=allowed_statuses`), `Some(vec![])` = none.
+    #[serde(default)]
+    pub allowed_statuses: Option<Vec<AllowedStatus>>,
+}
+
+/// One entry of `Issue.allowed_statuses`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct AllowedStatus {
+    /// The status id.
+    pub id: u64,
+    /// The status's display name.
+    pub name: String,
+    /// Whether moving to this status closes the issue.
+    #[serde(default)]
+    pub is_closed: Option<bool>,
 }
 
 /// One level of `Issue.children`. Redmine's own `render_api_issue_children`
@@ -772,6 +789,27 @@ mod tests {
         assert!(issue.relations.is_none());
         assert!(issue.watchers.is_none());
         assert!(issue.children.is_none());
+        assert!(issue.allowed_statuses.is_none());
+    }
+
+    #[test]
+    fn parses_allowed_statuses() {
+        let json = r#"{"issue": {
+            "id": 1, "project": {"id":1,"name":"P"}, "tracker": {"id":1,"name":"Bug"},
+            "status": {"id":1,"name":"New"}, "priority": {"id":1,"name":"Normal"},
+            "author": {"id":1,"name":"A"}, "subject": "s",
+            "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-01T00:00:00Z",
+            "allowed_statuses": [
+                {"id": 2, "name": "In Progress", "is_closed": false},
+                {"id": 5, "name": "Closed", "is_closed": true}
+            ]
+        }}"#;
+        let env: IssueEnvelope = serde_json::from_str(json).expect("should parse");
+        let allowed = env.issue.allowed_statuses.unwrap();
+        assert_eq!(allowed.len(), 2);
+        let closed = allowed.get(1).unwrap();
+        assert_eq!((closed.id, closed.name.as_str()), (5, "Closed"));
+        assert_eq!(closed.is_closed, Some(true));
     }
 
     #[test]
