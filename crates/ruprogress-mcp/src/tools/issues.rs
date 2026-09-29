@@ -306,6 +306,10 @@ pub(crate) struct JournalOut {
     pub(crate) user: Option<IdNameOut>,
     pub(crate) notes: Option<String>,
     pub(crate) created_on: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_on: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_by: Option<IdNameOut>,
     pub(crate) private_notes: Option<bool>,
 }
 
@@ -321,6 +325,11 @@ fn journal_out(boundary: &Boundary, j: &ClientJournal) -> JournalOut {
             .as_deref()
             .map(|n| boundary.wrap("journal.notes", n)),
         created_on: j.created_on,
+        updated_on: j.updated_on,
+        updated_by: j
+            .updated_by
+            .as_ref()
+            .map(|u| id_name_out(boundary, "user.name", u)),
         private_notes: j.private_notes,
     }
 }
