@@ -33,7 +33,8 @@ pub struct ProjectFileCreate {
     /// Override the filename recorded at upload time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
-    /// Override the content type recorded at upload time.
+    /// Override the content type recorded at upload time. Ignored by
+    /// Redmine 7.1+, which detects the type server-side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     /// Free-text description shown in the Files module.
