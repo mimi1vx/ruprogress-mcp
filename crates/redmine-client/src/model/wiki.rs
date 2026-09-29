@@ -56,7 +56,7 @@ pub struct WikiPageRef {
 
 /// One entry from `GET /projects/{id}/wiki/index.json`
 /// (`wiki/index.api.rsb`) — deliberately thinner than [`WikiPage`]: the
-/// index view never renders `text`/`author`/`comments`/`project`, so this is
+/// index view never renders `text`/`author`/`comments`, so this is
 /// a distinct type rather than a `WikiPage` with those fields always `None`
 /// (which would misrepresent "never sent by this endpoint" as "requested
 /// but absent").
@@ -70,6 +70,9 @@ pub struct WikiPageListItem {
     pub parent: Option<WikiPageRef>,
     /// The latest revision number.
     pub version: u32,
+    /// The owning project. Redmine ≥ 7.0.1; absent before.
+    #[serde(default)]
+    pub project: Option<IdName>,
     /// When the page was first created.
     #[serde(deserialize_with = "permissive_datetime")]
     pub created_on: DateTime<Utc>,
@@ -178,12 +181,15 @@ mod tests {
             r#"{"wiki_pages": [
                 {"title": "Home", "version": 1, "created_on": "2026-01-01T00:00:00Z"},
                 {"title": "Child", "parent": {"title": "Home"}, "version": 2,
+                 "project": {"id": 1, "name": "My Project"},
                  "created_on": "2026-01-01T00:00:00Z", "updated_on": "2026-01-02T00:00:00Z"}
             ]}"#,
         )
         .expect("should parse");
         assert_eq!(env.wiki_pages.len(), 2);
         assert!(env.wiki_pages[0].parent.is_none());
+        assert!(env.wiki_pages[0].project.is_none());
+        assert_eq!(env.wiki_pages[1].project.as_ref().expect("project").id, 1);
         assert_eq!(
             env.wiki_pages[1].parent.as_ref().expect("parent").title,
             "Home"

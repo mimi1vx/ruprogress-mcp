@@ -115,6 +115,9 @@ pub struct CustomFieldDefinition {
     pub id: u64,
     /// The custom field's display name.
     pub name: String,
+    /// The admin-authored field description.
+    #[serde(default)]
+    pub description: Option<String>,
     /// `"string"`, `"list"`, `"date"`, ...
     pub field_format: String,
     /// The definition's own required flag (see the struct-level caveat).
@@ -145,6 +148,11 @@ pub struct CustomFieldDefinition {
     /// `customized_type == "issue"`.
     #[serde(default)]
     pub trackers: Option<Vec<IdName>>,
+    /// The roles this field is restricted to when it isn't visible to
+    /// everyone. Only present for issue, time-entry, project, and version
+    /// custom fields.
+    #[serde(default)]
+    pub roles: Option<Vec<IdName>>,
 }
 
 fn deserialize_possible_values<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -231,11 +239,13 @@ mod tests {
     #[test]
     fn custom_field_definitions_envelope_round_trips_and_flattens_possible_values() {
         let json = r#"{"custom_fields": [{
-            "id": 6, "name": "Size", "field_format": "list", "is_required": false,
+            "id": 6, "name": "Size", "description": "T-shirt size",
+            "field_format": "list", "is_required": false,
             "multiple": false, "default_value": "M",
             "possible_values": [{"value": "S", "label": "S"}, {"value": "M", "label": "M"}],
             "customized_type": "issue", "is_for_all": true,
-            "trackers": [{"id": 5, "name": "Bug"}]
+            "trackers": [{"id": 5, "name": "Bug"}],
+            "roles": [{"id": 3, "name": "Developer"}]
         }]}"#;
         let env: CustomFieldDefinitionsEnvelope = serde_json::from_str(json).expect("should parse");
         let field = env.custom_fields.first().unwrap();
@@ -244,6 +254,11 @@ mod tests {
             Some(vec!["S".to_string(), "M".to_string()])
         );
         assert_eq!(field.customized_type.as_deref(), Some("issue"));
+        assert_eq!(field.description.as_deref(), Some("T-shirt size"));
+        assert_eq!(
+            field.roles.as_ref().unwrap().first().unwrap().name,
+            "Developer"
+        );
     }
 
     #[test]

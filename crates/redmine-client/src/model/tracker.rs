@@ -18,6 +18,10 @@ pub struct Tracker {
     /// The status a new issue of this tracker starts in.
     #[serde(default)]
     pub default_status: Option<IdName>,
+    /// Core issue fields this tracker enables (e.g. `"assigned_to_id"`,
+    /// `"due_date"`); fields absent here are disabled for the tracker.
+    #[serde(default)]
+    pub enabled_standard_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,17 @@ mod tests {
             serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
         assert_eq!(env.trackers.len(), 2);
         assert!(env.trackers.get(1).unwrap().default_status.is_some());
+        let fields = env
+            .trackers
+            .first()
+            .unwrap()
+            .enabled_standard_fields
+            .as_ref();
+        assert!(fields.unwrap().iter().any(|f| f == "due_date"));
+        assert_eq!(
+            env.trackers.get(1).unwrap().enabled_standard_fields,
+            Some(vec![])
+        );
     }
 
     #[test]

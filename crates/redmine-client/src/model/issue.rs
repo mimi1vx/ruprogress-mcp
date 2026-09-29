@@ -69,6 +69,14 @@ pub struct Issue {
     /// make.
     #[serde(default)]
     pub spent_hours: Option<f64>,
+    /// Estimated hours including every descendant issue.
+    #[serde(default)]
+    pub total_estimated_hours: Option<f64>,
+    /// Hours logged against this issue and every descendant. Omitted under
+    /// the same `view_time_entries` rule as [`Issue::spent_hours`], so `None`
+    /// carries the same ambiguity.
+    #[serde(default)]
+    pub total_spent_hours: Option<f64>,
     /// Planned start date.
     #[serde(default)]
     pub start_date: Option<NaiveDate>,
@@ -567,6 +575,8 @@ mod tests {
         let env: IssueEnvelope =
             serde_json::from_str(FIXTURE_7_0).expect("7.0 fixture should parse");
         assert_eq!(env.issue.subject, "Example issue");
+        assert_eq!(env.issue.total_estimated_hours, Some(6.0));
+        assert_eq!(env.issue.total_spent_hours, Some(4.25));
     }
 
     #[test]
@@ -784,6 +794,8 @@ mod tests {
         assert!(issue.category.is_none());
         assert!(issue.fixed_version.is_none());
         assert!(issue.spent_hours.is_none());
+        assert!(issue.total_estimated_hours.is_none());
+        assert!(issue.total_spent_hours.is_none());
         assert!(issue.journals.is_none());
         assert!(issue.attachments.is_none());
         assert!(issue.relations.is_none());
