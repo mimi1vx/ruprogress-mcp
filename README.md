@@ -47,6 +47,8 @@ Everything else is environment-driven — see [docs/configuration.md](docs/confi
 
 ## Tools
 
+Targets Redmine 6.0, 6.1 and 7.0.
+
 41 tools are registered by default. `cleanup_attachment_files`
 (`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) and the plugin-gated families below
 add more on top, each independently: `REDMINE_CHECKLISTS_ENABLED` adds 3,

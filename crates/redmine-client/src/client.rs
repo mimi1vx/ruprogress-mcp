@@ -2327,7 +2327,8 @@ impl Scoped<'_> {
     /// 406s any request whose `Content-Type` is not exactly
     /// `application/octet-stream` — this method sets it unconditionally, so
     /// `content_type` only ever affects the *stored* attachment's recorded
-    /// MIME type, never the request Redmine receives.
+    /// MIME type, never the request Redmine receives. Redmine 7.1+ ignores
+    /// it and detects the type server-side.
     ///
     /// # Errors
     ///

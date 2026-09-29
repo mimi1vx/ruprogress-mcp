@@ -155,8 +155,9 @@ Parameters:
 - `include_watchers` (boolean, optional): Include watcher list. Default: `false`
 - `include_relations` (boolean, optional): Include issue relations. Default: `false`
 - `include_children` (boolean, optional): Include child issues. Default: `false`
+- `include_allowed_statuses` (boolean, optional): Include `allowed_statuses`, the statuses the current credential may move this issue to (`[{id, name, is_closed}]`); use before `update_redmine_issue` `status_id`. Default: `false`. An addition beyond the reference contract's six `include_*` flags.
 
-Returns: Issue dictionary with details, journals, and attachments. Standard fields include `category`, `fixed_version` (target version), and `parent` (each `{id, ...}` or `None`), plus `start_date`, `due_date`, `closed_on` (ISO-8601 or `None`), `done_ratio`, `estimated_hours`, `spent_hours`, and `is_private`. Each is `None` when not set on the issue. When `REDMINE_AGILE_ENABLED=true`, also includes `story_points`, `agile_sprint_id`, and `agile_position` from the RedmineUP Agile plugin. When `REDMINE_TAGS_ENABLED=true`, also includes `tags` (array of `{id, name}`, `id` frequently `null`) from the AlphaNodes `additional_tags` plugin; the key is absent both when the flag is off and when Redmine itself omitted it (e.g. the caller lacks `view_issue_tags`) — the two cases are indistinguishable.
+Returns: Issue dictionary with details, journals, and attachments. Standard fields include `category`, `fixed_version` (target version), and `parent` (each `{id, ...}` or `None`), plus `start_date`, `due_date`, `closed_on` (ISO-8601 or `None`), `done_ratio`, `estimated_hours`, `spent_hours`, and `is_private`. Each is `None` when not set on the issue. A journal whose note was edited also carries `updated_on` and `updated_by`; both keys are absent on unedited journals. When `REDMINE_AGILE_ENABLED=true`, also includes `story_points`, `agile_sprint_id`, and `agile_position` from the RedmineUP Agile plugin. When `REDMINE_TAGS_ENABLED=true`, also includes `tags` (array of `{id, name}`, `id` frequently `null`) from the AlphaNodes `additional_tags` plugin; the key is absent both when the flag is off and when Redmine itself omitted it (e.g. the caller lacks `view_issue_tags`) — the two cases are indistinguishable.
 
 ### `list_redmine_issues`
 
@@ -383,7 +384,7 @@ Returns: List of `{id, name}` dicts for trackers enabled on the project.
 
 Parameters: none
 
-Returns: List of `{id, name, is_closed}` dicts — `is_closed` flags statuses that count as "closed" for reporting purposes.
+Returns: List of `{id, name, is_closed, description}` dicts — `is_closed` flags statuses that count as "closed" for reporting purposes; `description` is the admin-authored text, or `None`.
 
 ### `list_redmine_issue_priorities`
 
