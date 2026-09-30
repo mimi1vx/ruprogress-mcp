@@ -16,11 +16,10 @@
 //! `IssueCustomFieldEntry`/`IssueCustomFieldValueInput` are their own,
 //! smaller types, deliberately not merged with the ones above.
 
-use redmine_client::model::custom_field::{
-    CustomFieldDefinition, CustomFieldValue, CustomFieldWrite,
-};
+use redmine_client::model::IdName;
+use redmine_client::model::custom_field::{CustomFieldValue, CustomFieldWrite};
 use redmine_client::model::project::ProjectInclude;
-use redmine_client::{IssueId, ProjectId, ProjectIdent, Scoped};
+use redmine_client::{Error, IssueId, ProjectId, ProjectIdent, Scoped};
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
@@ -175,7 +174,7 @@ pub(crate) fn validate_entry_shapes(entries: &[IssueCustomFieldEntry]) -> Result
 /// definitions lookup entirely (F6) and this function never needs a
 /// definition to resolve an `id`-only entry.
 pub(crate) fn resolve_entries(
-    defs: Option<&[CustomFieldDefinition]>,
+    defs: Option<&[IdName]>,
     entries: Vec<IssueCustomFieldEntry>,
 ) -> Result<Vec<CustomFieldWrite>, McpError> {
     validate_entry_shapes(&entries)?;
@@ -215,9 +214,9 @@ pub(crate) fn resolve_entries(
     Ok(out)
 }
 
-fn resolve_name(defs: &[CustomFieldDefinition], name: &str) -> Result<u64, McpError> {
+fn resolve_name(defs: &[IdName], name: &str) -> Result<u64, McpError> {
     let normalized = normalize_field_name(name);
-    let matches: Vec<&CustomFieldDefinition> = defs
+    let matches: Vec<&IdName> = defs
         .iter()
         .filter(|d| normalize_field_name(&d.name) == normalized)
         .collect();
@@ -449,12 +448,13 @@ pub(crate) struct Fill {
 /// lookup in this module matches names. Returns the candidate as a
 /// `Vec<String>` (one entry for a single-valued field) so the caller can
 /// check `possible_values` membership uniformly for single and multi-value
-/// fields. `None` means neither source has anything usable.
-fn pick_candidate(def: &CustomFieldDefinition, cfg: &CustomFieldConfig) -> Option<Vec<String>> {
+/// fields, plus whether the value was configured as an array. `None` means
+/// neither source has anything usable.
+fn pick_candidate(def: &AutofillDef, cfg: &CustomFieldConfig) -> Option<(Vec<String>, bool)> {
     if let Some(default) = &def.default_value
         && !default.is_empty()
     {
-        return Some(vec![default.clone()]);
+        return Some((vec![default.clone()], false));
     }
     let normalized = normalize_field_name(&def.name);
     let (_, value) = cfg
@@ -462,8 +462,10 @@ fn pick_candidate(def: &CustomFieldDefinition, cfg: &CustomFieldConfig) -> Optio
         .iter()
         .find(|(name, _)| normalize_field_name(name) == normalized)?;
     match value {
-        CustomFieldDefaultValue::Single(s) if !s.is_empty() => Some(vec![s.clone()]),
-        CustomFieldDefaultValue::Multiple(items) if !items.is_empty() => Some(items.clone()),
+        CustomFieldDefaultValue::Single(s) if !s.is_empty() => Some((vec![s.clone()], false)),
+        CustomFieldDefaultValue::Multiple(items) if !items.is_empty() => {
+            Some((items.clone(), true))
+        }
         CustomFieldDefaultValue::Single(_) | CustomFieldDefaultValue::Multiple(_) => None,
     }
 }
@@ -474,8 +476,8 @@ fn pick_candidate(def: &CustomFieldDefinition, cfg: &CustomFieldConfig) -> Optio
 /// project/tracker does not carry), or whose only candidate value is empty
 /// or outside a restricted `possible_values` list, produces no [`Fill`] —
 /// an empty result means there is nothing to retry with.
-pub(crate) fn compute_autofill(
-    defs: &[CustomFieldDefinition],
+fn compute_autofill(
+    defs: &[AutofillDef],
     missing: &[MissingField],
     cfg: &CustomFieldConfig,
 ) -> Vec<Fill> {
@@ -486,14 +488,14 @@ pub(crate) fn compute_autofill(
             let def = defs
                 .iter()
                 .find(|d| normalize_field_name(&d.name) == normalized)?;
-            let candidate = pick_candidate(def, cfg)?;
+            let (candidate, from_array) = pick_candidate(def, cfg)?;
             if let Some(possible) = &def.possible_values
                 && !possible.is_empty()
                 && !candidate.iter().all(|v| possible.contains(v))
             {
                 return None;
             }
-            let value = if def.multiple.unwrap_or(false) {
+            let value = if def.multiple.unwrap_or(from_array) {
                 CustomFieldValue::Multiple(candidate)
             } else {
                 CustomFieldValue::Single(candidate.into_iter().next())
@@ -534,14 +536,41 @@ pub(crate) enum AutofillTarget<'a> {
     Update(IssueId),
 }
 
+/// The slice of an issue custom field definition autofill reads. A `None`
+/// in any optional field means the source did not say — `multiple: None`
+/// follows the shape of the configured default instead.
+struct AutofillDef {
+    id: u64,
+    name: String,
+    default_value: Option<String>,
+    possible_values: Option<Vec<String>>,
+    multiple: Option<bool>,
+}
+
+impl From<IdName> for AutofillDef {
+    fn from(field: IdName) -> Self {
+        Self {
+            id: field.id,
+            name: field.name,
+            default_value: None,
+            possible_values: None,
+            multiple: None,
+        }
+    }
+}
+
 /// Always fetches fresh, even when resolving `custom_fields` by name just
-/// fetched the same project's definitions moments earlier — reusing that
+/// fetched the same project's field list moments earlier — reusing that
 /// result would couple the two paths together to save one request on a
 /// failure path.
+///
+/// The project's `{id, name}` list says which fields apply; full definitions
+/// come from the admin-only `GET /custom_fields.json`. On 403 the list alone
+/// is used, so only the configured defaults can fill.
 async fn fetch_definitions_for_autofill(
     scoped: &Scoped<'_>,
     target: &AutofillTarget<'_>,
-) -> redmine_client::Result<Vec<CustomFieldDefinition>> {
+) -> redmine_client::Result<Vec<AutofillDef>> {
     let project_id = match target {
         AutofillTarget::Create(id) => (*id).clone(),
         AutofillTarget::Update(issue_id) => {
@@ -552,7 +581,22 @@ async fn fetch_definitions_for_autofill(
     let project = scoped
         .get_project(&project_id, &[ProjectInclude::IssueCustomFields])
         .await?;
-    Ok(project.issue_custom_fields.unwrap_or_default())
+    let members = project.issue_custom_fields.unwrap_or_default();
+    match scoped.list_custom_field_definitions().await {
+        Ok(definitions) => Ok(definitions
+            .into_iter()
+            .filter(|d| members.iter().any(|m| m.id == d.id))
+            .map(|d| AutofillDef {
+                id: d.id,
+                name: d.name,
+                default_value: d.default_value,
+                possible_values: d.possible_values,
+                multiple: d.multiple,
+            })
+            .collect()),
+        Err(Error::Forbidden) => Ok(members.into_iter().map(AutofillDef::from).collect()),
+        Err(e) => Err(e),
+    }
 }
 
 /// What to do about a write that just failed, decided once and handed back
@@ -648,11 +692,8 @@ pub(crate) fn retry_still_missing_required_fields(
 mod tests {
     use super::*;
 
-    fn def(id: u64, name: &str) -> CustomFieldDefinition {
-        serde_json::from_value(serde_json::json!({
-            "id": id, "name": name, "field_format": "string"
-        }))
-        .unwrap()
+    fn def(id: u64, name: &str) -> IdName {
+        serde_json::from_value(serde_json::json!({ "id": id, "name": name })).unwrap()
     }
 
     fn entry_by_id(id: u64, value: &str) -> IssueCustomFieldEntry {
@@ -842,18 +883,27 @@ mod tests {
         default_value: Option<&str>,
         possible_values: Option<&[&str]>,
         multiple: bool,
-    ) -> CustomFieldDefinition {
-        serde_json::from_value(serde_json::json!({
-            "id": id,
-            "name": name,
-            "field_format": "string",
-            "default_value": default_value,
-            "possible_values": possible_values.map(|values| {
-                values.iter().map(|v| serde_json::json!({"value": v})).collect::<Vec<_>>()
-            }),
-            "multiple": multiple,
-        }))
-        .unwrap()
+    ) -> AutofillDef {
+        AutofillDef {
+            multiple: Some(multiple),
+            ..def_unknown(id, name, default_value, possible_values)
+        }
+    }
+
+    fn def_unknown(
+        id: u64,
+        name: &str,
+        default_value: Option<&str>,
+        possible_values: Option<&[&str]>,
+    ) -> AutofillDef {
+        AutofillDef {
+            id,
+            name: name.to_string(),
+            default_value: default_value.map(str::to_string),
+            possible_values: possible_values
+                .map(|values| values.iter().map(|v| (*v).to_string()).collect()),
+            multiple: None,
+        }
     }
 
     fn missing(label: &str) -> MissingField {
@@ -960,6 +1010,56 @@ mod tests {
         let cfg = cfg_with_defaults(&[]);
         let fills = compute_autofill(&defs, &[missing("Subject"), missing("Department")], &cfg);
         assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn unknown_multiplicity_follows_a_configured_string_as_a_single_value() {
+        let defs = vec![AutofillDef::from(def(1, "Department"))];
+        let cfg = cfg_with_defaults(&[(
+            "Department",
+            CustomFieldDefaultValue::Single("Sales".to_string()),
+        )]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Single(Some("Sales".to_string()))
+        );
+    }
+
+    #[test]
+    fn unknown_multiplicity_follows_a_configured_array_as_a_multiple_value() {
+        let defs = vec![AutofillDef::from(def(1, "Tags"))];
+        let cfg = cfg_with_defaults(&[(
+            "Tags",
+            CustomFieldDefaultValue::Multiple(vec!["a".to_string(), "b".to_string()]),
+        )]);
+        let fills = compute_autofill(&defs, &[missing("Tags")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Multiple(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn unknown_multiplicity_wraps_a_definitions_own_default_as_a_single_value() {
+        let defs = vec![def_unknown(1, "Department", Some("Engineering"), None)];
+        let cfg = cfg_with_defaults(&[]);
+        let fills = compute_autofill(&defs, &[missing("Department")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Single(Some("Engineering".to_string()))
+        );
+    }
+
+    #[test]
+    fn known_multiplicity_overrides_the_configured_shape() {
+        let defs = vec![def_with(1, "Tags", None, None, true)];
+        let cfg = cfg_with_defaults(&[("Tags", CustomFieldDefaultValue::Single("a".to_string()))]);
+        let fills = compute_autofill(&defs, &[missing("Tags")], &cfg);
+        assert_eq!(
+            fills[0].value,
+            CustomFieldValue::Multiple(vec!["a".to_string()])
+        );
     }
 
     // --- required_field_error ---

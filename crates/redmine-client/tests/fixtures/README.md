@@ -31,7 +31,8 @@ capture date and re-run the scrub test below.
 | `saved_queries_6_1.json` | 6.1 | `GET /queries.json` | — |
 | `saved_queries_7_0.json` | 7.0 | `GET /queries.json` | — |
 | `project_with_trackers_7_0.json` | 7.0 | `GET /projects/1.json?include=trackers` | `project.trackers` populated |
-| `project_with_issue_custom_fields.json` | 7.0 | `GET /projects/1.json?include=issue_custom_fields` | `project.issue_custom_fields` populated: one `list` field with `possible_values`/`default_value`, one `multiple: true` `list` field, one plain `string` field. **Known divergence:** real Redmine (`ProjectsHelper#render_api_includes`) sends only `{id, name}` per field here; the full definition shape comes from `GET /custom_fields.json` |
+| `project_with_issue_custom_fields_6_1.json` | 6.1 | `GET /projects/1.json?include=issue_custom_fields` | `project.issue_custom_fields` populated with `{id, name}` only (all `ProjectsHelper#render_api_includes` sends; full definitions come from `GET /custom_fields.json`); no `parent` |
+| `project_with_issue_custom_fields_7_0.json` | 7.0 | `GET /projects/1.json?include=issue_custom_fields` | same `{id, name}`-only shape, three fields; includes `parent` |
 | `attachment_6_1.json` | 6.1 | `GET /attachments/6243.json` | no `thumbnail_url` (non-image) |
 | `attachment_7_0.json` | 7.0 | `GET /attachments/6244.json` | includes `thumbnail_url` (image), which the client ignores (not modeled) |
 | `project_files_6_1.json` | 6.1 | `GET /projects/1/files.json` | file attached to a `Version` (`version` present) |

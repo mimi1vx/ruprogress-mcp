@@ -47,13 +47,9 @@ fn required_422(message: &str) -> ResponseTemplate {
     ResponseTemplate::new(422).set_body_json(json!({"errors": [message]}))
 }
 
-/// A project carrying one `issue_custom_fields` definition.
-fn project_json(
-    id: u64,
-    name: &str,
-    default_value: Option<&str>,
-    possible_values: Option<&[&str]>,
-) -> Value {
+/// A project's `issue_custom_fields`, which carries only `{id, name}` per
+/// field — Redmine's `include=issue_custom_fields` sends nothing more.
+fn project_json(fields: &[(u64, &str)]) -> Value {
     json!({
         "project": {
             "id": 1,
@@ -61,25 +57,71 @@ fn project_json(
             "identifier": "p",
             "created_on": "2026-01-01T00:00:00Z",
             "updated_on": "2026-01-01T00:00:00Z",
-            "issue_custom_fields": [{
-                "id": id,
-                "name": name,
-                "field_format": "string",
-                "default_value": default_value,
-                "possible_values": possible_values.map(|values| {
-                    values.iter().map(|v| json!({"value": v})).collect::<Vec<_>>()
-                }),
-            }]
+            "issue_custom_fields": fields
+                .iter()
+                .map(|(id, name)| json!({"id": id, "name": name}))
+                .collect::<Vec<_>>()
         }
     })
 }
 
-async fn mock_project(server: &wiremock::MockServer, project: Value) {
+/// A full definition, as only the admin-only `GET /custom_fields.json` sends.
+fn definition_json(
+    id: u64,
+    name: &str,
+    default_value: Option<&str>,
+    possible_values: Option<&[&str]>,
+) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "customized_type": "issue",
+        "field_format": "string",
+        "default_value": default_value,
+        "possible_values": possible_values.map(|values| {
+            values.iter().map(|v| json!({"value": v})).collect::<Vec<_>>()
+        }),
+    })
+}
+
+async fn mock_project(server: &wiremock::MockServer, fields: &[(u64, &str)]) {
     Mock::given(method("GET"))
         .and(path("/projects/1.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(project))
+        .respond_with(ResponseTemplate::new(200).set_body_json(project_json(fields)))
         .mount(server)
         .await;
+}
+
+async fn mock_custom_fields(server: &wiremock::MockServer, defs: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/custom_fields.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"custom_fields": defs})))
+        .mount(server)
+        .await;
+}
+
+async fn mock_custom_fields_forbidden(server: &wiremock::MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/custom_fields.json"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(server)
+        .await;
+}
+
+/// One field that is both on the project and fully defined for an admin.
+async fn mock_field(
+    server: &wiremock::MockServer,
+    id: u64,
+    name: &str,
+    default_value: Option<&str>,
+    possible_values: Option<&[&str]>,
+) {
+    mock_project(server, &[(id, name)]).await;
+    mock_custom_fields(
+        server,
+        vec![definition_json(id, name, default_value, possible_values)],
+    )
+    .await;
 }
 
 // --- create_redmine_issue ---
@@ -128,11 +170,7 @@ async fn autofill_on_uses_the_definitions_default_value_and_reports_it() {
         .up_to_n_times(1)
         .mount(&h.redmine)
         .await;
-    mock_project(
-        &h.redmine,
-        project_json(3, "Department", Some("Engineering"), None),
-    )
-    .await;
+    mock_field(&h.redmine, 3, "Department", Some("Engineering"), None).await;
     Mock::given(method("POST"))
         .and(path("/issues.json"))
         .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
@@ -182,7 +220,7 @@ async fn autofill_on_falls_back_to_the_configured_map_when_no_default_value() {
         .up_to_n_times(1)
         .mount(&h.redmine)
         .await;
-    mock_project(&h.redmine, project_json(3, "Department", None, None)).await;
+    mock_field(&h.redmine, 3, "Department", None, None).await;
     Mock::given(method("POST"))
         .and(path("/issues.json"))
         .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
@@ -221,7 +259,7 @@ async fn autofill_on_nothing_fillable_sends_exactly_one_write() {
         .await;
     // The definition exists but has no default, and the operator configured
     // no map entry for it — nothing to fill with.
-    mock_project(&h.redmine, project_json(3, "Department", None, None)).await;
+    mock_field(&h.redmine, 3, "Department", None, None).await;
 
     let result = call(
         &h,
@@ -251,11 +289,7 @@ async fn autofill_on_second_attempt_also_422s_sends_exactly_two_writes_never_a_t
         .up_to_n_times(1)
         .mount(&h.redmine)
         .await;
-    mock_project(
-        &h.redmine,
-        project_json(3, "Department", Some("Engineering"), None),
-    )
-    .await;
+    mock_field(&h.redmine, 3, "Department", Some("Engineering"), None).await;
     // The retry still fails, for whatever reason Redmine has: no third
     // attempt should ever be made regardless.
     Mock::given(method("POST"))
@@ -293,9 +327,12 @@ async fn autofill_on_replaces_a_caller_value_redmine_rejected_as_out_of_range() 
         .up_to_n_times(1)
         .mount(&h.redmine)
         .await;
-    mock_project(
+    mock_field(
         &h.redmine,
-        project_json(3, "Severity", Some("High"), Some(&["Low", "High"])),
+        3,
+        "Severity",
+        Some("High"),
+        Some(&["Low", "High"]),
     )
     .await;
     Mock::given(method("POST"))
@@ -329,6 +366,167 @@ async fn autofill_on_replaces_a_caller_value_redmine_rejected_as_out_of_range() 
             .contains("High"),
         "the rejected caller value must be replaced by the default: {body:?}"
     );
+}
+
+async fn count_posts(h: &support::Harness) -> usize {
+    h.redmine
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/issues.json")
+        .count()
+}
+
+#[tokio::test]
+async fn non_admin_credential_fills_from_the_configured_map_only() {
+    let h = support::harness(&[
+        ("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", "true"),
+        (
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+            r#"{"Department": "Sales"}"#,
+        ),
+    ])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(required_422("Department can't be blank"))
+        .up_to_n_times(1)
+        .mount(&h.redmine)
+        .await;
+    mock_project(&h.redmine, &[(3, "Department")]).await;
+    mock_custom_fields_forbidden(&h.redmine).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue"}),
+    )
+    .await;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let body = result.structured_content.unwrap();
+    let filled = &body["autofilled_custom_fields"][0];
+    assert_eq!(filled["id"], 3);
+    assert!(filled["value"].as_str().unwrap().contains("Sales"));
+    assert_eq!(count_posts(&h).await, 2);
+}
+
+#[tokio::test]
+async fn non_admin_credential_cannot_use_the_fields_own_default_value() {
+    let h = support::harness(&[("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", "true")]).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(required_422("Department can't be blank"))
+        .mount(&h.redmine)
+        .await;
+    mock_project(&h.redmine, &[(3, "Department")]).await;
+    mock_custom_fields_forbidden(&h.redmine).await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue"}),
+    )
+    .await;
+
+    assert_eq!(result.is_error, Some(true));
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["code"], "VALIDATION_FAILED");
+    assert_eq!(body["missing_required_fields"], json!(["Department"]));
+    assert_eq!(count_posts(&h).await, 1);
+}
+
+#[tokio::test]
+async fn non_admin_credential_sends_an_array_default_as_an_array() {
+    let h = support::harness(&[
+        ("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", "true"),
+        (
+            "REDMINE_REQUIRED_CUSTOM_FIELD_DEFAULTS",
+            r#"{"Platforms": ["linux", "macos"]}"#,
+        ),
+    ])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(required_422("Platforms can't be blank"))
+        .up_to_n_times(1)
+        .mount(&h.redmine)
+        .await;
+    mock_project(&h.redmine, &[(4, "Platforms")]).await;
+    mock_custom_fields_forbidden(&h.redmine).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue"}),
+    )
+    .await;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        result.structured_content
+    );
+    let requests = h.redmine.received_requests().await.unwrap_or_default();
+    let retry = requests
+        .iter()
+        .filter(|r| r.url.path() == "/issues.json")
+        .nth(1)
+        .expect("the retry should have been sent");
+    let body: Value = retry.body_json().expect("issues.json body should be JSON");
+    assert_eq!(
+        body["issue"]["custom_fields"],
+        json!([{"id": 4, "value": ["linux", "macos"]}])
+    );
+}
+
+#[tokio::test]
+async fn a_definition_outside_the_projects_field_list_is_never_used() {
+    let h = support::harness(&[("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", "true")]).await;
+    Mock::given(method("POST"))
+        .and(path("/issues.json"))
+        .respond_with(required_422("Budget can't be blank"))
+        .mount(&h.redmine)
+        .await;
+    mock_project(&h.redmine, &[(3, "Department")]).await;
+    mock_custom_fields(
+        &h.redmine,
+        vec![
+            definition_json(3, "Department", Some("Engineering"), None),
+            definition_json(9, "Budget", Some("100"), None),
+        ],
+    )
+    .await;
+
+    let result = call(
+        &h,
+        "create_redmine_issue",
+        json!({"project_id": 1, "subject": "New issue"}),
+    )
+    .await;
+
+    assert_eq!(result.is_error, Some(true));
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["code"], "VALIDATION_FAILED");
+    assert_eq!(body["missing_required_fields"], json!(["Budget"]));
+    assert_eq!(count_posts(&h).await, 1);
 }
 
 async fn mock_upload_token(server: &wiremock::MockServer, id: u64, token: &str) {
@@ -374,11 +572,7 @@ async fn autofill_on_a_create_with_uploads_retries_with_the_same_upload_token() 
         .up_to_n_times(1)
         .mount(&h.redmine)
         .await;
-    mock_project(
-        &h.redmine,
-        project_json(3, "Department", Some("Engineering"), None),
-    )
-    .await;
+    mock_field(&h.redmine, 3, "Department", Some("Engineering"), None).await;
     Mock::given(method("POST"))
         .and(path("/issues.json"))
         .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(42, "New issue")))
@@ -427,7 +621,8 @@ async fn autofill_on_a_create_with_uploads_retries_with_the_same_upload_token() 
 // --- update_redmine_issue ---
 
 #[tokio::test]
-async fn update_retry_path_is_get_issue_then_get_project_then_put_then_its_own_follow_up_get() {
+async fn update_retry_path_is_get_issue_then_get_project_then_get_custom_fields_then_put_then_its_own_follow_up_get()
+ {
     let h = support::harness(&[("REDMINE_AUTOFILL_REQUIRED_CUSTOM_FIELDS", "true")]).await;
     Mock::given(method("PUT"))
         .and(path("/issues/7.json"))
@@ -440,11 +635,7 @@ async fn update_retry_path_is_get_issue_then_get_project_then_put_then_its_own_f
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
         .mount(&h.redmine)
         .await;
-    mock_project(
-        &h.redmine,
-        project_json(3, "Department", Some("Engineering"), None),
-    )
-    .await;
+    mock_field(&h.redmine, 3, "Department", Some("Engineering"), None).await;
     Mock::given(method("PUT"))
         .and(path("/issues/7.json"))
         .respond_with(ResponseTemplate::new(204))
@@ -478,6 +669,7 @@ async fn update_retry_path_is_get_issue_then_get_project_then_put_then_its_own_f
             ("PUT".to_string(), "/issues/7.json".to_string()),
             ("GET".to_string(), "/issues/7.json".to_string()),
             ("GET".to_string(), "/projects/1.json".to_string()),
+            ("GET".to_string(), "/custom_fields.json".to_string()),
             ("PUT".to_string(), "/issues/7.json".to_string()),
             ("GET".to_string(), "/issues/7.json".to_string()),
         ],
@@ -541,11 +733,7 @@ async fn update_with_notes_that_422s_then_succeeds_sends_exactly_two_puts() {
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7, "s")))
         .mount(&h.redmine)
         .await;
-    mock_project(
-        &h.redmine,
-        project_json(3, "Department", Some("Engineering"), None),
-    )
-    .await;
+    mock_field(&h.redmine, 3, "Department", Some("Engineering"), None).await;
     Mock::given(method("PUT"))
         .and(path("/issues/7.json"))
         .respond_with(ResponseTemplate::new(204))

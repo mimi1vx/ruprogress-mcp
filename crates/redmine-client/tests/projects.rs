@@ -97,32 +97,47 @@ async fn list_projects_forbidden() {
 }
 
 #[tokio::test]
-async fn get_project_with_issue_custom_fields_sends_the_include_param_and_parses_definitions() {
-    let (server, client) = support::mock_redmine().await;
-    let fixture = include_str!("fixtures/project_with_issue_custom_fields.json");
-    let body: serde_json::Value = serde_json::from_str(fixture).unwrap();
-    Mock::given(method("GET"))
-        .and(path("/projects/1.json"))
-        .and(query_param("include", "issue_custom_fields"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .mount(&server)
-        .await;
+async fn get_project_with_issue_custom_fields_sends_the_include_param_and_parses_id_and_name() {
+    for (fixture, expected) in [
+        (
+            include_str!("fixtures/project_with_issue_custom_fields_6_1.json"),
+            vec![(3, "Severity"), (5, "Story Points")],
+        ),
+        (
+            include_str!("fixtures/project_with_issue_custom_fields_7_0.json"),
+            vec![
+                (3, "Severity"),
+                (4, "Affected Platforms"),
+                (5, "Story Points"),
+            ],
+        ),
+    ] {
+        let (server, client) = support::mock_redmine().await;
+        let body: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/projects/1.json"))
+            .and(query_param("include", "issue_custom_fields"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
 
-    let cred = Credential::ApiKey(SecretString::from("k"));
-    let ident = ProjectIdent::Id(ProjectId(1));
-    let project = client
-        .as_user(&cred)
-        .get_project(&ident, &[ProjectInclude::IssueCustomFields])
-        .await
-        .unwrap();
-    let defs = project
-        .issue_custom_fields
-        .expect("issue_custom_fields should be Some");
-    assert_eq!(defs.len(), 3);
-    let severity = defs.iter().find(|d| d.name == "Severity").unwrap();
-    assert_eq!(severity.default_value.as_deref(), Some("Low"));
-    assert_eq!(
-        severity.possible_values,
-        Some(vec!["Low".to_string(), "High".to_string()])
-    );
+        let cred = Credential::ApiKey(SecretString::from("k"));
+        let ident = ProjectIdent::Id(ProjectId(1));
+        let project = client
+            .as_user(&cred)
+            .get_project(&ident, &[ProjectInclude::IssueCustomFields])
+            .await
+            .unwrap();
+        let fields: Vec<(u64, String)> = project
+            .issue_custom_fields
+            .expect("issue_custom_fields should be Some")
+            .into_iter()
+            .map(|f| (f.id, f.name))
+            .collect();
+        let expected: Vec<(u64, String)> = expected
+            .into_iter()
+            .map(|(i, n)| (i, n.to_string()))
+            .collect();
+        assert_eq!(fields, expected);
+    }
 }

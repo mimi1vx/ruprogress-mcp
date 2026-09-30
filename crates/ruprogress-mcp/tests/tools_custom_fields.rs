@@ -51,8 +51,8 @@ fn project_with_definitions_json() -> Value {
             "created_on": "2026-01-01T00:00:00Z",
             "updated_on": "2026-01-01T00:00:00Z",
             "issue_custom_fields": [
-                {"id": 3, "name": "Severity", "field_format": "string"},
-                {"id": 4, "name": "Severity Level", "field_format": "string"}
+                {"id": 3, "name": "Severity"},
+                {"id": 4, "name": "Severity Level"}
             ]
         }
     })
@@ -75,8 +75,8 @@ fn project_with_ambiguous_definitions_json() -> Value {
             "created_on": "2026-01-01T00:00:00Z",
             "updated_on": "2026-01-01T00:00:00Z",
             "issue_custom_fields": [
-                {"id": 3, "name": "Story Points", "field_format": "string"},
-                {"id": 4, "name": "story_points", "field_format": "string"}
+                {"id": 3, "name": "Story Points"},
+                {"id": 4, "name": "story_points"}
             ]
         }
     })
