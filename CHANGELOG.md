@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.10.3...v0.11.0) - 2026-09-30
+
+### Added
+
+- surface journal edit metadata
+- show allowed status transitions on get_redmine_issue
+- expose issue-status descriptions
+- *(redmine-client)* model fields Redmine 7.0 already sends
+
+### Fixed
+
+- *(custom-fields)* decode project issue_custom_fields as {id, name}
+- *(redmine-client)* [**breaking**] drop the issue-status is_default Redmine never sends
+
+### Other
+
+- state supported Redmine versions and correct fixture provenance
+
 ## [0.10.3](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.10.2...v0.10.3) - 2026-09-24
 
 ### Fixed
