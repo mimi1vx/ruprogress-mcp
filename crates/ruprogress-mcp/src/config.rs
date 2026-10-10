@@ -2897,7 +2897,11 @@ mod tests {
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:8000");
         assert_eq!(cfg.mcp_path, "/mcp");
         assert_eq!(cfg.allowed_hosts, ["localhost", "127.0.0.1", "::1"]);
-        assert!(cfg.allowed_origins.is_empty());
+        assert!(
+            cfg.allowed_origins.is_empty(),
+            "unexpected allowed origins: {:?}",
+            cfg.allowed_origins
+        );
         assert_eq!(cfg.max_request_body_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.health_ttl, Duration::from_secs(30));
     }
@@ -3019,7 +3023,11 @@ mod tests {
             ("PUBLIC_HOST", "mcp.example.com"),
         ])
         .expect("the explicit opt-out should be accepted");
-        assert!(cfg.allowed_hosts.is_empty());
+        assert!(
+            cfg.allowed_hosts.is_empty(),
+            "unexpected allowed hosts: {:?}",
+            cfg.allowed_hosts
+        );
     }
 
     /// The invariant the whole derivation exists for: rmcp reads an empty
@@ -3348,7 +3356,11 @@ mod tests {
         assert!(a.auto_cleanup_enabled);
         assert_eq!(a.cleanup_interval, Duration::from_mins(15));
         assert_eq!(a.expires_after, Duration::from_hours(1));
-        assert!(a.upload_file_roots.is_empty());
+        assert!(
+            a.upload_file_roots.is_empty(),
+            "unexpected upload_file_roots: {:?}",
+            a.upload_file_roots
+        );
         assert!(!a.expose_admin_tools);
         assert!(a.public_url_rewrite.is_none());
     }

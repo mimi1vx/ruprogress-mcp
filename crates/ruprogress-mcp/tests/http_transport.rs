@@ -51,7 +51,7 @@ async fn initialize_negotiates_a_protocol_version() {
     let harness = support::http_harness(&[]).await;
     let client = connect(&harness).await;
     let info = client.peer_info().expect("server info after initialize");
-    assert!(!info.protocol_version.to_string().is_empty());
+    assert_ne!(info.protocol_version.to_string(), "");
     client.cancel().await.ok();
 }
 

@@ -679,7 +679,11 @@ mod tests {
             ])),
         ) {
             Requirement::ScopesWithAnyOf { all, any } => {
-                assert!(missing(all, &held).is_empty());
+                assert!(
+                    missing(all, &held).is_empty(),
+                    "unexpected missing scopes: {:?}",
+                    missing(all, &held)
+                );
                 assert!(any_held(any, &held));
             }
             other => panic!("unexpected requirement: {other:?}"),
@@ -697,7 +701,11 @@ mod tests {
             ])),
         ) {
             Requirement::ScopesWithAnyOf { all, any } => {
-                assert!(missing(all, &held).is_empty());
+                assert!(
+                    missing(all, &held).is_empty(),
+                    "unexpected missing scopes: {:?}",
+                    missing(all, &held)
+                );
                 assert!(any_held(any, &held));
             }
             other => panic!("unexpected requirement: {other:?}"),
@@ -770,7 +778,11 @@ mod tests {
             Some(&args(&[("tag_list", serde_json::json!(["a"]))])),
         ) {
             Requirement::ScopesWithAnyOf { all, any } => {
-                assert!(missing(all, &held).is_empty());
+                assert!(
+                    missing(all, &held).is_empty(),
+                    "unexpected missing scopes: {:?}",
+                    missing(all, &held)
+                );
                 assert!(!any_held(any, &held));
             }
             other => panic!("unexpected requirement: {other:?}"),
@@ -844,6 +856,10 @@ mod tests {
             missing(&["view_project", "view_issues"], &held),
             vec!["view_project"]
         );
-        assert!(missing(&["view_issues"], &held).is_empty());
+        assert!(
+            missing(&["view_issues"], &held).is_empty(),
+            "unexpected missing scopes: {:?}",
+            missing(&["view_issues"], &held)
+        );
     }
 }

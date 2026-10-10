@@ -872,7 +872,7 @@ mod tests {
         let missing = parse_required_field_errors(&[
             "Issue relations conflict with an existing relation".to_string(),
         ]);
-        assert!(missing.is_empty());
+        assert!(missing.is_empty(), "unexpected fields: {missing:?}");
     }
 
     // --- compute_autofill ---
