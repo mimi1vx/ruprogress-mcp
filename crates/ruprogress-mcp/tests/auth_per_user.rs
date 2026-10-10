@@ -310,13 +310,13 @@ async fn tools_list_and_initialize_succeed_without_any_credential_header() {
     let client = connect_with_no_headers(&harness.mcp_url()).await;
 
     let info = client.peer_info().expect("server info after initialize");
-    assert!(!info.protocol_version.to_string().is_empty());
+    assert_ne!(info.protocol_version.to_string(), "");
 
     let tools = client
         .list_all_tools()
         .await
         .expect("tools/list should succeed with no credential header");
-    assert!(!tools.is_empty());
+    assert!(!tools.is_empty(), "expected at least one tool");
     client.cancel().await.ok();
 }
 

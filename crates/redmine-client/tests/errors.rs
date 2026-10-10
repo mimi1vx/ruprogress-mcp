@@ -92,7 +92,7 @@ async fn get_json_maps_500_with_unparseable_body_to_empty_errors() {
     match err {
         Error::Api { status, errors } => {
             assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(errors.is_empty());
+            assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         }
         other => panic!("expected Api, got {other:?}"),
     }

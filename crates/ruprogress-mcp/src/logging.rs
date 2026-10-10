@@ -210,6 +210,9 @@ mod tests {
         // `EnvFilter::new` already parses leniently (an invalid directive is
         // dropped, not an error) — the floor must not change that.
         let (_filter, overridden) = env_filter("not a valid directive!!!");
-        assert!(overridden.is_empty());
+        assert!(
+            overridden.is_empty(),
+            "unexpected overridden targets: {overridden:?}"
+        );
     }
 }

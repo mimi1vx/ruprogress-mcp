@@ -104,7 +104,11 @@ mod tests {
             iat: None,
             token_type: None,
         };
-        assert!(value.scopes().is_empty());
+        assert!(
+            value.scopes().is_empty(),
+            "unexpected scopes: {:?}",
+            value.scopes()
+        );
     }
 
     #[test]

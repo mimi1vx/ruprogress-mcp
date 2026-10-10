@@ -244,7 +244,7 @@ mod tests {
         match from_status(http::StatusCode::INTERNAL_SERVER_ERROR, b"not json", None) {
             Error::Api { status, errors } => {
                 assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR);
-                assert!(errors.is_empty());
+                assert!(errors.is_empty(), "unexpected errors: {errors:?}");
             }
             other => panic!("expected Api, got {other:?}"),
         }
