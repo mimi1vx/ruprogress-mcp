@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use redmine_client::RedmineClientBuilder;
 use rmcp::service::RunningService;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{RoleClient, ServiceExt as _};
 use ruprogress_mcp::attachments::AttachmentStore;
 use ruprogress_mcp::config::{AuthMode, Config, TransportKind};
 use ruprogress_mcp::server::RedmineMcp;
+use ruprogress_mcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Harness {
@@ -89,15 +91,19 @@ pub(crate) async fn harness_with_route(
 }
 
 async fn serve_over_duplex(redmine: wiremock::MockServer, server: RedmineMcp) -> Harness {
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let (server_io, client_io) = tokio::io::duplex(4096);
+    let (server_read, server_write) = tokio::io::split(server_io);
+    let (client_read, client_write) = tokio::io::split(client_io);
     tokio::spawn(async move {
         let running = server
-            .serve(server_transport)
+            .serve(stdio::transport(server_read, server_write))
             .await
             .expect("server should start serving over the duplex transport");
         let _ = running.waiting().await;
     });
 
+    let client_transport = AsyncRwTransport::new_client(client_read, client_write)
+        .with_max_line_length(stdio::MAX_LINE_BYTES);
     let client =
         ().serve(client_transport)
             .await
