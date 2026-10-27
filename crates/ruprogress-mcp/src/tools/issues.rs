@@ -1596,7 +1596,7 @@ enum IssueUploadOutcome {
 /// `mint_upload_token`. Without this, the existing 10-item cap alone still
 /// let one call buffer up to 10 × `UPLOAD_FILE_MAX_BYTES` ≈ 500 MiB of
 /// decoded bytes; this bounds the same call to ≈ 100 MiB.
-const ISSUE_UPLOADS_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const ISSUE_UPLOADS_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Bounds how many `GET /attachments/{id}.json` requests `fetch_attachments`
 /// has in flight at once. `uploads[]` is capped at 10 items, so this only

@@ -173,8 +173,9 @@ unless it resolves inside `ATTACHMENTS_DIR` or a `REDMINE_MCP_UPLOAD_FILE_ROOTS`
 entry. `uploads[]` additionally shares a 100 MiB aggregate budget across all
 its items (both sources) for one call. On the HTTP transport,
 `REDMINE_MCP_MAX_REQUEST_BODY_BYTES` is an additional *outer* bound on the
-whole request body; on stdio there is no equivalent, so these are this
-server's only application-level upload limits there.
+whole request body. On stdio, each JSON-RPC message is bounded at a fixed
+144 MiB, sized above the largest upload budget; the transport drops a longer
+message without replying.
 
 ## Exposing the server on a network
 
