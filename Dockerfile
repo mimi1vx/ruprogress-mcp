@@ -14,7 +14,7 @@
 # the release matrix needs no digest change per arch. .github/workflows/docker.yml
 # smoke-tests every base-image bump before it reaches main.
 
-FROM rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
+FROM rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --locked --release --bin ruprogress-mcp
