@@ -48,6 +48,13 @@ pub(crate) fn to_tool_error(e: redmine_client::Error) -> CallToolResult {
             format!("Redmine rejected the request: {}", errors.join("; ")),
             Some("fix the fields named in the error and retry"),
         ),
+        Error::Api { status, errors } if status.is_server_error() => err(
+            ErrorCode::UnexpectedResponse,
+            format!("Redmine returned {status}: {}", errors.join("; ")),
+            Some(
+                "Redmine failed internally; under OAuth on Redmine older than 6.1.6/7.0.3 this is what a locked or inactive user's token produces - ask the operator",
+            ),
+        ),
         Error::Api { status, errors } => err(
             ErrorCode::UnexpectedResponse,
             format!("Redmine returned {status}: {}", errors.join("; ")),
@@ -230,5 +237,27 @@ mod tests {
                 "error envelope for {display} leaked a URL or token: {structured}"
             );
         }
+    }
+
+    fn hint_of(result: &CallToolResult) -> Option<String> {
+        result.structured_content.as_ref().unwrap()["hint"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn a_5xx_hints_at_the_inactive_user_cause_but_a_404_hint_is_unchanged() {
+        let hint = hint_of(&to_tool_error(Error::Api {
+            status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            errors: vec![],
+        }))
+        .expect("a 500 should carry a hint");
+        assert!(hint.contains("inactive user"), "hint: {hint}");
+
+        let hint = hint_of(&to_tool_error(Error::NotFound)).expect("a 404 should carry a hint");
+        assert!(
+            hint.starts_with("verify the id/identifier is correct"),
+            "hint: {hint}"
+        );
     }
 }
