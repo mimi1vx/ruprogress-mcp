@@ -71,6 +71,17 @@ A client that caches `tools/list` across users despite the `cache_scope:
 wrong list to the wrong user — this server cannot fix a client that ignores
 that hint.
 
+Patch-level caveats on the Redmine side:
+
+- Redmine before 6.1.6/7.0.3 ignores token scopes when it decides which
+  projects a request may see. The `INSUFFICIENT_SCOPE` gate filters tools but
+  cannot narrow what an allowed tool returns, so on those patch levels a
+  scoped token sees more than its scopes allow. See
+  [minimum safe patch levels](troubleshooting.md#minimum-safe-redmine-patch-levels).
+- `manage_issue_category` with `action="list"` is mapped to `view_issues`,
+  which is only what Redmine requires from 6.0.11/6.1.4/7.0.1. Before those
+  patch levels it needs `manage_categories`.
+
 ## Step 1: Register an OAuth app for your users
 
 1. Log in to Redmine as admin → **Administration → Applications** → **New

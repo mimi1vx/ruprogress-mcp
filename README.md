@@ -47,7 +47,9 @@ Everything else is environment-driven — see [docs/configuration.md](docs/confi
 
 ## Tools
 
-Targets Redmine 6.0, 6.1 and 7.0.
+Targets Redmine 6.0, 6.1 and 7.0. Run at least 6.0.12 / 6.1.6 / 7.0.3;
+earlier patch levels leak data through endpoints this server calls. See
+[docs/troubleshooting.md](docs/troubleshooting.md#minimum-safe-redmine-patch-levels).
 
 41 tools are registered by default. `cleanup_attachment_files`
 (`REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) and the plugin-gated families below
