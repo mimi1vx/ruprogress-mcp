@@ -43,6 +43,11 @@ pub(crate) struct ServerInfoOutput {
     /// Live upstream sessions (proxy access tokens minted for a user);
     /// `null` outside `oauth-proxy` mode.
     pub(crate) active_sessions: Option<usize>,
+    /// `REDMINE_VERSION` as declared by the operator, not detected; `null`
+    /// when undeclared.
+    pub(crate) redmine_version: Option<String>,
+    /// Set when the declared version is below its series' safe patch level.
+    pub(crate) redmine_version_advisory: Option<String>,
 }
 
 #[tool_router(router = meta_tool_router, vis = "pub(crate)")]
@@ -106,6 +111,8 @@ impl RedmineMcp {
             required_custom_field_defaults_count: self.inner.config.custom_fields.defaults.len(),
             registered_clients,
             active_sessions,
+            redmine_version: self.inner.config.redmine.version.map(|v| v.to_string()),
+            redmine_version_advisory: self.inner.config.redmine_version_advisory(),
         };
         Ok(output::ok(&output, self.output_caps()))
     }

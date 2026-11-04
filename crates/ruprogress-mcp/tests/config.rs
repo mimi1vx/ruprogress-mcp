@@ -302,3 +302,48 @@ fn sigterm_drains_the_http_server_and_exits_zero() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
     assert!(stderr.contains("drained cleanly"), "stderr: {stderr}");
 }
+
+#[test]
+fn print_config_reports_the_declared_redmine_version() {
+    let env_file = TempEnvFile::new(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\nREDMINE_VERSION=7.0.2\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .arg("--print-config")
+        .env_remove("REDMINE_URL")
+        .env_remove("REDMINE_API_KEY")
+        .env_remove("REDMINE_VERSION")
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(
+        stdout.contains(r#""redmine_version": "7.0.2""#),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn print_config_rejects_an_unparseable_redmine_version_naming_the_variable() {
+    let env_file = TempEnvFile::new(
+        "REDMINE_URL=https://redmine.example.com\nREDMINE_API_KEY=k\nREDMINE_VERSION=banana\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ruprogress-mcp"))
+        .arg("--env-file")
+        .arg(&env_file.0)
+        .arg("--print-config")
+        .env_remove("REDMINE_URL")
+        .env_remove("REDMINE_API_KEY")
+        .env_remove("REDMINE_VERSION")
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("REDMINE_VERSION"), "stderr: {stderr}");
+}

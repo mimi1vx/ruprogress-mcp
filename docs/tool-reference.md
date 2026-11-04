@@ -17,7 +17,7 @@ Return the MCP server's version, read-only/auth mode, plugin flags, and the iden
 
 *(no parameters)*
 
-**Output:** object: `active_sessions`, `auth_mode`, `autofill_required_custom_fields`, `current_user`, `oauth_scope_enforcement`, `plugin_flags`, `read_only_mode`, `registered_clients`, `required_custom_field_defaults_count`, `server_version`, `transport`
+**Output:** object: `active_sessions`, `auth_mode`, `autofill_required_custom_fields`, `current_user`, `oauth_scope_enforcement`, `plugin_flags`, `read_only_mode`, `redmine_version`, `redmine_version_advisory`, `registered_clients`, `required_custom_field_defaults_count`, `server_version`, `transport`
 
 ## Discovery
 

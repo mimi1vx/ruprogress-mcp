@@ -312,6 +312,9 @@ async fn main() -> anyhow::Result<()> {
     if cli.print_config {
         return print_config(&config);
     }
+    if let Some(advisory) = config.redmine_version_advisory() {
+        tracing::warn!("{advisory}");
+    }
 
     let http = config.transport.as_http().cloned();
     let client = build_redmine_client(&config)?;
