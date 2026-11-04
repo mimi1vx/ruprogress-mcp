@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.11.2...v0.12.0) - 2026-11-04
+
+### Added
+
+- warn when the declared Redmine version is below a safe patch level
+
+### Fixed
+
+- hint at the inactive-user cause of a Redmine 500
+- *(redmine-client)* don't retry a bearer-token 500
+
+### Other
+
+- pin the 422 path for notes on closed issues
+
 ## [0.11.2](https://github.com/mimi1vx/ruprogress-mcp/compare/v0.11.1...v0.11.2) - 2026-10-27
 
 ### Fixed
