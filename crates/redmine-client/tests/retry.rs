@@ -132,3 +132,37 @@ async fn hostile_retry_after_is_clamped_and_elapsed_stays_within_timeout() {
         "hostile Retry-After must be clamped, not honoured literally: took {elapsed:?}"
     );
 }
+
+async fn get_issue_request_count(status: u16, cred: &Credential) -> usize {
+    let (server, client) = support::mock_redmine_fast().await;
+    Mock::given(method("GET"))
+        .and(path("/issues/1.json"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+
+    client
+        .as_user(cred)
+        .get_issue(IssueId(1), &[])
+        .await
+        .expect_err("a persistent failure must surface as an error");
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn bearer_get_does_not_retry_a_500() {
+    let cred = Credential::Bearer(SecretString::from("t"));
+    assert_eq!(get_issue_request_count(500, &cred).await, 1);
+}
+
+#[tokio::test]
+async fn bearer_get_still_retries_a_503() {
+    let cred = Credential::Bearer(SecretString::from("t"));
+    assert_eq!(get_issue_request_count(503, &cred).await, 4);
+}
+
+#[tokio::test]
+async fn api_key_get_still_retries_a_500() {
+    let cred = Credential::ApiKey(SecretString::from("k"));
+    assert_eq!(get_issue_request_count(500, &cred).await, 4);
+}

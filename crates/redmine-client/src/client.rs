@@ -480,8 +480,13 @@ impl Scoped<'_> {
             };
 
             let now = Instant::now();
+            // Redmine answers an OAuth request from an inactive user with a
+            // deterministic 500 (an unhandled exception), so retrying cannot help.
+            let bearer_500 = matches!(self.credential, Credential::Bearer(_))
+                && matches!(&err, Error::Api { status, .. } if *status == http::StatusCode::INTERNAL_SERVER_ERROR);
             let can_retry = retry::method_is_retryable(method)
                 && err.is_retryable()
+                && !bearer_500
                 && attempt < policy.max_retries
                 && now < deadline;
 
