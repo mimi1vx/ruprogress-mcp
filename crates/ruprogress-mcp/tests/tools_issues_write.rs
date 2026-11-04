@@ -492,6 +492,35 @@ async fn update_redmine_issue_happy_path() {
 }
 
 #[tokio::test]
+async fn update_redmine_issue_notes_on_a_closed_issue_422_keeps_the_redmine_text() {
+    let h = support::harness(&[]).await;
+    Mock::given(method("PUT"))
+        .and(path("/issues/7.json"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "errors": ["Notes cannot be added to a closed issue"]
+        })))
+        .mount(&h.redmine)
+        .await;
+
+    let result = call(
+        &h,
+        "update_redmine_issue",
+        json!({"issue_id": 7, "notes": "late comment"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["code"], "VALIDATION_FAILED");
+    assert!(
+        structured["error"]
+            .as_str()
+            .unwrap()
+            .contains("Notes cannot be added to a closed issue"),
+        "structured: {structured}"
+    );
+}
+
+#[tokio::test]
 async fn update_redmine_issue_without_uploads_sends_a_byte_identical_body() {
     let h = support::harness(&[]).await;
     Mock::given(method("PUT"))
