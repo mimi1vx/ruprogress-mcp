@@ -347,3 +347,45 @@ endpoint) and reports `503` while it stays unreachable.
 *traffic-routing/readiness* policy at `/readyz` separately, exactly as
 distinguished by their names; a `503` on `/readyz` alone should not restart
 the container, only pull it out of rotation until Redmine recovers.
+
+## `UNEXPECTED_RESPONSE` or a `500` under OAuth
+
+**Symptom:** a call in `oauth`/`oauth-proxy` mode fails with
+`UNEXPECTED_RESPONSE` and a Redmine `500`, for one user only.
+
+**Cause:** Redmine before 6.1.6/7.0.3 answers an OAuth request from a locked
+or inactive user with an internal `500` instead of `401`. This server does not
+retry a `500` made with a bearer token, because the failure is deterministic;
+a `502`, `503` or `504` is still retried.
+
+**Fix:** check that the Redmine account is active, or upgrade Redmine to
+6.1.6/7.0.3 or later.
+
+## `VALIDATION_FAILED` "Assignee is invalid" on create
+
+**Symptom:** `create_redmine_issue` fails with `VALIDATION_FAILED` and
+`Assignee is invalid`, although the call set no assignee.
+
+**Cause:** the project or category has a default assignee who can no longer be
+assigned issues. Redmine before 6.1.5/7.0.2 fails the create instead of
+skipping the default.
+
+**Fix:** pass `assigned_to_id` explicitly, change the default assignee in
+Redmine, or upgrade to 6.1.5/7.0.2 or later.
+
+## Minimum safe Redmine patch levels
+
+Earlier patch levels leak data through endpoints this server calls:
+
+| Series | Run at least | What leaks on earlier patch levels |
+|---|---|---|
+| 6.0 | 6.0.12 | `get_redmine_issue` with `include_children` exposes subjects of issues the caller cannot see (fixed in 6.0.12); `manage_issue_relation` `list` bypasses issue visibility (fixed in 6.0.11) |
+| 6.1 | 6.1.6 | Token scopes are ignored in project visibility (fixed in 6.1.6); `include_children` leak (6.1.5); relations (6.1.4) |
+| 7.0 | 7.0.3 | Token scopes are ignored in project visibility (fixed in 7.0.3); `include_children` leak (7.0.2); relations (7.0.1) |
+
+Redmine before 6.0 is not supported.
+
+This server cannot read your Redmine version: Redmine does not expose it over
+REST. Set `REDMINE_VERSION` (see [configuration](configuration.md)) to what
+you run, and startup logs a `WARN` when it is below the floor of its series.
+The value is declared, so keep it current after an upgrade.
