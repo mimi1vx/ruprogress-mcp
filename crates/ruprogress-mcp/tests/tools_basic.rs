@@ -475,6 +475,41 @@ async fn get_mcp_server_info_reports_the_resolved_current_user_when_reachable() 
     assert!(name.contains("Alice Example"), "name: {name}");
 }
 
+async fn server_info_body(env: &[(&str, &str)]) -> Value {
+    let h = support::harness(env).await;
+    let result = h
+        .client
+        .call_tool(CallToolRequestParams::new("get_mcp_server_info"))
+        .await
+        .expect("call_tool should succeed");
+    content_text(&result)
+        .lines()
+        .last()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .expect("last content block should be the JSON body")
+}
+
+#[tokio::test]
+async fn get_mcp_server_info_reports_no_version_advisory_when_undeclared_or_safe() {
+    let body = server_info_body(&[]).await;
+    assert_eq!(body["redmine_version"], Value::Null);
+    assert_eq!(body["redmine_version_advisory"], Value::Null);
+
+    let body = server_info_body(&[("REDMINE_VERSION", "7.0.3")]).await;
+    assert_eq!(body["redmine_version"], "7.0.3");
+    assert_eq!(body["redmine_version_advisory"], Value::Null);
+}
+
+#[tokio::test]
+async fn get_mcp_server_info_reports_the_version_advisory_below_the_floor() {
+    let body = server_info_body(&[("REDMINE_VERSION", "7.0.2")]).await;
+    assert_eq!(body["redmine_version"], "7.0.2");
+    let advisory = body["redmine_version_advisory"]
+        .as_str()
+        .expect("advisory should be a string");
+    assert!(advisory.contains("7.0.3"), "advisory: {advisory}");
+}
+
 #[tokio::test]
 async fn get_mcp_server_info_never_leaks_the_redmine_host() {
     let h = support::harness(&[]).await;
@@ -794,8 +829,8 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// tools or wider input schemas (like `manage_redmine_wiki_page`'s
 /// six-action parameter set or `upload_file`'s/`uploads[]`'s multi-field
 /// shapes) push the observed size close to the current limit; currently
-/// 140 500 bytes for 41 tools (~140 393 observed after `get_redmine_issue`
-/// gained `include_allowed_statuses` and journal `updated_on`/`updated_by`),
+/// 141 000 bytes for 41 tools (~140 679 observed after `get_mcp_server_info`
+/// gained `redmine_version`/`redmine_version_advisory`),
 /// leaving headroom for future growth at a similar per-tool rate.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
@@ -807,8 +842,8 @@ async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
-        bytes.len() < 140_500,
-        "tools/list is {} bytes for {} tools; over the 140500 baseline threshold",
+        bytes.len() < 141_000,
+        "tools/list is {} bytes for {} tools; over the 141000 baseline threshold",
         bytes.len(),
         tools.tools.len()
     );

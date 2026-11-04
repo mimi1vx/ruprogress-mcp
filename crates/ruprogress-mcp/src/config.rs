@@ -70,6 +70,63 @@ pub enum SchemaDialect {
 pub struct RedmineConfig {
     pub url: Url,
     pub ssl_verify: bool,
+    /// `REDMINE_VERSION`: declared by the operator, never detected.
+    pub version: Option<RedmineVersion>,
+}
+
+/// A Redmine release as `MAJOR.MINOR.PATCH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedmineVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl std::str::FromStr for RedmineVersion {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let mut parts = raw.split('.').map(|part| {
+            if part.bytes().all(|b| b.is_ascii_digit()) {
+                part.parse::<u32>().map_err(|_| ())
+            } else {
+                Err(())
+            }
+        });
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(major), Some(minor), Some(patch), None) => Ok(Self {
+                major: major?,
+                minor: minor?,
+                patch: patch?,
+            }),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for RedmineVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl RedmineVersion {
+    /// What to tell the operator when this version is below the oldest patch
+    /// level of its series that does not leak data through endpoints this
+    /// server calls; `None` at or above that level and for series newer
+    /// than the table.
+    #[must_use]
+    pub fn advisory(self) -> Option<&'static str> {
+        match (self.major, self.minor, self.patch) {
+            (0..=5, ..) => {
+                Some("Redmine before 6.0 is unsupported; run at least 6.0.12, 6.1.6 or 7.0.3")
+            }
+            (6, 0, 0..=11) => Some("upgrade to Redmine 6.0.12 or later"),
+            (6, 1, 0..=5) => Some("upgrade to Redmine 6.1.6 or later"),
+            (7, 0, 0..=2) => Some("upgrade to Redmine 7.0.3 or later"),
+            _ => None,
+        }
+    }
 }
 
 /// How this server authenticates to Redmine.
@@ -450,7 +507,19 @@ fn parse_redmine(vars: &EnvMap) -> Result<RedmineConfig, ConfigError> {
     if !ssl_verify {
         tracing::warn!("REDMINE_SSL_VERIFY=false: TLS certificate verification is disabled");
     }
-    Ok(RedmineConfig { url, ssl_verify })
+    let version = match optional(vars, "REDMINE_VERSION") {
+        None => None,
+        Some(raw) => Some(raw.parse().map_err(|()| ConfigError::Invalid {
+            var: "REDMINE_VERSION",
+            expected: "MAJOR.MINOR.PATCH, for example 7.0.3",
+            because: format!("got {raw:?}"),
+        })?),
+    };
+    Ok(RedmineConfig {
+        url,
+        ssl_verify,
+        version,
+    })
 }
 
 fn parse_bind(vars: &EnvMap) -> Result<SocketAddr, ConfigError> {
@@ -1607,6 +1676,16 @@ impl Config {
         }
     }
 
+    /// The warning for a declared `REDMINE_VERSION` below its series' safe
+    /// patch level; `None` when undeclared or safe.
+    #[must_use]
+    pub fn redmine_version_advisory(&self) -> Option<String> {
+        let version = self.redmine.version?;
+        version.advisory().map(|advice| {
+            format!("declared Redmine {version} is below the minimum safe patch level: {advice}")
+        })
+    }
+
     pub(crate) fn schema_dialect_label(&self) -> &'static str {
         match self.schema_dialect {
             SchemaDialect::Strict => "strict",
@@ -1674,6 +1753,7 @@ impl Config {
                 "url_host": self.redmine.url.host_str(),
                 "ssl_verify": self.redmine.ssl_verify,
             },
+            "redmine_version": self.redmine.version.map(|v| v.to_string()),
             "auth_mode": self.auth_mode_label(),
             "oauth": oauth,
             "transport": transport,
@@ -2647,6 +2727,87 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn redmine_version_is_unset_by_default() {
+        let config =
+            Config::from_map(&valid_legacy(), TransportKind::Stdio).expect("should be valid");
+        assert_eq!(config.redmine.version, None);
+        assert_eq!(config.redmine_version_advisory(), None);
+        assert_eq!(config.redacted_summary()["redmine_version"], json!(null));
+    }
+
+    #[test]
+    fn redmine_version_parses_and_is_summarized() {
+        let mut vars = valid_legacy();
+        vars.insert("REDMINE_VERSION".to_string(), "7.0.2".to_string());
+        let config = Config::from_map(&vars, TransportKind::Stdio).expect("should be valid");
+        assert_eq!(
+            config.redmine.version,
+            Some(RedmineVersion {
+                major: 7,
+                minor: 0,
+                patch: 2
+            })
+        );
+        assert_eq!(config.redacted_summary()["redmine_version"], "7.0.2");
+        assert!(
+            config
+                .redmine_version_advisory()
+                .is_some_and(|a| a.contains("7.0.2") && a.contains("7.0.3"))
+        );
+    }
+
+    #[test]
+    fn redmine_version_rejects_garbage() {
+        for bad in [
+            "banana",
+            "7.0",
+            "7.0.3.1",
+            "7.0.x",
+            "7..3",
+            "-7.0.3",
+            "+7.0.3",
+            "7.0.3-rc1",
+        ] {
+            let mut vars = valid_legacy();
+            vars.insert("REDMINE_VERSION".to_string(), bad.to_string());
+            let err = Config::from_map(&vars, TransportKind::Stdio).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "REDMINE_VERSION",
+                        ..
+                    }
+                ),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advisory_follows_the_per_series_floor_table() {
+        let advisory = |raw: &str| raw.parse::<RedmineVersion>().unwrap().advisory();
+        for (version, floor) in [
+            ("6.0.11", Some("6.0.12")),
+            ("6.1.5", Some("6.1.6")),
+            ("7.0.2", Some("7.0.3")),
+            ("5.1.13", Some("6.0.12")),
+            ("6.0.12", None),
+            ("6.1.6", None),
+            ("7.0.3", None),
+            ("7.1.0", None),
+        ] {
+            match (advisory(version), floor) {
+                (Some(text), Some(floor)) => {
+                    assert!(text.contains(floor), "{version}: {text}");
+                }
+                (None, None) => {}
+                (got, want) => panic!("{version}: got {got:?}, want floor {want:?}"),
+            }
+        }
     }
 
     #[test]
