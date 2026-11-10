@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "redmine-client"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "ruprogress-mcp"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "axum",
