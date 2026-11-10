@@ -829,9 +829,9 @@ async fn every_tool_description_is_short_and_names_when_to_call_it() {
 /// tools or wider input schemas (like `manage_redmine_wiki_page`'s
 /// six-action parameter set or `upload_file`'s/`uploads[]`'s multi-field
 /// shapes) push the observed size close to the current limit; currently
-/// 141 000 bytes for 41 tools (~140 679 observed after `get_mcp_server_info`
-/// gained `redmine_version`/`redmine_version_advisory`),
-/// leaving headroom for future growth at a similar per-tool rate.
+/// 146 000 bytes for 41 tools (~143 270 observed after rmcp 3.9 started
+/// listing always-serialized optional fields in each output schema's
+/// `required`), leaving headroom for future growth at a similar per-tool rate.
 #[tokio::test]
 async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
     let h = support::harness(&[]).await;
@@ -842,8 +842,8 @@ async fn tools_list_serialized_size_stays_under_the_baseline_threshold() {
         .expect("list_tools should succeed");
     let bytes = serde_json::to_vec(&tools.tools).expect("tools/list result should serialize");
     assert!(
-        bytes.len() < 141_000,
-        "tools/list is {} bytes for {} tools; over the 141000 baseline threshold",
+        bytes.len() < 146_000,
+        "tools/list is {} bytes for {} tools; over the 146000 baseline threshold",
         bytes.len(),
         tools.tools.len()
     );
@@ -873,9 +873,9 @@ async fn tools_list_serialized_size_with_every_plugin_enabled_stays_under_a_wide
     // Threshold raised from 160 000 to fit it —
     // re-measure and adjust here if a future change is a real regression.
     assert!(
-        bytes.len() < 170_000,
+        bytes.len() < 176_000,
         "tools/list is {} bytes for {} tools with every implemented plugin enabled; over the \
-         170000 threshold",
+         176000 threshold",
         bytes.len(),
         tools.tools.len()
     );
