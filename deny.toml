@@ -1,6 +1,8 @@
 [advisories]
 version = 2
 yanked  = "deny"
+# chrono is unmaintained with no fix, and rmcp/schemars require it.
+ignore  = [{ id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; transitive via rmcp/schemars, no safe upgrade" }]
 
 [licenses]
 version = 2
